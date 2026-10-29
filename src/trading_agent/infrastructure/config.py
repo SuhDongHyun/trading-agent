@@ -68,7 +68,7 @@ class ClaudeSettings(BaseModel):
     command: str = "claude"
     model: str = "claude-opus-5-5"
     effort: str = "high"
-    timeout_seconds: float = Field(default=120, gt=0)
+    timeout_seconds: float = Field(default=300, gt=0)
 
 
 class CodexSettings(BaseModel):
@@ -77,7 +77,7 @@ class CodexSettings(BaseModel):
     command: str = "codex"
     model: str = "gpt-6.1-sol"
     reasoning_effort: str = "high"
-    timeout_seconds: float = Field(default=120, gt=0)
+    timeout_seconds: float = Field(default=300, gt=0)
 
 
 class LLMSettings(BaseModel):

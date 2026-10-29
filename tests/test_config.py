@@ -44,4 +44,6 @@ def test_defaults_cover_api_models_and_ledger(tmp_path: Path) -> None:
     assert settings.trading_api.base_url == "http://localhost:9999"
     assert settings.llm.claude.model == "claude-opus-5-5"
     assert settings.llm.codex.model == "gpt-6.1-sol"
+    assert settings.llm.claude.timeout_seconds == 300
+    assert settings.llm.codex.timeout_seconds == 300
     assert settings.ledger.db_path == Path("data/trading-agent.db")
