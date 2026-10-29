@@ -96,12 +96,15 @@ class StockSnapshot:
     name: str
     current_price: Decimal | None = None
     change_percent: Decimal | None = None
-    return_percent: Decimal | None = None
-    moving_average_deviation: Decimal | None = None
+    return_5d_percent: Decimal | None = None
+    return_20d_percent: Decimal | None = None
+    ma20_deviation_percent: Decimal | None = None
+    ma60_deviation_percent: Decimal | None = None
     rsi: Decimal | None = None
     rsi_signal: str | None = None
     macd: Decimal | None = None
-    macd_signal: Decimal | None = None
+    macd_signal_value: Decimal | None = None
+    macd_signal: str | None = None
     volume_change_percent: Decimal | None = None
     news_headlines: list[str] | None = None
 
@@ -109,11 +112,13 @@ class StockSnapshot:
         for field_name in (
             "current_price",
             "change_percent",
-            "return_percent",
-            "moving_average_deviation",
+            "return_5d_percent",
+            "return_20d_percent",
+            "ma20_deviation_percent",
+            "ma60_deviation_percent",
             "rsi",
             "macd",
-            "macd_signal",
+            "macd_signal_value",
             "volume_change_percent",
         ):
             value = getattr(self, field_name)
@@ -128,17 +133,27 @@ class MarketContext:
     """시장 지수와 거시 지표 요약."""
 
     index_summary: str | None = None
+    kospi_change_percent: Decimal | None = None
+    kosdaq_change_percent: Decimal | None = None
+    sp500_change_percent: Decimal | None = None
     volatility_index: Decimal | None = None
+    vkospi: Decimal | None = None
     fear_greed_index: Decimal | None = None
     exchange_rate: Decimal | None = None
-    interest_rate: Decimal | None = None
+    korea_3y_yield: Decimal | None = None
+    us_10y_yield: Decimal | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
             "volatility_index",
+            "kospi_change_percent",
+            "kosdaq_change_percent",
+            "sp500_change_percent",
+            "vkospi",
             "fear_greed_index",
             "exchange_rate",
-            "interest_rate",
+            "korea_3y_yield",
+            "us_10y_yield",
         ):
             value = getattr(self, field_name)
             if value is not None:

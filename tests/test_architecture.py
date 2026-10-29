@@ -52,6 +52,20 @@ def test_domain_imports_only_standard_library_or_domain_modules() -> None:
         _assert_domain_imports_allowed(tree)
 
 
+def test_application_does_not_import_infrastructure() -> None:
+    application_dir = (
+        Path(__file__).parents[1] / "src" / "trading_agent" / "application"
+    )
+
+    for source_file in application_dir.glob("*.py"):
+        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        imported_modules = _import_names(tree, "trading_agent.application")
+        assert all(
+            not module.startswith("trading_agent.infrastructure")
+            for module in imported_modules
+        )
+
+
 @pytest.mark.parametrize(
     "source",
     [
