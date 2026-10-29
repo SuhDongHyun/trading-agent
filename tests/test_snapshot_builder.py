@@ -219,6 +219,27 @@ def test_snapshot_builder_continues_after_optional_data_failures() -> None:
     assert snapshot.account.total_asset_value == Decimal("1400")
 
 
+def test_snapshot_builder_uses_kst_date_when_utc_clock_crosses_day_boundary() -> None:
+    gateway = FakeMarketDataGateway()
+    now = datetime(2026, 10, 29, 15, 30, tzinfo=UTC)
+
+    snapshot = SnapshotBuilder(gateway, ["005930"], clock=lambda: now).build()
+
+    assert snapshot.created_at == now
+    assert set(gateway.request_ranges) == {("20260702", "20261030")}
+
+
+def test_snapshot_builder_rejects_naive_clock_datetime() -> None:
+    builder = SnapshotBuilder(
+        FakeMarketDataGateway(),
+        ["005930"],
+        clock=lambda: datetime(2026, 10, 29, 15, 30),
+    )
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        builder.build()
+
+
 @pytest.mark.parametrize("failure", ["account", "quote"])
 def test_snapshot_builder_fails_closed_for_required_data(failure: str) -> None:
     gateway = FakeMarketDataGateway({failure})

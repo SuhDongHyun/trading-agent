@@ -11,7 +11,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-_DEFAULT_CONFIG_FILE = Path(__file__).resolve().parents[3] / "config.yaml"
+_DEFAULT_CONFIG_FILE = Path("config.yaml")
 
 
 class YamlSettingsSource(PydanticBaseSettingsSource):
@@ -138,6 +138,8 @@ def load_settings(config_file: str | Path | None = None) -> AgentSettings:
         return AgentSettings()
 
     selected_file = Path(config_file).expanduser().resolve()
+    if not selected_file.is_file():
+        raise FileNotFoundError(f"설정 파일을 찾을 수 없습니다: {selected_file}")
 
     class ConfiguredAgentSettings(AgentSettings):
         _yaml_file = selected_file

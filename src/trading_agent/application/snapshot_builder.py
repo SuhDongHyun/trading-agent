@@ -101,7 +101,9 @@ class SnapshotBuilder:
         """필수 데이터가 있으면 스냅샷을 만들고 보조 실패는 기록한다."""
 
         now = self.clock()
-        today = now.date()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("clock는 timezone-aware datetime을 반환해야 합니다.")
+        today = now.astimezone(MARKET_TIMEZONE).date()
         end_date = today.strftime("%Y%m%d")
         start_date = (today - timedelta(days=LOOKBACK_CALENDAR_DAYS)).strftime("%Y%m%d")
 
@@ -341,12 +343,12 @@ class SnapshotBuilder:
             return None
 
     @classmethod
-    def _latest_optional(
+    def _latest_optional[T: IndicatorPoint | IndexPoint](
         cls,
         label: str,
-        read: Callable[[], Sequence[IndicatorPoint] | Sequence[IndexPoint]],
+        read: Callable[[], Sequence[T]],
         missing: list[str],
-    ) -> IndicatorPoint | IndexPoint | None:
+    ) -> T | None:
         """시계열의 최신 값을 가져오고 오류나 빈 응답을 기록한다."""
 
         points = cls._read_optional(label, read, missing)
