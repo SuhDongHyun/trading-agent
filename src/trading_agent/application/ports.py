@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from trading_agent.domain.models import AccountSnapshot
+from trading_agent.domain.models import AccountSnapshot, ModelDecision
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,3 +155,31 @@ class MarketDataGateway(ABC):
         self, maturity: TreasuryMaturity, start_date: str, end_date: str
     ) -> list[IndexPoint]:
         """국가와 만기별 국채 수익률을 조회한다."""
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRun:
+    """모델 호출의 원문 출력과 검증 결과를 보존한다."""
+
+    model_id: str
+    stdout: str
+    stderr: str
+    exit_code: int | None
+    duration_seconds: float
+    response_text: str | None = None
+    decision: ModelDecision | None = None
+    error: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        """정상 종료하고 도메인 판단까지 검증했는지 반환한다."""
+
+        return self.exit_code == 0 and self.decision is not None and self.error is None
+
+
+class DecisionModel(ABC):
+    """프롬프트를 한 모델의 검증된 판단으로 변환하는 포트."""
+
+    @abstractmethod
+    def decide(self, prompt: str) -> ModelRun:
+        """판단 원문과 도메인 결과를 반환하고 실패 시 실행 정보를 예외에 담는다."""

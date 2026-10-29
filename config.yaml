@@ -14,11 +14,11 @@ llm:
     command: claude
     model: claude-opus-5-5
     effort: high
-    timeout_seconds: 120
+    timeout_seconds: 300
   codex:
     command: codex
     model: gpt-6.1-sol
     reasoning_effort: high
-    timeout_seconds: 120
+    timeout_seconds: 300
 ledger:
   db_path: data/trading-agent.db
