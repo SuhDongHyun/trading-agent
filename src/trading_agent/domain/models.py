@@ -165,7 +165,6 @@ class StockSnapshot:
 class MarketContext:
     """시장 지수와 거시 지표 요약."""
 
-    index_summary: str | None = None
     kospi_change_percent: Decimal | None = None
     kosdaq_change_percent: Decimal | None = None
     sp500_change_percent: Decimal | None = None
@@ -202,6 +201,8 @@ class MarketSnapshot:
     stocks: list[StockSnapshot]
     market_context: MarketContext
     missing: list[str]
+    as_of_trading_date: str | None = None
+    market_session: str = "closed"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stocks", list(self.stocks))
@@ -216,6 +217,8 @@ class ResearchSnapshot:
     stocks: list[StockSnapshot]
     market_context: MarketContext
     missing: list[str]
+    as_of_trading_date: str | None = None
+    market_session: str = "closed"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stocks", list(self.stocks))

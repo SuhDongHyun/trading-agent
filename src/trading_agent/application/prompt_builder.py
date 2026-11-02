@@ -3,7 +3,7 @@
 import json
 from dataclasses import fields, is_dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from typing import Any
 
@@ -27,14 +27,15 @@ STOCK_FIELD_GLOSSARY = """- stocks[].code/name: 종목 코드와 이름.
   장중에는 당일 미완성 누적 거래량을 직전 20일 평균과 비교하므로 과소평가될 수 있습니다.
 - stocks[].news_headlines: 최근 뉴스 제목."""
 
-MARKET_FIELD_GLOSSARY = """- market_context.index_summary: 시장 요약 문구.
-- market_context.kospi_change_percent/kosdaq_change_percent/sp500_change_percent:
-  각 시장 지수의 변화율.
+MARKET_FIELD_GLOSSARY = """- market_context.kospi_change_percent, kosdaq_change_percent,
+  sp500_change_percent: 각 시장 지수의 변화율.
 - market_context.volatility_index/vkospi/fear_greed_index:
   변동성 및 공포·탐욕 지표.
 - market_context.exchange_rate/korea_3y_yield/us_10y_yield: 환율과 국채 금리.
+- as_of_trading_date: 종목들에서 확인한 가장 최근 일봉 날짜. 일봉이 없으면 null.
+- market_session: KST 기준 장 상태(open, closed, pre_open, holiday).
 - 모든 null 값은 해당 값을 수집하지 못했음을 뜻합니다.
-- missing: 스냅샷 수집 단계에서 누락되거나 실패한 데이터 항목."""
+- missing: 스냅샷 수집 단계에서 누락되거나 실패한 데이터와 원인."""
 
 
 def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
@@ -65,6 +66,7 @@ def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
 - 현금, 허용 종목, 주문 금액·종목 비중·최소 확신도 정책을 지키세요.
 - 확신이 낮으면 buy·sell 대신 hold로 적으세요.
 - 필요한데 제공되지 않은 데이터는 missing_info에 적으세요.
+- snapshot.missing에 이미 있는 항목은 missing_info에 다시 적지 마세요.
 - 응답은 주어진 JSON Schema에 맞는 JSON 하나만 출력하세요.
 
 리스크 정책:
@@ -86,23 +88,33 @@ def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
 """
 
 
-def to_json_value(value: Any) -> Any:
-    """dataclass, Decimal, datetime, enum을 결정적인 JSON 값으로 바꾼다."""
+def to_json_value(value: Any, field_name: str | None = None) -> Any:
+    """프롬프트용 JSON 값으로 바꾸며 금액과 지표만 반올림한다."""
 
     if is_dataclass(value) and not isinstance(value, type):
         return {
-            field.name: to_json_value(getattr(value, field.name))
+            field.name: to_json_value(getattr(value, field.name), field.name)
             for field in fields(value)
         }
     if isinstance(value, Decimal):
-        return str(value)
+        if field_name in {
+            "cash",
+            "average_price",
+            "current_price",
+            "market_value",
+            "limit_price",
+            "target_price",
+            "stop_loss_price",
+        } or (field_name is not None and field_name.endswith("_amount")):
+            return format(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP), "f")
+        return format(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, dict):
-        return {str(key): to_json_value(item) for key, item in value.items()}
+        return {str(key): to_json_value(item, str(key)) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         items = sorted(value) if isinstance(value, (set, frozenset)) else value
-        return [to_json_value(item) for item in items]
+        return [to_json_value(item, field_name) for item in items]
     return value

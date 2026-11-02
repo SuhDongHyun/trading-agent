@@ -42,28 +42,38 @@ class TradingApiClient:
         method: str,
         path: str,
         json_body: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> Any:
         """HTTP 오류, 연결 오류, 잘못된 JSON을 애플리케이션 오류로 바꾼다."""
 
         url = f"{self.base_url}/{path.lstrip('/')}"
         try:
-            response = self._client.request(method, url, json=json_body)
+            request_options: dict[str, Any] = {"json": json_body}
+            if timeout_seconds is not None:
+                request_options["timeout"] = timeout_seconds
+            response = self._client.request(method, url, **request_options)
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
             raise MarketDataUnavailable(
-                f"trading-api 요청 실패: {method} {path} (HTTP {status})"
+                f"trading-api 요청 실패: {method} {path} (HTTP {status})",
+                reason=f"http {status}",
+            ) from error
+        except httpx.TimeoutException as error:
+            raise MarketDataUnavailable(
+                f"trading-api 요청 시간 초과: {method} {path}", reason="timeout"
             ) from error
         except httpx.RequestError as error:
             raise MarketDataUnavailable(
-                f"trading-api 연결 실패: {method} {path}"
+                f"trading-api 연결 실패: {method} {path}", reason="connection error"
             ) from error
 
         try:
             return response.json()
         except (ValueError, UnicodeDecodeError) as error:
             raise MarketDataUnavailable(
-                f"trading-api JSON 응답이 올바르지 않습니다: {method} {path}"
+                f"trading-api JSON 응답이 올바르지 않습니다: {method} {path}",
+                reason="invalid response",
             ) from error
 
     def close(self) -> None:
@@ -86,6 +96,7 @@ class TradingApiMarketDataGateway(MarketDataGateway):
             timeout_seconds=settings.timeout_seconds,
             client=client,
         )
+        self.settings = settings
 
     def close(self) -> None:
         """내부 HTTP 클라이언트의 리소스를 해제한다."""
@@ -292,9 +303,14 @@ class TradingApiMarketDataGateway(MarketDataGateway):
             data,
             lambda payload: [
                 NewsItem(
-                    title=_string(_mapping(item), "title"),
-                    source=_string(_mapping(item), "source"),
+                    title=_clean_news_text(_string(_mapping(item), "title")),
+                    source=_clean_news_text(_string(_mapping(item), "source")),
                     published_at=_datetime(_mapping(item), "published_at"),
+                    key=_optional_string(
+                        _mapping(item).get("key")
+                        or _mapping(item).get("news_id")
+                        or _mapping(item).get("id")
+                    ),
                 )
                 for item in _sequence(payload)
             ],
@@ -309,15 +325,29 @@ class TradingApiMarketDataGateway(MarketDataGateway):
         """시장 지표 응답을 공통 시계열 형식으로 변환한다."""
 
         path = f"/market-index/{index.value}"
+        indicator = {
+            MarketIndex.KOSPI: "kospi",
+            MarketIndex.KOSDAQ: "kosdaq",
+            MarketIndex.SP500: "sp500",
+            MarketIndex.VIX: "vix",
+            MarketIndex.VKOSPI: "vkospi",
+            MarketIndex.USD_KRW: "usd_krw",
+        }[index]
         if index is MarketIndex.VIX:
             data = self.client.request_json(
-                "POST", path, {"start_date": start_date, "end_date": end_date}
+                "POST",
+                path,
+                {"start_date": start_date, "end_date": end_date},
+                timeout_seconds=self.settings.timeout_for(indicator),
             )
             value_field = "value"
             change_field = None
         else:
             data = self.client.request_json(
-                "POST", path, {"start_date": start_date, "end_date": end_date}
+                "POST",
+                path,
+                {"start_date": start_date, "end_date": end_date},
+                timeout_seconds=self.settings.timeout_for(indicator),
             )
             value_field = "close_price"
             change_field = (
@@ -351,7 +381,11 @@ class TradingApiMarketDataGateway(MarketDataGateway):
     def get_fear_and_greed_index(self) -> IndexPoint:
         """최신 공포탐욕 지수와 갱신 날짜를 변환한다."""
 
-        data = self.client.request_json("GET", "/market-index/fear-and-greed-index")
+        data = self.client.request_json(
+            "GET",
+            "/market-index/fear-and-greed-index",
+            timeout_seconds=self.settings.timeout_for("fear_and_greed"),
+        )
 
         def parse(payload: Any) -> IndexPoint:
             body = _mapping(payload)
@@ -373,7 +407,14 @@ class TradingApiMarketDataGateway(MarketDataGateway):
 
         path = f"/market-index/treasury-yield/{maturity.value}"
         data = self.client.request_json(
-            "POST", path, {"start_date": start_date, "end_date": end_date}
+            "POST",
+            path,
+            {"start_date": start_date, "end_date": end_date},
+            timeout_seconds=self.settings.timeout_for(
+                "korea_3y_yield"
+                if maturity is TreasuryMaturity.KOREA_3Y
+                else "us_10y_yield"
+            ),
         )
 
         def parse(payload: Any) -> list[IndexPoint]:
@@ -423,7 +464,8 @@ def _decode[T](label: str, payload: Any, parser: Callable[[Any], T]) -> T:
         raise
     except (ArithmeticError, KeyError, TypeError, ValueError) as error:
         raise MarketDataUnavailable(
-            f"trading-api 응답 형식이 올바르지 않습니다: {label}"
+            f"trading-api 응답 형식이 올바르지 않습니다: {label}",
+            reason="invalid response",
         ) from error
 
 
@@ -489,6 +531,27 @@ def _datetime(body: dict[str, Any], field: str) -> datetime:
 
     value = _string(body, field)
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _optional_string(value: Any) -> str | None:
+    """선택적 기사 key를 문자열로 바꾼다."""
+
+    if value is None:
+        return None
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        raise ValueError("기사 key는 문자열이어야 합니다.")
+    return str(value)
+
+
+def _clean_news_text(value: str) -> str:
+    """뉴스 한 줄의 제어문자를 공백으로 바꾸고 SUB는 가운데점으로 복원한다."""
+
+    value = value.replace("\x1a", "·")
+    cleaned = "".join(
+        " " if ord(character) < 32 or 0x7F <= ord(character) <= 0x9F else character
+        for character in value
+    )
+    return " ".join(cleaned.split())
 
 
 def _indicator_points(
