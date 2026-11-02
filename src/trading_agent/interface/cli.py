@@ -16,8 +16,6 @@ from trading_agent.domain.models import Action
 from trading_agent.domain.recommendation import StockRecommendation
 from trading_agent.infrastructure.config import AgentSettings, load_settings
 from trading_agent.interface.bootstrap import (
-    RecommendationRuntime,
-    TradingAgentRuntime,
     create_recommendation_runtime,
     create_runtime,
 )
@@ -34,6 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = commands.add_parser("run", help="결정 사이클을 한 번 실행")
     run_parser.add_argument("--config", type=Path, help="YAML 설정 파일 경로")
     run_parser.add_argument("--db", type=Path, help="SQLite 기록 파일 경로")
+    run_parser.add_argument(
+        "--force", action="store_true", help="휴장일에도 모델 판단을 강제로 실행"
+    )
     recommend_parser = commands.add_parser(
         "recommend", help="계좌와 무관하게 후보 종목 투자의견을 한 번 생성"
     )
@@ -55,11 +56,9 @@ class _Runtime[R](Protocol):
 
 def main(
     argv: Sequence[str] | None = None,
-    runtime_factory: Callable[
-        [AgentSettings, str | Path | None], TradingAgentRuntime
-    ] = create_runtime,
+    runtime_factory: Callable[..., _Runtime[DecisionCycleResult]] = create_runtime,
     recommendation_runtime_factory: Callable[
-        [AgentSettings, str | Path | None], RecommendationRuntime
+        ..., _Runtime[RecommendationRunResult]
     ] = create_recommendation_runtime,
 ) -> int:
     """CLI를 실행하고 cron에서 확인할 종료 코드를 반환한다."""
@@ -82,14 +81,17 @@ def main(
 
 def _execute[R: (DecisionCycleResult, RecommendationRunResult)](
     args: argparse.Namespace,
-    factory: Callable[[AgentSettings, str | Path | None], _Runtime[R]],
+    factory: Callable[..., _Runtime[R]],
     print_result: Callable[[R, AgentSettings], None],
 ) -> int:
     """설정을 읽어 런타임을 실행하고 결과 요약과 종료 코드를 반환한다."""
 
     try:
         settings = load_settings(args.config)
-        runtime = factory(settings, args.db)
+        if getattr(args, "force", False):
+            runtime = factory(settings, args.db, True)
+        else:
+            runtime = factory(settings, args.db)
     except Exception as error:
         print(f"실행 준비 실패: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
@@ -127,7 +129,8 @@ def _print_result(result: DecisionCycleResult) -> None:
     print(f"리스크 승인: {approved_summary}")
     print(f"missing_info: {', '.join(missing_info) if missing_info else '없음'}")
     if result.error:
-        print(f"오류: {result.error}")
+        label = "사유" if result.status is CycleStatus.SKIPPED else "오류"
+        print(f"{label}: {result.error}")
 
 
 def _print_recommendations(result: RecommendationRunResult, top: int) -> None:
@@ -204,7 +207,7 @@ def _price(value: Decimal | None) -> str:
 def _exit_code(status: CycleStatus) -> int:
     """요구된 성공·모델 실패·기타 실패 종료 코드를 반환한다."""
 
-    if status is CycleStatus.COMPLETED:
+    if status in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
         return 0
     if status is CycleStatus.MODEL_FAILED:
         return 2

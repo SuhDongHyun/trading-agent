@@ -58,6 +58,7 @@ class TradingAgentRuntime:
 def create_runtime(
     settings: AgentSettings,
     db_path: str | Path | None = None,
+    force: bool = False,
 ) -> TradingAgentRuntime:
     """설정을 적용한 네트워크·LLM 어댑터와 사이클을 조립한다."""
 
@@ -82,6 +83,7 @@ def create_runtime(
         watchlist=settings.watchlist,
         ledger=SQLiteDecisionLedger(db_path or settings.ledger.db_path),
         clock=clock,
+        force=force,
     )
     return TradingAgentRuntime(cycle=cycle, gateway=gateway)
 

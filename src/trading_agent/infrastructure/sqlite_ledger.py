@@ -160,14 +160,14 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
     ) -> None:
         """정상 사이클을 한 트랜잭션으로 종료하고 상세 데이터를 저장한다."""
 
-        if result.status is not CycleStatus.COMPLETED:
-            raise ValueError("완료 기록에는 completed 결과가 필요합니다.")
+        if result.status not in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
+            raise ValueError("완료 기록에는 completed 또는 skipped 결과가 필요합니다.")
         self._finish_cycle(result, finished_at)
 
     def fail_cycle(self, result: DecisionCycleResult, finished_at: datetime) -> None:
         """실패 사이클을 한 트랜잭션으로 종료하고 확보한 데이터를 저장한다."""
 
-        if result.status is CycleStatus.COMPLETED:
+        if result.status in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
             raise ValueError("실패 기록에는 실패 상태 결과가 필요합니다.")
         self._finish_cycle(result, finished_at)
 

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from trading_agent.infrastructure.config import load_settings
+from trading_agent.infrastructure.config import TradingApiSettings, load_settings
 
 
 def test_yaml_settings_are_loaded(tmp_path: Path) -> None:
@@ -71,3 +71,25 @@ def test_missing_default_config_uses_builtin_defaults(
     settings = load_settings()
 
     assert settings.watchlist == []
+
+
+def test_market_indicator_timeout_override_uses_default_when_missing() -> None:
+    settings = TradingApiSettings(
+        timeout_seconds=10,
+        market_timeouts={"vkospi": 2.5, "vix": 4},
+    )
+
+    assert settings.timeout_for("vkospi") == 2.5
+    assert settings.timeout_for("vix") == 4
+    assert settings.timeout_for("kospi") == 10
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_market_indicator_timeout_must_be_positive_and_finite(value: float) -> None:
+    with pytest.raises(ValueError, match="market_timeouts"):
+        TradingApiSettings(market_timeouts={"vkospi": value})
+
+
+def test_market_indicator_timeout_rejects_unknown_key() -> None:
+    with pytest.raises(ValueError, match="지원하지 않는"):
+        TradingApiSettings(market_timeouts={"unknown": 2})

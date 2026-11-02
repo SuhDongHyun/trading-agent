@@ -84,9 +84,10 @@ def test_gateway_uses_trading_api_contract_and_parses_decimal_values() -> None:
             ],
             ("POST", "/stock_news"): [
                 {
-                    "title": "삼성전자 소식",
-                    "source": "연합뉴스",
+                    "title": "삼성\x1a전자\x00\n소식",
+                    "source": "연\x7f합뉴스",
                     "published_at": "2026-10-28T09:30:00+09:00",
+                    "news_id": "item-1",
                 }
             ],
             ("POST", "/market-index/kospi-index"): [
@@ -149,6 +150,9 @@ def test_gateway_uses_trading_api_contract_and_parses_decimal_values() -> None:
     assert rsi_signal[0].signal == "buy"
     assert macd[0].value == Decimal("1.25")
     assert macd_signal[0].value == Decimal("1.0")
+    assert news[0].title == "삼성·전자 소식"
+    assert news[0].source == "연 합뉴스"
+    assert news[0].key == "item-1"
     assert news[0].published_at == datetime.fromisoformat("2026-10-28T09:30:00+09:00")
     assert kospi[0].change_percent == Decimal("0.5")
     assert vix[0].value == Decimal("16.25")
@@ -168,9 +172,15 @@ def test_gateway_uses_trading_api_contract_and_parses_decimal_values() -> None:
             "adjusted_price": True,
         },
     )
-    assert requests[3][2]["window"] == 20
-    assert requests[5][2]["rsi_window"] == 14
-    assert requests[6][2]["ema_short_window"] == 12
+    moving_average_body = requests[3][2]
+    rsi_body = requests[5][2]
+    macd_body = requests[6][2]
+    assert moving_average_body is not None
+    assert rsi_body is not None
+    assert macd_body is not None
+    assert moving_average_body["window"] == 20
+    assert rsi_body["rsi_window"] == 14
+    assert macd_body["ema_short_window"] == 12
     assert requests[8] == (
         "POST",
         "/stock_news",
@@ -217,3 +227,57 @@ def test_gateway_converts_connection_errors() -> None:
             gateway.get_stock_quote("005930")
     finally:
         client.close()
+
+
+def test_market_index_uses_its_configured_timeout() -> None:
+    timeouts: list[dict[str, float]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(
+            200,
+            json=[{"date": "20261029", "close_price": 1, "price_diff_rate": 0}],
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    gateway = TradingApiMarketDataGateway(
+        TradingApiSettings(timeout_seconds=10, market_timeouts={"vkospi": 2.5}),
+        client=client,
+    )
+    try:
+        gateway.get_market_index(MarketIndex.VKOSPI, "20261015", "20261029")
+    finally:
+        client.close()
+
+    assert timeouts[0]["read"] == 2.5
+
+
+def test_gateway_classifies_timeout_and_http_errors() -> None:
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(timeout))
+    gateway = TradingApiMarketDataGateway(
+        TradingApiSettings(base_url="http://trading-api"), client=client
+    )
+    try:
+        with pytest.raises(MarketDataUnavailable) as error:
+            gateway.get_stock_quote("005930")
+    finally:
+        client.close()
+    assert error.value.reason == "timeout"
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, json={"detail": "unavailable"})
+        )
+    )
+    gateway = TradingApiMarketDataGateway(
+        TradingApiSettings(base_url="http://trading-api"), client=client
+    )
+    try:
+        with pytest.raises(MarketDataUnavailable) as error:
+            gateway.get_stock_quote("005930")
+    finally:
+        client.close()
+    assert error.value.reason == "http 503"

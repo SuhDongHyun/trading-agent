@@ -16,6 +16,7 @@ class CycleStatus(StrEnum):
     """사이클을 종료한 상태."""
 
     COMPLETED = "completed"
+    SKIPPED = "skipped"
     MODEL_FAILED = "model_failed"
     DATA_FAILED = "data_failed"
     ERROR = "error"

@@ -1,10 +1,11 @@
 """YAML과 환경변수로부터 애플리케이션 설정을 읽는다."""
 
+import math
 from pathlib import Path
 from typing import Any, ClassVar
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -12,6 +13,17 @@ from pydantic_settings import (
 )
 
 _DEFAULT_CONFIG_FILE = Path("config.yaml")
+_MARKET_TIMEOUT_KEYS = {
+    "kospi",
+    "kosdaq",
+    "sp500",
+    "vix",
+    "vkospi",
+    "fear_and_greed",
+    "usd_krw",
+    "korea_3y_yield",
+    "us_10y_yield",
+}
 
 
 class YamlSettingsSource(PydanticBaseSettingsSource):
@@ -51,6 +63,26 @@ class TradingApiSettings(BaseModel):
 
     base_url: str = "http://localhost:9999"
     timeout_seconds: float = Field(default=10, gt=0)
+    market_timeouts: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("market_timeouts")
+    @classmethod
+    def validate_market_timeouts(cls, values: dict[str, float]) -> dict[str, float]:
+        """지원 지표만 양수 timeout으로 설정했는지 확인한다."""
+
+        unknown = values.keys() - _MARKET_TIMEOUT_KEYS
+        if unknown:
+            raise ValueError(
+                "지원하지 않는 market_timeouts 지표: " + ", ".join(sorted(unknown))
+            )
+        if any(not math.isfinite(value) or value <= 0 for value in values.values()):
+            raise ValueError("market_timeouts 값은 0보다 커야 합니다.")
+        return values
+
+    def timeout_for(self, indicator: str) -> float:
+        """지표별 재정의 값이 없으면 기본 API timeout을 반환한다."""
+
+        return self.market_timeouts.get(indicator, self.timeout_seconds)
 
 
 class RiskSettings(BaseModel):

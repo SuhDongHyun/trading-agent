@@ -46,6 +46,7 @@ class NewsItem:
     title: str
     source: str
     published_at: datetime
+    key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

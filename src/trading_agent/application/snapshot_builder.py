@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from decimal import Decimal
 from functools import partial
 from zoneinfo import ZoneInfo
@@ -13,6 +13,7 @@ from trading_agent.application.ports import (
     IndicatorPoint,
     MarketDataGateway,
     MarketIndex,
+    NewsItem,
     StockQuote,
     TreasuryMaturity,
 )
@@ -25,6 +26,7 @@ from trading_agent.domain.models import (
 )
 
 LOOKBACK_CALENDAR_DAYS = 120
+MARKET_LOOKBACK_CALENDAR_DAYS = 14
 MA_SHORT_WINDOW = 20
 MA_LONG_WINDOW = 60
 RSI_WINDOW = 14
@@ -102,26 +104,32 @@ class SnapshotBuilder:
     def build(self) -> MarketSnapshot:
         """필수 데이터가 있으면 스냅샷을 만들고 보조 실패는 기록한다."""
 
-        now, start_date, end_date = self._lookback_window()
+        now, start_date, end_date, market_start_date = self._lookback_window()
         account = self.gateway.get_account()
         codes = _unique_codes(
             [*self.watchlist, *(position.code for position in account.positions)]
         )
-        quotes = {code: self.gateway.get_stock_quote(code) for code in codes}
+        quotes = {code: self._required_quote(code) for code in codes}
         valued_account = _with_current_prices(account, quotes)
         missing: list[str] = []
 
-        stocks = [
+        stock_results = [
             self._build_stock(code, quotes[code], start_date, end_date, missing)
             for code in codes
         ]
-        market_context = self._build_market_context(start_date, end_date, missing)
+        stocks = [stock for stock, _ in stock_results]
+        as_of_trading_date = _latest_daily_date(stock_results)
+        market_context = self._build_market_context(
+            market_start_date, end_date, missing
+        )
         return MarketSnapshot(
             created_at=now,
             account=valued_account,
             stocks=stocks,
             market_context=market_context,
             missing=missing,
+            as_of_trading_date=as_of_trading_date,
+            market_session=_market_session(now, as_of_trading_date, missing),
         )
 
     def build_research(self, codes: Sequence[str]) -> ResearchSnapshot:
@@ -130,7 +138,7 @@ class SnapshotBuilder:
         현재가를 못 읽은 종목은 missing에 적고 제외한다. 한 종목도 읽지 못하면 실패한다.
         """
 
-        now, start_date, end_date = self._lookback_window()
+        now, start_date, end_date, market_start_date = self._lookback_window()
         missing: list[str] = []
         quotes: dict[str, StockQuote] = {}
         for code in _unique_codes(codes):
@@ -142,19 +150,25 @@ class SnapshotBuilder:
         if not quotes:
             raise MarketDataUnavailable("후보 종목 현재가를 하나도 읽지 못했습니다.")
 
-        stocks = [
+        stock_results = [
             self._build_stock(code, quote, start_date, end_date, missing)
             for code, quote in quotes.items()
         ]
-        market_context = self._build_market_context(start_date, end_date, missing)
+        stocks = [stock for stock, _ in stock_results]
+        as_of_trading_date = _latest_daily_date(stock_results)
+        market_context = self._build_market_context(
+            market_start_date, end_date, missing
+        )
         return ResearchSnapshot(
             created_at=now,
             stocks=stocks,
             market_context=market_context,
             missing=missing,
+            as_of_trading_date=as_of_trading_date,
+            market_session=_market_session(now, as_of_trading_date, missing),
         )
 
-    def _lookback_window(self) -> tuple[datetime, str, str]:
+    def _lookback_window(self) -> tuple[datetime, str, str, str]:
         """현재 시각과 한국 날짜 기준 조회 시작일·종료일을 반환한다."""
 
         now = self.clock()
@@ -163,7 +177,10 @@ class SnapshotBuilder:
         today = now.astimezone(MARKET_TIMEZONE).date()
         end_date = today.strftime("%Y%m%d")
         start_date = (today - timedelta(days=LOOKBACK_CALENDAR_DAYS)).strftime("%Y%m%d")
-        return now, start_date, end_date
+        market_start_date = (
+            today - timedelta(days=MARKET_LOOKBACK_CALENDAR_DAYS)
+        ).strftime("%Y%m%d")
+        return now, start_date, end_date, market_start_date
 
     def _build_stock(
         self,
@@ -172,7 +189,7 @@ class SnapshotBuilder:
         start_date: str,
         end_date: str,
         missing: list[str],
-    ) -> StockSnapshot:
+    ) -> tuple[StockSnapshot, str | None]:
         """한 종목의 필수 현재가와 보조 시계열을 요약한다."""
 
         daily = self._read_optional(
@@ -233,29 +250,41 @@ class SnapshotBuilder:
             ),
             missing,
         )
-        news = self._read_optional(
-            f"{code}:news",
-            lambda: self.gateway.get_stock_news(code, end_date),
-            missing,
-        )
-
         sorted_daily = sorted(daily or [], key=lambda item: item.date)
         if not sorted_daily:
-            _mark_missing(f"{code}:daily", missing)
+            _mark_missing(f"{code}:daily", missing, "empty")
+        latest_daily_date = sorted_daily[-1].date if sorted_daily else None
+        news_dates = list(dict.fromkeys((end_date, latest_daily_date)))
+        news_items = []
+        for search_date in news_dates:
+            if search_date is None:
+                continue
+            items = self._read_optional(
+                f"{code}:news",
+                lambda search_date=search_date: self.gateway.get_stock_news(
+                    code, search_date
+                ),
+                missing,
+                failure_detail=search_date,
+            )
+            news_items.extend(items or [])
+        unique_news = _unique_news(news_items)
+        if not unique_news:
+            _mark_missing(f"{code}:news", missing, "empty")
         sorted_closes = [bar.close_price for bar in sorted_daily]
         sorted_volumes = [bar.volume for bar in sorted_daily]
         latest_ma20 = ma20.value if ma20 else None
         latest_ma60 = ma60.value if ma60 else None
         headlines = None
-        if news is not None:
+        if unique_news:
             headlines = [
                 item.title
                 for item in sorted(
-                    news, key=lambda item: item.published_at, reverse=True
+                    unique_news, key=lambda item: item.published_at, reverse=True
                 )[: self.news_limit]
             ]
 
-        return StockSnapshot(
+        stock = StockSnapshot(
             code=code,
             name=quote.name,
             current_price=quote.current_price,
@@ -276,6 +305,17 @@ class SnapshotBuilder:
             volume_change_percent=calculate_volume_change_percent(sorted_volumes),
             news_headlines=headlines,
         )
+        return stock, latest_daily_date
+
+    def _required_quote(self, code: str) -> StockQuote:
+        """필수 현재가 실패에 종목과 원인을 붙여 전파한다."""
+
+        try:
+            return self.gateway.get_stock_quote(code)
+        except MarketDataUnavailable as error:
+            raise MarketDataUnavailable(
+                f"{code}:quote({error.reason})", reason=error.reason
+            ) from error
 
     def _build_market_context(
         self, start_date: str, end_date: str, missing: list[str]
@@ -305,7 +345,7 @@ class SnapshotBuilder:
         )
         sp500_change = _latest_change_percent(sp500_points or [])
         if sp500_points is not None and sp500_change is None:
-            _mark_missing("market:sp500", missing)
+            _mark_missing("market:sp500", missing, "empty")
 
         vix = self._latest_optional(
             "market:vix",
@@ -364,13 +404,14 @@ class SnapshotBuilder:
         label: str,
         read: Callable[[], T],
         missing: list[str],
+        failure_detail: str | None = None,
     ) -> T | None:
         """보조 조회 실패를 missing 항목으로 기록하고 계속한다."""
 
         try:
             return read()
-        except MarketDataUnavailable:
-            _mark_missing(label, missing)
+        except MarketDataUnavailable as error:
+            _mark_missing(label, missing, error.reason, failure_detail)
             return None
 
     @classmethod
@@ -384,7 +425,7 @@ class SnapshotBuilder:
 
         points = cls._read_optional(label, read, missing)
         if not points:
-            _mark_missing(label, missing)
+            _mark_missing(label, missing, "empty")
             return None
         return max(points, key=lambda point: point.date)
 
@@ -427,8 +468,74 @@ def _latest_change_percent(points: Sequence[IndexPoint]) -> Decimal | None:
     return (latest.value - previous.value) / previous.value * Decimal(100)
 
 
-def _mark_missing(label: str, missing: list[str]) -> None:
+def _latest_daily_date(
+    results: Sequence[tuple[StockSnapshot, str | None]],
+) -> str | None:
+    """스냅샷에 포함된 종목 일봉 중 가장 최신 날짜를 반환한다."""
+
+    dates = [date for _, date in results if date is not None]
+    return max(dates) if dates else None
+
+
+def has_daily_request_failure(missing: Sequence[str]) -> bool:
+    """empty 외 일봉 요청 실패가 있는지 확인한다."""
+
+    return any(":daily(" in item and not item.endswith("(empty)") for item in missing)
+
+
+def _market_session(
+    now: datetime, as_of_trading_date: str | None, missing: Sequence[str]
+) -> str:
+    """현재 한국 시각과 일봉 날짜로 장 상태를 구분한다."""
+
+    local_now = now.astimezone(MARKET_TIMEZONE)
+    if local_now.weekday() >= 5:
+        return "holiday"
+    if local_now.time() < time(9):
+        return "pre_open"
+    today = local_now.date().strftime("%Y%m%d")
+    if (
+        as_of_trading_date is not None
+        and as_of_trading_date < today
+        and not has_daily_request_failure(missing)
+    ):
+        return "holiday"
+    if local_now.time() < time(15, 30):
+        return "open"
+    return "closed"
+
+
+def _unique_news(news: Sequence[NewsItem]) -> list[NewsItem]:
+    """기사 key나 제목이 겹치면 최신 게시 기사를 남긴다."""
+
+    unique = []
+    seen_keys: set[str] = set()
+    seen_titles: set[str] = set()
+    for item in sorted(news, key=lambda value: value.published_at, reverse=True):
+        title = item.title.casefold().strip()
+        if (item.key and item.key in seen_keys) or (title and title in seen_titles):
+            continue
+        if item.key:
+            seen_keys.add(item.key)
+        if title:
+            seen_titles.add(title)
+        unique.append(item)
+    return unique
+
+
+def _mark_missing(
+    label: str,
+    missing: list[str],
+    reason: str = "unavailable",
+    detail: str | None = None,
+) -> None:
     """missing 목록에 같은 항목이 중복 추가되지 않도록 한다."""
 
-    if label not in missing:
-        missing.append(label)
+    if detail is not None:
+        entry = f"{label}({detail} {reason})"
+        if entry not in missing:
+            missing.append(entry)
+        return
+    if any(item == label or item.startswith(f"{label}(") for item in missing):
+        return
+    missing.append(f"{label}({reason})")

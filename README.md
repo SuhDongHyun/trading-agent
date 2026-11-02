@@ -45,6 +45,9 @@ uv sync
 trading_api:
   base_url: http://localhost:9999
   timeout_seconds: 10
+  market_timeouts:
+    vkospi: 3
+    vix: 5
 watchlist:
   - "005930"
 risk:
@@ -73,6 +76,11 @@ ledger:
 환경변수는 `TRADING_AGENT__RISK__MAX_ORDER_AMOUNT`처럼 중첩 키를
 `__`로 구분합니다.
 
+`trading_api.market_timeouts`에는 `kospi`, `kosdaq`, `sp500`, `vix`,
+`vkospi`, `fear_and_greed`, `usd_krw`, `korea_3y_yield`, `us_10y_yield`별
+timeout 초를 지정할 수 있습니다. 생략한 지표는 `trading_api.timeout_seconds`를
+사용합니다. 이 설정은 `config.yaml`에 추가하지 않아도 기본값이 코드에 있습니다.
+
 ## 실행
 
 ```sh
@@ -80,6 +88,7 @@ uv run trading-agent --help
 uv run trading-agent run --help
 uv run trading-agent run
 uv run trading-agent run --config ./config.yaml --db ./data/paper.sqlite
+uv run trading-agent run --force
 ```
 
 한 사이클은 계좌·시장 스냅샷 수집, Claude와 Codex의 독립 판단, 일치 제안의
@@ -89,6 +98,15 @@ uv run trading-agent run --config ./config.yaml --db ./data/paper.sqlite
 종목은 불일치(`action_mismatch`) 이력에 남기며, 한 모델이라도 실패하면 그 사이클은
 `model_failed`로 기록하고 제안을 승인하지 않습니다. 저장소는 기본적으로
 `data/trading-agent.db`이며 필요한 부모 디렉터리를 만듭니다.
+
+스냅샷에는 가장 최근 일봉 날짜인 `as_of_trading_date`와 KST 기준
+`market_session`(open, closed, pre_open, holiday)이 포함됩니다. 시장 지표는 최근
+14 calendar days, 수익률·이동평균 계산용 종목 데이터는 기존 120 calendar days를
+조회합니다. `run`은 주말에는 스냅샷 수집 없이, 평일 09:00 이후에는 실제로 받은
+최신 일봉 날짜가 오늘보다 이전일 때 `skipped` 상태로 기록하고 LLM 판단 없이 종료
+코드 0으로 끝납니다. 일봉을 받지 못했거나 조회가 실패해 날짜를 확인하지 못하면
+휴장으로 단정하지 않고 누락 원인을 기록한 뒤 판단을 진행합니다. `--force`는 휴장
+skip을 건너뜁니다. `recommend`는 휴장일에도 실행합니다.
 
 ### 종목 추천
 

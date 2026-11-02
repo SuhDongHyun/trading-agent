@@ -110,7 +110,7 @@ def test_completed_run_ranks_agreed_buys_and_ignores_codes_outside_snapshot(
 
     assert result.status is CycleStatus.COMPLETED
     assert gateway.account_reads == 0
-    assert [(item.code, item.confidence) for item in result.recommendations] == [
+    assert [(item.code, item.confidence) for item in result.recommendations or []] == [
         ("000660", 0.8),
         ("005930", 0.6),
     ]
@@ -164,7 +164,7 @@ def test_unreadable_quote_is_skipped_but_all_failing_is_data_failure(
     assert partial.status is CycleStatus.COMPLETED
     assert partial.snapshot is not None
     assert [stock.code for stock in partial.snapshot.stocks] == ["005930", "000660"]
-    assert "086520:quote" in partial.snapshot.missing
+    assert "086520:quote(unavailable)" in partial.snapshot.missing
 
     all_failing = FakeGateway(failing_quotes=frozenset({"005930", "000660", "086520"}))
     use_case, _, _ = build(tmp_path / "b.sqlite", all_failing)

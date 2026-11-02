@@ -6,12 +6,12 @@ from trading_agent.application.records import CycleStatus, DecisionCycleResult
 from trading_agent.interface.cli import main
 
 
-class FakeRuntime:
-    def __init__(self, result: DecisionCycleResult) -> None:
+class FakeRuntime[R]:
+    def __init__(self, result: R) -> None:
         self.result = result
         self.closed = False
 
-    def run(self) -> DecisionCycleResult:
+    def run(self) -> R:
         return self.result
 
     def close(self) -> None:
@@ -22,6 +22,7 @@ class FakeRuntime:
     ("status", "expected_exit"),
     [
         (CycleStatus.COMPLETED, 0),
+        (CycleStatus.SKIPPED, 0),
         (CycleStatus.MODEL_FAILED, 2),
         (CycleStatus.DATA_FAILED, 1),
         (CycleStatus.ERROR, 1),
@@ -78,6 +79,22 @@ def test_missing_explicit_config_returns_error_before_runtime_creation(
     assert exit_code == 1
     assert not created
     assert "설정 파일을 찾을 수 없습니다" in capsys.readouterr().err
+
+
+def test_run_force_flag_is_forwarded_to_runtime_factory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    runtime = FakeRuntime(DecisionCycleResult(run_id=1, status=CycleStatus.COMPLETED))
+    calls = []
+
+    def runtime_factory(settings, db_path, force):
+        calls.append(force)
+        return runtime
+
+    assert main(["run", "--force"], runtime_factory=runtime_factory) == 0
+    assert calls == [True]
+    assert runtime.closed
 
 
 def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
@@ -141,7 +158,7 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
         outcome=RecommendationConsensusOutcome(run, run, consensus),
         recommendations=[*buys, sell],
     )
-    runtime = FakeRuntime(result)  # type: ignore[arg-type]
+    runtime = FakeRuntime(result)
 
     exit_code = main(
         ["recommend", "--top", "1"],

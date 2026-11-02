@@ -2,7 +2,8 @@
 
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 from trading_agent.application.consensus_service import (
     ConsensusDecisionResult,
@@ -15,9 +16,14 @@ from trading_agent.application.records import (
     CycleStatus,
     DecisionCycleResult,
 )
-from trading_agent.application.snapshot_builder import SnapshotBuilder
+from trading_agent.application.snapshot_builder import (
+    SnapshotBuilder,
+    has_daily_request_failure,
+)
 from trading_agent.domain.models import MarketSnapshot
 from trading_agent.domain.risk import RiskGuard, RiskPolicy
+
+MARKET_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 
 class RunDecisionCycle:
@@ -34,6 +40,7 @@ class RunDecisionCycle:
         prompt_builder: Callable[[MarketSnapshot, RiskPolicy], str] = (
             build_decision_prompt
         ),
+        force: bool = False,
     ) -> None:
         self.snapshot_builder = snapshot_builder
         self.consensus_service = consensus_service
@@ -41,6 +48,7 @@ class RunDecisionCycle:
         self.watchlist = frozenset(watchlist)
         self.ledger = ledger
         self.clock = clock
+        self.force = force
         self.prompt_builder = prompt_builder
 
     def run(self) -> DecisionCycleResult:
@@ -52,37 +60,50 @@ class RunDecisionCycle:
         decision = None
         verdicts = []
         try:
-            snapshot = self.snapshot_builder.build()
-            allowed_codes = self.watchlist | frozenset(
-                position.code for position in snapshot.account.positions
-            )
-            policy = replace(self.risk_policy, allowed_codes=allowed_codes)
-            prompt = self.prompt_builder(snapshot, policy)
-            decision = self.consensus_service.decide(prompt)
-            if decision.failed:
+            skip_reason = None if self.force else _skip_reason(None, self.clock())
+            if skip_reason is None:
+                snapshot = self.snapshot_builder.build()
+                if not self.force:
+                    skip_reason = _skip_reason(snapshot, snapshot.created_at)
+            if skip_reason is not None:
                 result = DecisionCycleResult(
                     run_id=run_id,
-                    status=CycleStatus.MODEL_FAILED,
-                    error=_model_failure_detail(decision),
-                    prompt=prompt,
+                    status=CycleStatus.SKIPPED,
+                    error=skip_reason,
                     snapshot=snapshot,
-                    decision=decision,
                 )
             else:
-                assert decision.consensus is not None
-                verdicts = RiskGuard.review(
-                    decision.consensus.proposals,
-                    snapshot.account,
-                    policy,
+                assert snapshot is not None
+                allowed_codes = self.watchlist | frozenset(
+                    position.code for position in snapshot.account.positions
                 )
-                result = DecisionCycleResult(
-                    run_id=run_id,
-                    status=CycleStatus.COMPLETED,
-                    prompt=prompt,
-                    snapshot=snapshot,
-                    decision=decision,
-                    verdicts=verdicts,
-                )
+                policy = replace(self.risk_policy, allowed_codes=allowed_codes)
+                prompt = self.prompt_builder(snapshot, policy)
+                decision = self.consensus_service.decide(prompt)
+                if decision.failed:
+                    result = DecisionCycleResult(
+                        run_id=run_id,
+                        status=CycleStatus.MODEL_FAILED,
+                        error=_model_failure_detail(decision),
+                        prompt=prompt,
+                        snapshot=snapshot,
+                        decision=decision,
+                    )
+                else:
+                    assert decision.consensus is not None
+                    verdicts = RiskGuard.review(
+                        decision.consensus.proposals,
+                        snapshot.account,
+                        policy,
+                    )
+                    result = DecisionCycleResult(
+                        run_id=run_id,
+                        status=CycleStatus.COMPLETED,
+                        prompt=prompt,
+                        snapshot=snapshot,
+                        decision=decision,
+                        verdicts=verdicts,
+                    )
         except MarketDataUnavailable as error:
             result = DecisionCycleResult(
                 run_id=run_id,
@@ -105,7 +126,7 @@ class RunDecisionCycle:
             )
 
         finished_at = self.clock()
-        if result.status is CycleStatus.COMPLETED:
+        if result.status in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
             self.ledger.complete_cycle(result, finished_at)
         else:
             self.ledger.fail_cycle(result, finished_at)
@@ -120,3 +141,27 @@ def _model_failure_detail(decision: ConsensusDecisionResult) -> str:
         if model_run.error:
             details.append(f"{model_run.model_id}: {model_run.error}")
     return "; ".join(details) or "두 모델 합의 판단에 실패했습니다."
+
+
+def _skip_reason(snapshot: MarketSnapshot | None, now: datetime) -> str | None:
+    """주말 또는 장 시작 후 오늘 일봉이 없으면 skip 사유를 반환한다."""
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("clock는 timezone-aware datetime을 반환해야 합니다.")
+    local_now = now.astimezone(MARKET_TIMEZONE)
+    if local_now.weekday() >= 5:
+        return "주말 휴장일이므로 모델 판단을 생략했습니다."
+    if snapshot is None:
+        return None
+    today = local_now.date().strftime("%Y%m%d")
+    latest_date = snapshot.as_of_trading_date
+    if (
+        local_now.time() >= time(9)
+        and latest_date is not None
+        and latest_date < today
+        and not has_daily_request_failure(snapshot.missing)
+    ):
+        return (
+            f"오늘 일봉이 없고 최신 일봉은 {latest_date}여서 모델 판단을 생략했습니다."
+        )
+    return None
