@@ -233,6 +233,21 @@ class Action(StrEnum):
     HOLD = "hold"
 
 
+class ProposalSource(StrEnum):
+    """매매 제안이 만들어진 경로."""
+
+    CONSENSUS = "consensus"
+    RULE = "rule"
+
+
+class RuleType(StrEnum):
+    """규칙 기반 매매 제안의 종류."""
+
+    STOP_LOSS = "stop_loss"
+    TAKE_PROFIT = "take_profit"
+    REBALANCE = "rebalance"
+
+
 @dataclass(frozen=True, slots=True)
 class TradeProposal:
     """모델이 제시한 단일 매매 제안."""
@@ -243,11 +258,24 @@ class TradeProposal:
     limit_price: Decimal
     confidence: float
     reason: str
+    source: ProposalSource = ProposalSource.CONSENSUS
+    rule_type: RuleType | None = None
 
     def __post_init__(self) -> None:
         require_stock_code(self.code)
         action = require_action(self.action)
         object.__setattr__(self, "action", action)
+        try:
+            source = ProposalSource(self.source)
+            rule_type = RuleType(self.rule_type) if self.rule_type is not None else None
+        except (TypeError, ValueError) as error:
+            raise DomainError(
+                "제안 출처 또는 규칙 종류가 올바르지 않습니다."
+            ) from error
+        if (source is ProposalSource.RULE) != (rule_type is not None):
+            raise DomainError("규칙 제안에는 규칙 종류가 필요합니다.")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "rule_type", rule_type)
         if not isinstance(self.quantity, int) or isinstance(self.quantity, bool):
             raise DomainError("매매 수량은 정수여야 합니다.")
         if action in (Action.BUY, Action.SELL) and self.quantity <= 0:

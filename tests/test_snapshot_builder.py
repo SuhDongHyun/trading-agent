@@ -20,7 +20,9 @@ from trading_agent.application.snapshot_builder import (
     calculate_return_percent,
     calculate_volume_change_percent,
 )
-from trading_agent.domain.models import AccountSnapshot, Position
+from trading_agent.domain.models import AccountSnapshot, Position, RuleType
+from trading_agent.domain.risk import RiskPolicy
+from trading_agent.domain.rules import generate_rule_proposals
 
 
 class FakeMarketDataGateway(MarketDataGateway):
@@ -45,7 +47,7 @@ class FakeMarketDataGateway(MarketDataGateway):
         return AccountSnapshot(
             cash=Decimal("1000"),
             positions=[
-                Position("005930", "삼성전자", 2),
+                Position("005930", "삼성전자", 2, profit_loss_rate=Decimal("10")),
                 Position("051910", "LG화학", 1),
             ],
         )
@@ -196,6 +198,9 @@ def test_snapshot_builder_merges_watchlist_and_holdings_and_summarizes_data() ->
     ]
     assert snapshot.account.positions[0].current_price == Decimal("100")
     assert snapshot.account.positions[1].current_price == Decimal("200")
+    assert snapshot.account.positions[0].average_price == Decimal("100") / Decimal(
+        "1.1"
+    )
     assert snapshot.account.total_asset_value == Decimal("1400")
     assert snapshot.market_context.kospi_change_percent == Decimal("0.6")
     assert snapshot.market_context.sp500_change_percent == Decimal("10")
@@ -271,6 +276,53 @@ def test_snapshot_builder_rejects_naive_clock_datetime() -> None:
 
     with pytest.raises(ValueError, match="timezone-aware"):
         builder.build()
+
+
+@pytest.mark.parametrize(
+    ("price", "profit_loss_rate", "expected_rule"),
+    [
+        ("1000", "-10", RuleType.STOP_LOSS),
+        ("1202", "20", RuleType.TAKE_PROFIT),
+    ],
+)
+def test_snapshot_rate_triggers_rule_at_boundary_for_non_divisible_price(
+    price: str,
+    profit_loss_rate: str,
+    expected_rule: RuleType,
+) -> None:
+    class AccountRateGateway(FakeMarketDataGateway):
+        def get_account(self) -> AccountSnapshot:
+            return AccountSnapshot(
+                Decimal("10000"),
+                [
+                    Position(
+                        "005930",
+                        "삼성전자",
+                        1,
+                        profit_loss_rate=Decimal(profit_loss_rate),
+                    )
+                ],
+            )
+
+        def get_stock_quote(self, code: str) -> StockQuote:
+            return StockQuote(code, "삼성전자", Decimal(price), Decimal("0"))
+
+    snapshot = SnapshotBuilder(
+        AccountRateGateway(),
+        ["005930"],
+        clock=lambda: datetime(2026, 10, 29, tzinfo=UTC),
+    ).build()
+    policy = RiskPolicy(
+        max_position_weight=Decimal("1"),
+        stop_loss_percent=Decimal("10"),
+        take_profit_percent=Decimal("20"),
+        allowed_codes={"005930"},
+    )
+
+    proposals = generate_rule_proposals(snapshot.account, policy)
+
+    assert len(proposals) == 1
+    assert proposals[0].rule_type is expected_rule
 
 
 def test_research_fetches_news_for_today_and_latest_bar_and_deduplicates() -> None:

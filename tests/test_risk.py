@@ -2,7 +2,14 @@ from decimal import Decimal
 
 import pytest
 
-from trading_agent.domain.models import AccountSnapshot, Action, Position, TradeProposal
+from trading_agent.domain.models import (
+    AccountSnapshot,
+    Action,
+    Position,
+    ProposalSource,
+    RuleType,
+    TradeProposal,
+)
 from trading_agent.domain.risk import (
     RiskGuard,
     RiskPolicy,
@@ -31,6 +38,7 @@ def policy(**overrides: object) -> RiskPolicy:
     values: dict[str, object] = {
         "max_position_weight": Decimal("0.5"),
         "max_order_amount": Decimal("1000"),
+        "max_order_ratio": Decimal("1"),
         "min_confidence": 0.7,
         "allowed_codes": {"005930", "000660"},
         "max_proposals_per_cycle": 5,
@@ -215,12 +223,161 @@ def test_cycle_limit_applies_after_maximum_approved_proposals() -> None:
     assert RiskReasonCode.CYCLE_LIMIT_EXCEEDED in reason_codes(verdicts[1])
 
 
+def test_order_limit_uses_the_lower_of_asset_ratio_and_absolute_cap() -> None:
+    verdicts = RiskGuard.review(
+        [
+            proposal(quantity=15, price="10"),
+            proposal(code="000660", quantity=16, price="10"),
+        ],
+        account(cash="1000"),
+        policy(
+            max_order_ratio=Decimal("0.2"),
+            max_order_amount=Decimal("150"),
+            max_position_weight=Decimal("1"),
+        ),
+    )
+
+    assert verdicts[0].approved
+    assert RiskReasonCode.ORDER_AMOUNT_EXCEEDED in reason_codes(verdicts[1])
+
+
+def test_sell_may_exceed_order_limit_only_for_required_weight_reduction() -> None:
+    account_snapshot = account(
+        cash="300",
+        positions=[Position("005930", "A", 70, current_price=Decimal("10"))],
+    )
+    verdicts = RiskGuard.review(
+        [
+            proposal(action=Action.SELL, quantity=20, price="10"),
+            proposal(action=Action.SELL, quantity=21, price="10"),
+        ],
+        account_snapshot,
+        policy(
+            max_position_weight=Decimal("0.5"),
+            max_order_ratio=Decimal("0.1"),
+            max_order_amount=Decimal("100"),
+        ),
+    )
+
+    assert verdicts[0].approved
+    assert RiskReasonCode.ORDER_AMOUNT_EXCEEDED in reason_codes(verdicts[1])
+    assert RiskReasonCode.NOT_ENOUGH_SHARES not in reason_codes(verdicts[1])
+
+
+def test_sell_allowance_uses_normal_limit_if_it_exceeds_reduction_need() -> None:
+    account_snapshot = account(
+        cash="500",
+        positions=[Position("005930", "A", 50, current_price=Decimal("10"))],
+    )
+    verdicts = RiskGuard.review(
+        [proposal(action=Action.SELL, quantity=20, price="10")],
+        account_snapshot,
+        policy(
+            max_position_weight=Decimal("0.5"),
+            max_order_ratio=Decimal("0.5"),
+            max_order_amount=Decimal("250"),
+        ),
+    )
+
+    assert verdicts[0].approved
+
+
+def test_reduction_exception_uses_position_current_price_not_proposal_limit() -> None:
+    account_snapshot = account(
+        cash="300",
+        positions=[Position("005930", "A", 70, current_price=Decimal("10"))],
+    )
+    risk_policy = policy(
+        max_position_weight=Decimal("0.5"),
+        max_order_ratio=Decimal("0.1"),
+        max_order_amount=Decimal("100"),
+    )
+
+    required_quantity = RiskGuard.review(
+        [proposal(action=Action.SELL, quantity=20, price="12")],
+        account_snapshot,
+        risk_policy,
+    )[0]
+    beyond_required = RiskGuard.review(
+        [proposal(action=Action.SELL, quantity=21, price="8")],
+        account_snapshot,
+        risk_policy,
+    )[0]
+
+    assert required_quantity.approved
+    assert RiskReasonCode.ORDER_AMOUNT_EXCEEDED in reason_codes(beyond_required)
+
+
+def test_order_limit_fails_closed_when_total_assets_are_unavailable() -> None:
+    verdict = RiskGuard.review(
+        [proposal()],
+        account(positions=[Position("005930", "A", 1)]),
+        policy(),
+    )[0]
+
+    assert RiskReasonCode.ACCOUNT_VALUE_UNAVAILABLE in reason_codes(verdict)
+    assert (
+        sum(
+            issue.code is RiskReasonCode.ACCOUNT_VALUE_UNAVAILABLE
+            for issue in verdict.reasons
+        )
+        == 1
+    )
+
+
+def test_rule_sell_bypasses_order_and_total_asset_limits_but_checks_holding() -> None:
+    rule_sell = TradeProposal(
+        code="005930",
+        action=Action.SELL,
+        quantity=15,
+        limit_price=Decimal("100"),
+        confidence=1.0,
+        reason="손절 규칙",
+        source=ProposalSource.RULE,
+        rule_type=RuleType.STOP_LOSS,
+    )
+    account_snapshot = account(
+        cash="1000",
+        positions=[
+            Position("005930", "A", 15, current_price=Decimal("100")),
+            Position("000660", "B", 1),
+        ],
+    )
+
+    verdict = RiskGuard.review(
+        [rule_sell],
+        account_snapshot,
+        policy(max_order_ratio=Decimal("0.1"), max_order_amount=Decimal("10")),
+    )[0]
+
+    assert verdict.approved
+
+
+def test_zero_total_assets_adds_unavailable_reason_only_once() -> None:
+    verdict = RiskGuard.review(
+        [proposal()],
+        account(cash="0"),
+        policy(),
+    )[0]
+
+    assert (
+        sum(
+            issue.code is RiskReasonCode.ACCOUNT_VALUE_UNAVAILABLE
+            for issue in verdict.reasons
+        )
+        == 1
+    )
+
+
 @pytest.mark.parametrize(
     "policy_values",
     [
         {"max_position_weight": Decimal("0")},
         {"max_position_weight": Decimal("1.1")},
         {"max_order_amount": Decimal("0")},
+        {"max_order_ratio": Decimal("0")},
+        {"max_order_ratio": Decimal("1.1")},
+        {"take_profit_sell_fraction": Decimal("1.1")},
         {"min_confidence": 1.1},
         {"max_proposals_per_cycle": 0},
     ],

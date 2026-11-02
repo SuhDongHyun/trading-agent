@@ -52,9 +52,13 @@ watchlist:
   - "005930"
 risk:
   max_position_weight: 0.2
+  max_order_ratio: 0.1
   max_order_amount: 500000
   min_confidence: 0.7
   max_proposals_per_cycle: 5
+  stop_loss_percent: 10
+  take_profit_percent: 20
+  take_profit_sell_fraction: 0.5
 recommendation:
   universe: []        # 비우면 watchlist를 추천 후보로 사용
   max_results: 5      # recommend 출력에 표시할 BUY 수
@@ -75,6 +79,48 @@ ledger:
 
 환경변수는 `TRADING_AGENT__RISK__MAX_ORDER_AMOUNT`처럼 중첩 키를
 `__`로 구분합니다.
+
+## 리스크 정책
+
+주문 금액 한도는 계좌 총자산의 `max_order_ratio` 비율로 계산합니다(기본값
+`0.1`). `max_order_amount`는 선택적인 절대 상한이며, 설정하면 비율 한도와 절대
+상한 중 더 낮은 값을 적용합니다. 예시의 500,000원 상한은 총자산이 500만 원을
+넘을 때 주문 크기를 추가로 제한합니다. 총자산을 계산할 수 없으면 제안을 거절합니다.
+
+| 설정 | 기본값 | 동작 |
+| --- | --- | --- |
+| `max_position_weight` | `0.2` | 매수 후 한 종목이 총자산에서 차지할 수 있는 최대 비중 |
+| `max_order_ratio` | `0.1` | 1회 주문 금액의 총자산 비율 상한 (`0 < 값 ≤ 1`) |
+| `max_order_amount` | `null` | 선택적인 1회 주문 절대 금액 상한 |
+| `stop_loss_percent` | `null` | 평균 매입가 대비 해당 하락률 이하이면 전량 매도 규칙을 평가 |
+| `take_profit_percent` | `null` | 평균 매입가 대비 해당 상승률 이상이면 일부 매도 규칙을 평가 |
+| `take_profit_sell_fraction` | `0.5` | 익절 시 매도할 보유 수량 비율 (`0 < 값 ≤ 1`, 내림 후 최소 1주) |
+
+기존 설정의 `max_order_amount` 키는 계속 읽고 적용합니다. 업그레이드 후에도
+기존 절대 상한을 유지하려면 해당 값을 남겨 두세요. LLM 합의 매도는 현재 비중이
+한도를 넘은 종목에서 한도까지 줄이는 데 필요한 수량만 일반 주문 금액 한도에서
+예외 처리하며, 추가 매도에는 일반 한도가 적용됩니다. 보유 수량을 넘는 매도는
+계속 거절합니다.
+
+보유 수량, 현재가, 총자산을 확인할 수 있으면 다음 규칙을 LLM 합의와 독립적으로
+평가합니다. `stop_loss_percent`와 `take_profit_percent`가 `null`이면 각각의 규칙은
+꺼집니다. 규칙 제안은 신뢰도 1.0으로 같은 Risk Guard를 통과해야 하고, 같은 종목의
+합의 제안은 규칙 제안 뒤에 검토되어 중복으로 거절됩니다.
+
+| 우선순위 | 규칙 | 제안 |
+| --- | --- | --- |
+| 1 | 손절 | 수익률이 기준 이하이면 보유 전량 매도 |
+| 2 | 익절 | 수익률이 기준 이상이면 설정 비율을 매도 |
+| 3 | 리밸런싱 | 종목 비중이 `max_position_weight`를 넘으면 한도까지 축소 매도 |
+
+규칙에서 만든 손절·익절·리밸런싱 SELL은 주문 금액 한도를 넘더라도 보유 수량
+이내이면 승인 검사를 계속합니다. LLM 합의 SELL에는 일반 주문 한도가 적용되고,
+현재 비중이 한도를 넘은 종목은 필요한 축소 수량만 예외 처리합니다.
+
+손절·익절 기본값은 비활성화되어 있습니다. 예시처럼 `10`과 `20`을 설정하면 평균
+매입가 대비 -10% 이하에서 전량 손절, +20% 이상에서 기본 보유량의 절반을 익절합니다.
+trading-api 계좌 응답의 평균 매입가 항목이 제공되지 않아, 계좌 손익률과 현재가에서
+평균 매입가를 계산해 스냅샷에 채웁니다.
 
 `trading_api.market_timeouts`에는 `kospi`, `kosdaq`, `sp500`, `vix`,
 `vkospi`, `fear_and_greed`, `usd_krw`, `korea_3y_yield`, `us_10y_yield`별
@@ -173,7 +219,9 @@ WHERE c.run_id = (
 ORDER BY c.rank;
 ```
 
-기존 v1 DB는 처음 열 때 v2로 자동 이전됩니다(`runs.kind` 열과 추천 테이블 추가).
+기존 v1·v2 DB는 처음 열 때 v3으로 자동 이전됩니다. 기존 리스크 판정에는
+`source = 'consensus'`가 채워지고, 새 규칙 제안은 `source = 'rule'`과 규칙 종류를
+함께 기록합니다.
 
 ## 안전
 

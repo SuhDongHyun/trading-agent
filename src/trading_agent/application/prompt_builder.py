@@ -46,7 +46,29 @@ def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
     )
     risk_policy = {
         "max_position_weight": str(policy.max_position_weight),
-        "max_order_amount": str(policy.max_order_amount),
+        "max_order_ratio": str(policy.max_order_ratio),
+        "max_order_amount": (
+            str(policy.max_order_amount)
+            if policy.max_order_amount is not None
+            else None
+        ),
+        "effective_max_order_amount": (
+            str(policy.effective_order_limit(snapshot.account.total_asset_value))
+            if policy.effective_order_limit(snapshot.account.total_asset_value)
+            is not None
+            else None
+        ),
+        "stop_loss_percent": (
+            str(policy.stop_loss_percent)
+            if policy.stop_loss_percent is not None
+            else None
+        ),
+        "take_profit_percent": (
+            str(policy.take_profit_percent)
+            if policy.take_profit_percent is not None
+            else None
+        ),
+        "take_profit_sell_fraction": str(policy.take_profit_sell_fraction),
         "min_confidence": policy.min_confidence,
         "allowed_codes": sorted(policy.allowed_codes),
         "max_proposals_per_cycle": policy.max_proposals_per_cycle,
@@ -64,6 +86,7 @@ def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
   매매하지 않을 종목은 action을 hold, quantity를 0, limit_price를 현재가로 적으세요.
 - 보유하지 않은 종목은 SELL로 제안하지 마세요. 현재 보유 종목 코드는 {held_codes}입니다.
 - 현금, 허용 종목, 주문 금액·종목 비중·최소 확신도 정책을 지키세요.
+- 손절·익절·비중 초과 축소는 시스템 규칙이 자동 처리하므로 같은 매도를 제안하지 마세요.
 - 확신이 낮으면 buy·sell 대신 hold로 적으세요.
 - 필요한데 제공되지 않은 데이터는 missing_info에 적으세요.
 - snapshot.missing에 이미 있는 항목은 missing_info에 다시 적지 마세요.

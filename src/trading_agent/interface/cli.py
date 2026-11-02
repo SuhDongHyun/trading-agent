@@ -12,7 +12,7 @@ from trading_agent.application.records import (
     DecisionCycleResult,
     RecommendationRunResult,
 )
-from trading_agent.domain.models import Action
+from trading_agent.domain.models import Action, TradeProposal
 from trading_agent.domain.recommendation import StockRecommendation
 from trading_agent.infrastructure.config import AgentSettings, load_settings
 from trading_agent.interface.bootstrap import (
@@ -114,23 +114,42 @@ def _print_result(result: DecisionCycleResult) -> None:
     consensus = result.decision.consensus if result.decision is not None else None
     proposal_count = len(consensus.proposals) if consensus is not None else 0
     disagreement_count = len(consensus.disagreements) if consensus is not None else 0
-    approved = [verdict for verdict in result.verdicts or [] if verdict.approved]
+    verdicts = result.verdicts or []
+    approved = [verdict for verdict in verdicts if verdict.approved]
+    rejected = [verdict for verdict in verdicts if not verdict.approved]
     missing_info = consensus.missing_info if consensus is not None else []
     print(f"상태: {result.status.value}")
     print(f"합의 채택: {proposal_count}건, 불일치: {disagreement_count}건")
     if approved:
         approved_summary = ", ".join(
-            f"{item.proposal.code} {item.proposal.action.value.upper()} "
+            f"{_proposal_origin(item.proposal)} {item.proposal.code} "
+            f"{item.proposal.action.value.upper()} "
             f"x{item.proposal.quantity} @ {item.proposal.limit_price}"
             for item in approved
         )
     else:
         approved_summary = "없음"
     print(f"리스크 승인: {approved_summary}")
+    if rejected:
+        rejected_summary = "; ".join(
+            f"{_proposal_origin(item.proposal)} {item.proposal.code} "
+            f"{item.proposal.action.value.upper()} x{item.proposal.quantity}: "
+            f"{', '.join(reason.message for reason in item.reasons)}"
+            for item in rejected
+        )
+        print(f"리스크 거절: {rejected_summary}")
     print(f"missing_info: {', '.join(missing_info) if missing_info else '없음'}")
     if result.error:
         label = "사유" if result.status is CycleStatus.SKIPPED else "오류"
         print(f"{label}: {result.error}")
+
+
+def _proposal_origin(proposal: TradeProposal) -> str:
+    """제안 출처와 규칙 종류를 CLI에 표시한다."""
+
+    if proposal.rule_type is not None:
+        return f"규칙({proposal.rule_type.value})"
+    return "합의(consensus)"
 
 
 def _print_recommendations(result: RecommendationRunResult, top: int) -> None:

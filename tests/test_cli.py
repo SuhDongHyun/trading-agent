@@ -97,6 +97,64 @@ def test_run_force_flag_is_forwarded_to_runtime_factory(
     assert runtime.closed
 
 
+def test_run_prints_approved_and_rejected_sources(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from decimal import Decimal
+
+    from trading_agent.domain.models import (
+        Action,
+        ProposalSource,
+        RuleType,
+        TradeProposal,
+    )
+    from trading_agent.domain.risk import (
+        RiskIssue,
+        RiskReasonCode,
+        RiskVerdict,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    rule = TradeProposal(
+        "005930",
+        Action.SELL,
+        1,
+        Decimal("100"),
+        1.0,
+        "손절",
+        source=ProposalSource.RULE,
+        rule_type=RuleType.STOP_LOSS,
+    )
+    consensus = TradeProposal(
+        "000660", Action.SELL, 1, Decimal("200"), 0.9, "합의 매도"
+    )
+    result = DecisionCycleResult(
+        run_id=1,
+        status=CycleStatus.COMPLETED,
+        verdicts=[
+            RiskVerdict(rule, True, []),
+            RiskVerdict(
+                consensus,
+                False,
+                [
+                    RiskIssue(
+                        RiskReasonCode.DUPLICATE_CODE,
+                        "중복 제안입니다.",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert main(["run"], runtime_factory=lambda settings, db: FakeRuntime(result)) == 0
+
+    output = capsys.readouterr().out
+    assert "규칙(stop_loss) 005930 SELL" in output
+    assert "합의(consensus) 000660 SELL" in output
+    assert "리스크 거절:" in output
+    assert "중복 제안입니다." in output
+
+
 def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

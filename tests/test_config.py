@@ -19,6 +19,7 @@ def test_yaml_settings_are_loaded(tmp_path: Path) -> None:
     assert settings.trading_api.base_url == "http://yaml.example"
     assert settings.watchlist == ["005930"]
     assert settings.risk.max_order_amount == 12345
+    assert settings.risk.max_order_ratio == 0.1
 
 
 def test_environment_overrides_yaml_settings(
@@ -71,6 +72,11 @@ def test_missing_default_config_uses_builtin_defaults(
     settings = load_settings()
 
     assert settings.watchlist == []
+    assert settings.risk.max_order_amount is None
+    assert settings.risk.max_order_ratio == 0.1
+    assert settings.risk.stop_loss_percent is None
+    assert settings.risk.take_profit_percent is None
+    assert settings.risk.take_profit_sell_fraction == 0.5
 
 
 def test_market_indicator_timeout_override_uses_default_when_missing() -> None:

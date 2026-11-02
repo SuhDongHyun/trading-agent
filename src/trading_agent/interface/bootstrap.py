@@ -71,10 +71,26 @@ def create_runtime(
     )
     risk_policy = RiskPolicy(
         max_position_weight=Decimal(str(settings.risk.max_position_weight)),
-        max_order_amount=Decimal(str(settings.risk.max_order_amount)),
+        max_order_amount=(
+            Decimal(str(settings.risk.max_order_amount))
+            if settings.risk.max_order_amount is not None
+            else None
+        ),
         min_confidence=settings.risk.min_confidence,
         allowed_codes=set(settings.watchlist),
         max_proposals_per_cycle=settings.risk.max_proposals_per_cycle,
+        max_order_ratio=Decimal(str(settings.risk.max_order_ratio)),
+        stop_loss_percent=(
+            Decimal(str(settings.risk.stop_loss_percent))
+            if settings.risk.stop_loss_percent is not None
+            else None
+        ),
+        take_profit_percent=(
+            Decimal(str(settings.risk.take_profit_percent))
+            if settings.risk.take_profit_percent is not None
+            else None
+        ),
+        take_profit_sell_fraction=Decimal(str(settings.risk.take_profit_sell_fraction)),
     )
     cycle = RunDecisionCycle(
         snapshot_builder=SnapshotBuilder(gateway, settings.watchlist, clock=clock),

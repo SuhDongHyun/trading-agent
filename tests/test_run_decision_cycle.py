@@ -21,8 +21,10 @@ from trading_agent.application.records import CycleStatus
 from trading_agent.application.run_decision_cycle import RunDecisionCycle
 from trading_agent.application.snapshot_builder import SnapshotBuilder
 from trading_agent.domain.models import (
+    AccountSnapshot,
     Action,
     ModelDecision,
+    Position,
     TradeProposal,
 )
 from trading_agent.domain.risk import RiskPolicy
@@ -457,3 +459,80 @@ def test_sql_queries_find_latest_approvals_and_disagreement_history(
 
     assert latest_approved == ("005930", "buy", 2, "100.123456788")
     assert disagreement == ("000660", "action_mismatch")
+
+
+class StopLossGateway(FakeGateway):
+    """현재가가 평균 매입가보다 낮은 단일 보유 계좌를 반환한다."""
+
+    def get_account(self) -> AccountSnapshot:
+        return AccountSnapshot(
+            Decimal("8500"),
+            [Position("005930", "삼성전자", 15, profit_loss_rate=Decimal("-10"))],
+        )
+
+    def get_stock_quote(self, code: str) -> StockQuote:
+        return StockQuote(code, "삼성전자", Decimal("100"), Decimal("0"))
+
+
+def build_rule_cycle(db_path: Path, *, model_failure: bool = False) -> RunDecisionCycle:
+    gateway = StopLossGateway()
+    proposal = make_proposal("005930", "10")
+    claude = FakeDecisionModel(
+        "claude", make_decision("claude", [proposal]), fail=model_failure
+    )
+    codex = FakeDecisionModel("codex", make_decision("codex", [proposal]))
+    return RunDecisionCycle(
+        snapshot_builder=SnapshotBuilder(gateway, ["005930"], clock=lambda: FIXED_NOW),
+        consensus_service=ConsensusDecisionService(claude, codex),
+        risk_policy=RiskPolicy(
+            max_position_weight=Decimal("0.2"),
+            max_order_amount=None,
+            max_order_ratio=Decimal("0.1"),
+            stop_loss_percent=Decimal("10"),
+            min_confidence=0.7,
+            allowed_codes={"005930"},
+            max_proposals_per_cycle=5,
+        ),
+        watchlist=["005930"],
+        ledger=SQLiteDecisionLedger(db_path),
+        clock=lambda: FIXED_NOW,
+    )
+
+
+def test_rule_proposal_is_recorded_when_models_fail(tmp_path: Path) -> None:
+    db_path = tmp_path / "rule-model-failure.sqlite"
+
+    result = build_rule_cycle(db_path, model_failure=True).run()
+
+    assert result.status is CycleStatus.MODEL_FAILED
+    assert result.snapshot is not None
+    assert result.snapshot.account.total_asset_value == Decimal("10000")
+    assert len(result.verdicts) == 1
+    assert result.verdicts[0].proposal.source.value == "rule"
+    assert result.verdicts[0].proposal.rule_type.value == "stop_loss"
+    assert result.verdicts[0].proposal.quantity == 15
+    assert result.verdicts[0].proposal.limit_price * result.verdicts[
+        0
+    ].proposal.quantity > Decimal("1000")
+    assert result.verdicts[0].approved
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT source, rule_type, approved FROM risk_verdicts WHERE run_id = ?",
+            (result.run_id,),
+        ).fetchone()
+    assert row == ("rule", "stop_loss", 1)
+
+
+def test_rule_proposal_precedes_and_blocks_same_code_consensus(tmp_path: Path) -> None:
+    result = build_rule_cycle(tmp_path / "rule-duplicate.sqlite").run()
+
+    assert result.status is CycleStatus.COMPLETED
+    assert [item.proposal.source.value for item in result.verdicts] == [
+        "rule",
+        "consensus",
+    ]
+    assert result.verdicts[0].approved
+    assert not result.verdicts[1].approved
+    assert any(
+        issue.code.value == "duplicate_code" for issue in result.verdicts[1].reasons
+    )

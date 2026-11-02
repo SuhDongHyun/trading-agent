@@ -22,6 +22,7 @@ from trading_agent.application.snapshot_builder import (
 )
 from trading_agent.domain.models import MarketSnapshot
 from trading_agent.domain.risk import RiskGuard, RiskPolicy
+from trading_agent.domain.rules import generate_rule_proposals
 
 MARKET_TIMEZONE = ZoneInfo("Asia/Seoul")
 
@@ -78,9 +79,15 @@ class RunDecisionCycle:
                     position.code for position in snapshot.account.positions
                 )
                 policy = replace(self.risk_policy, allowed_codes=allowed_codes)
+                rule_proposals = generate_rule_proposals(snapshot.account, policy)
                 prompt = self.prompt_builder(snapshot, policy)
                 decision = self.consensus_service.decide(prompt)
                 if decision.failed:
+                    verdicts = RiskGuard.review(
+                        rule_proposals,
+                        snapshot.account,
+                        policy,
+                    )
                     result = DecisionCycleResult(
                         run_id=run_id,
                         status=CycleStatus.MODEL_FAILED,
@@ -88,11 +95,12 @@ class RunDecisionCycle:
                         prompt=prompt,
                         snapshot=snapshot,
                         decision=decision,
+                        verdicts=verdicts,
                     )
                 else:
                     assert decision.consensus is not None
                     verdicts = RiskGuard.review(
-                        decision.consensus.proposals,
+                        [*rule_proposals, *decision.consensus.proposals],
                         snapshot.account,
                         policy,
                     )
