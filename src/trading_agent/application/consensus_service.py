@@ -7,15 +7,20 @@ from time import perf_counter
 from trading_agent.application.errors import DecisionModelError
 from trading_agent.application.ports import DecisionModel, ModelRun
 from trading_agent.domain.consensus import ConsensusPolicy, ConsensusResult
-from trading_agent.domain.models import TradeProposal
+from trading_agent.domain.models import ModelDecision, TradeProposal
+from trading_agent.domain.recommendation import (
+    ModelRecommendation,
+    RecommendationConsensusPolicy,
+    RecommendationConsensusResult,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ConsensusDecisionResult:
     """두 모델 원문과 성공 시 합의 결과를 함께 보존한다."""
 
-    claude_run: ModelRun
-    codex_run: ModelRun
+    claude_run: ModelRun[ModelDecision]
+    codex_run: ModelRun[ModelDecision]
     consensus: ConsensusResult | None
 
     @property
@@ -31,34 +36,81 @@ class ConsensusDecisionResult:
         return [] if self.consensus is None else list(self.consensus.proposals)
 
 
+@dataclass(frozen=True, slots=True)
+class RecommendationConsensusOutcome:
+    """두 모델 추천 원문과 성공 시 합의 투자의견을 함께 보존한다."""
+
+    claude_run: ModelRun[ModelRecommendation]
+    codex_run: ModelRun[ModelRecommendation]
+    consensus: RecommendationConsensusResult | None
+
+    @property
+    def failed(self) -> bool:
+        """한 모델이라도 정상 응답을 내지 못했는지 반환한다."""
+
+        return self.consensus is None
+
+
 class ConsensusDecisionService:
     """같은 프롬프트를 두 모델에 전달해 일치 결과만 공개한다."""
 
-    def __init__(self, claude: DecisionModel, codex: DecisionModel) -> None:
+    def __init__(
+        self,
+        claude: DecisionModel[ModelDecision],
+        codex: DecisionModel[ModelDecision],
+    ) -> None:
         self._claude = claude
         self._codex = codex
 
     def decide(self, prompt: str) -> ConsensusDecisionResult:
         """두 호출을 모두 기다리고 하나라도 실패하면 제안을 비운다."""
 
-        with ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="decision-model"
-        ) as pool:
-            claude_future = pool.submit(_execute, self._claude, "claude", prompt)
-            codex_future = pool.submit(_execute, self._codex, "codex", prompt)
-            claude_run = claude_future.result()
-            codex_run = codex_future.result()
-
+        claude_run, codex_run = run_both(self._claude, self._codex, prompt)
         if not claude_run.succeeded or not codex_run.succeeded:
             return ConsensusDecisionResult(claude_run, codex_run, None)
-
-        assert claude_run.decision is not None
-        assert codex_run.decision is not None
+        assert claude_run.decision is not None and codex_run.decision is not None
         consensus = ConsensusPolicy.reconcile(claude_run.decision, codex_run.decision)
         return ConsensusDecisionResult(claude_run, codex_run, consensus)
 
 
-def _execute(model: DecisionModel, model_id: str, prompt: str) -> ModelRun:
+class RecommendationConsensusService:
+    """같은 추천 프롬프트를 두 모델에 전달해 일치한 투자의견만 공개한다."""
+
+    def __init__(
+        self,
+        claude: DecisionModel[ModelRecommendation],
+        codex: DecisionModel[ModelRecommendation],
+    ) -> None:
+        self._claude = claude
+        self._codex = codex
+
+    def recommend(self, prompt: str) -> RecommendationConsensusOutcome:
+        """두 호출을 모두 기다리고 하나라도 실패하면 추천을 비운다."""
+
+        claude_run, codex_run = run_both(self._claude, self._codex, prompt)
+        if not claude_run.succeeded or not codex_run.succeeded:
+            return RecommendationConsensusOutcome(claude_run, codex_run, None)
+        assert claude_run.decision is not None and codex_run.decision is not None
+        consensus = RecommendationConsensusPolicy.reconcile(
+            claude_run.decision, codex_run.decision
+        )
+        return RecommendationConsensusOutcome(claude_run, codex_run, consensus)
+
+
+def run_both[T](
+    claude: DecisionModel[T], codex: DecisionModel[T], prompt: str
+) -> tuple[ModelRun[T], ModelRun[T]]:
+    """두 모델을 병렬로 실행하고 실패도 실행 기록으로 반환한다."""
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="decision-model") as pool:
+        claude_future = pool.submit(_execute, claude, "claude", prompt)
+        codex_future = pool.submit(_execute, codex, "codex", prompt)
+        claude_run = claude_future.result()
+        codex_run = codex_future.result()
+    return claude_run, codex_run
+
+
+def _execute[T](model: DecisionModel[T], model_id: str, prompt: str) -> ModelRun[T]:
     """모델 오류를 실행 메타데이터와 함께 반환 가능한 값으로 바꾼다."""
 
     started = perf_counter()

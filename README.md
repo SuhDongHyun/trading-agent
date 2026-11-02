@@ -23,6 +23,17 @@ uv sync
 자동으로 제거합니다. 이 키를 사용하면 API 사용량 과금이 발생할 수 있기
 때문입니다. 구독 로그인과 사용량 한도를 확인하고 실행하세요.
 
+두 CLI는 사용자 전역 설정과 격리해 실행합니다. 매매 판단 역할의 system prompt를
+따로 지정하고 도구는 쓰지 않습니다.
+
+- Claude: `--safe-mode --strict-mcp-config --disable-slash-commands`.
+  hooks, MCP, skills, plugins, CLAUDE.md를 로드하지 않습니다. `--bare`는 OAuth
+  인증을 막으므로 쓰지 않습니다.
+- Codex: `--json --ignore-user-config --ignore-rules`와 hooks·plugins·apps·
+  multi_agent 등 `--disable`. 단, 전역 `~/.codex/AGENTS.md`는 끌 수 있는 설정이
+  없어 계속 주입됩니다. system prompt에서 이 작업에는 적용되지 않는다고
+  명시합니다.
+
 ## 설정
 
 기본 설정 파일은 현재 작업 디렉터리의 `config.yaml`입니다. 파일이 없으면
@@ -41,6 +52,9 @@ risk:
   max_order_amount: 500000
   min_confidence: 0.7
   max_proposals_per_cycle: 5
+recommendation:
+  universe: []        # 비우면 watchlist를 추천 후보로 사용
+  max_results: 5      # recommend 출력에 표시할 BUY 수
 llm:
   claude:
     command: claude
@@ -69,12 +83,31 @@ uv run trading-agent run --config ./config.yaml --db ./data/paper.sqlite
 ```
 
 한 사이클은 계좌·시장 스냅샷 수집, Claude와 Codex의 독립 판단, 일치 제안의
-합의, Risk Guard 검토, SQLite 기록 순서로 진행합니다. 두 모델의 동작이
-일치하지 않는 제안은 불일치 이력에 남기며, 한 모델이라도 실패하면 그 사이클은
+합의, Risk Guard 검토, SQLite 기록 순서로 진행합니다. 두 모델은 스냅샷의 모든
+종목에 대해 `buy`/`sell`/`hold` 중 하나를 정확히 한 번 냅니다. 응답에서 빠진
+종목은 `hold`로 간주하므로 hold와 미응답은 같은 의견입니다. 유효 동작이 다른
+종목은 불일치(`action_mismatch`) 이력에 남기며, 한 모델이라도 실패하면 그 사이클은
 `model_failed`로 기록하고 제안을 승인하지 않습니다. 저장소는 기본적으로
 `data/trading-agent.db`이며 필요한 부모 디렉터리를 만듭니다.
 
-종료 코드는 cron 모니터링에 사용합니다.
+### 종목 추천
+
+```sh
+uv run trading-agent recommend
+uv run trading-agent recommend --top 3 --db ./data/paper.sqlite
+```
+
+계좌 잔고·보유 여부와 무관하게 `recommendation.universe`(비어 있으면 watchlist)
+종목마다 두 모델이 투자의견(`buy`/`hold`/`sell`), 확신도, 목표가, 손절가를
+냅니다. 의견이 같은 종목만 채택하고, 확신도는 낮은 쪽, 목표가와 손절가는 보수적인
+쪽을 씁니다(buy: 낮은 목표가·높은 손절가). sell 의견에서는 같은 두 값이 예상
+하락 가격과 의견 철회 가격(이 위로 오르면 매도 판단이 틀린 것)을 뜻하며, 출력도
+그렇게 표시합니다. 결과는 BUY 확신도 순, SELL, HOLD,
+불일치 순서로 출력하고 `runs.kind = 'recommendation'`으로 기록합니다. 계좌를
+조회하지 않으며 Risk Guard도 적용하지 않습니다. 현재가를 읽지 못한 종목은
+`missing`에 적고 제외합니다.
+
+종료 코드는 cron 모니터링에 사용합니다. `run`과 `recommend`에 공통입니다.
 
 - `0`: `completed` (합의 제안이 0건이어도 정상 완료)
 - `2`: `model_failed`
@@ -109,6 +142,20 @@ FROM consensus_disagreements AS d
 JOIN runs AS r ON r.id = d.run_id
 ORDER BY r.started_at DESC, d.disagreement_index;
 ```
+
+최근 추천 순위:
+
+```sql
+SELECT c.rank, c.code, c.rating, c.confidence, c.target_price, c.stop_loss_price
+FROM consensus_recommendations AS c
+WHERE c.run_id = (
+  SELECT id FROM runs WHERE kind = 'recommendation'
+  ORDER BY started_at DESC, id DESC LIMIT 1
+)
+ORDER BY c.rank;
+```
+
+기존 v1 DB는 처음 열 때 v2로 자동 이전됩니다(`runs.kind` 열과 추천 테이블 추가).
 
 ## 안전
 

@@ -87,6 +87,13 @@ class LLMSettings(BaseModel):
     codex: CodexSettings = Field(default_factory=CodexSettings)
 
 
+class RecommendationSettings(BaseModel):
+    """계좌와 무관한 종목 추천 설정."""
+
+    universe: list[str] = Field(default_factory=list)
+    max_results: int = Field(default=5, gt=0)
+
+
 class LedgerSettings(BaseModel):
     """결정 기록 저장 위치."""
 
@@ -102,6 +109,9 @@ class AgentSettings(BaseSettings):
     watchlist: list[str] = Field(default_factory=list)
     risk: RiskSettings = Field(default_factory=RiskSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
+    recommendation: RecommendationSettings = Field(
+        default_factory=RecommendationSettings
+    )
     ledger: LedgerSettings = Field(default_factory=LedgerSettings)
 
     model_config = SettingsConfigDict(
@@ -110,6 +120,12 @@ class AgentSettings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @property
+    def recommendation_universe(self) -> list[str]:
+        """추천 후보가 비어 있으면 watchlist를 후보로 쓴다."""
+
+        return list(self.recommendation.universe or self.watchlist)
 
     @classmethod
     def settings_customise_sources(

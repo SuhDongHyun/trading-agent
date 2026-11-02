@@ -91,13 +91,25 @@ def test_matching_trade_actions_merge_conservatively(
     assert result.codex_summary == "codex summary"
 
 
-def test_one_sided_proposal_is_recorded() -> None:
+def test_trade_against_omitted_stock_is_action_mismatch() -> None:
     result = ConsensusPolicy.reconcile(decision([proposal(Action.BUY)]), decision([]))
 
     assert result.proposals == []
-    assert result.disagreements[0].reason_code is DisagreementReasonCode.ONE_SIDED
+    assert result.disagreements[0].reason_code is DisagreementReasonCode.ACTION_MISMATCH
     assert result.disagreements[0].claude_actions == (Action.BUY,)
     assert result.disagreements[0].codex_actions == ()
+
+
+@pytest.mark.parametrize("hold_side", ["claude", "codex"])
+def test_hold_and_omitted_stock_are_the_same_opinion(hold_side: str) -> None:
+    hold = decision([proposal(Action.HOLD, quantity=0)])
+    omitted = decision([])
+    claude, codex = (hold, omitted) if hold_side == "claude" else (omitted, hold)
+
+    result = ConsensusPolicy.reconcile(claude, codex)
+
+    assert result.proposals == []
+    assert result.disagreements == []
 
 
 @pytest.mark.parametrize(

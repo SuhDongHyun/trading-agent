@@ -78,3 +78,80 @@ def test_missing_explicit_config_returns_error_before_runtime_creation(
     assert exit_code == 1
     assert not created
     assert "설정 파일을 찾을 수 없습니다" in capsys.readouterr().err
+
+
+def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from trading_agent.application.consensus_service import (
+        RecommendationConsensusOutcome,
+    )
+    from trading_agent.application.ports import ModelRun
+    from trading_agent.application.records import RecommendationRunResult
+    from trading_agent.domain.consensus import Disagreement, DisagreementReasonCode
+    from trading_agent.domain.models import (
+        Action,
+        MarketContext,
+        ResearchSnapshot,
+        StockSnapshot,
+    )
+    from trading_agent.domain.recommendation import (
+        RecommendationConsensusResult,
+        StockRecommendation,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    buys = [
+        StockRecommendation(
+            code, Action.BUY, conf, Decimal("1200"), Decimal("900"), "r"
+        )
+        for code, conf in (("000660", 0.9), ("005930", 0.8))
+    ]
+    sell = StockRecommendation(
+        "086520", Action.SELL, 0.5, Decimal("66000"), Decimal("79000"), "r"
+    )
+    consensus = RecommendationConsensusResult(
+        recommendations=[*buys, sell],
+        disagreements=[
+            Disagreement(
+                "086520", DisagreementReasonCode.ACTION_MISMATCH, (Action.BUY,), ()
+            )
+        ],
+        missing_info=[],
+        claude_summary="c",
+        codex_summary="x",
+    )
+    run = ModelRun("claude", "", "", 0, 0.1)
+    snapshot = ResearchSnapshot(
+        created_at=datetime(2026, 11, 2, tzinfo=UTC),
+        stocks=[
+            StockSnapshot("000660", "SK하이닉스"),
+            StockSnapshot("005930", "삼성전자"),
+        ],
+        market_context=MarketContext(),
+        missing=[],
+    )
+    result = RecommendationRunResult(
+        run_id=3,
+        status=CycleStatus.COMPLETED,
+        snapshot=snapshot,
+        outcome=RecommendationConsensusOutcome(run, run, consensus),
+        recommendations=[*buys, sell],
+    )
+    runtime = FakeRuntime(result)  # type: ignore[arg-type]
+
+    exit_code = main(
+        ["recommend", "--top", "1"],
+        recommendation_runtime_factory=lambda settings, db: runtime,
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert runtime.closed
+    assert "1. 000660 SK하이닉스 확신도 0.90 목표가 1,200원 손절가 900원" in out
+    assert "005930 삼성전자 확신도" not in out
+    assert "예상 하락가 66,000원, 79,000원 위로 오르면 매도 의견 철회" in out
+    assert "불일치: 086520 (claude buy / codex 미응답)" in out

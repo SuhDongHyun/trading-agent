@@ -10,6 +10,8 @@ import pytest
 
 from trading_agent.application.decision_schema import DECISION_RESPONSE_SCHEMA
 from trading_agent.application.errors import DecisionModelError
+from trading_agent.application.model_tasks import DECISION_TASK, RECOMMENDATION_TASK
+from trading_agent.domain.recommendation import ModelRecommendation
 from trading_agent.infrastructure.command_runner import (
     CommandResult,
     CommandRunner,
@@ -188,10 +190,10 @@ def test_codex_adapter_uses_schema_output_file_and_isolated_working_directory() 
         assert json.loads(schema_path.read_text(encoding="utf-8")) == (
             DECISION_RESPONSE_SCHEMA
         )
-        # Codex without --json writes the schema-shaped response to -o and stdout.
+        # Codex --json writes JSONL events to stdout and the final answer to -o.
         raw_response = json.dumps(VALID_RESPONSE)
         output_path.write_text(raw_response, encoding="utf-8")
-        return completed(raw_response)
+        return completed('{"type":"turn.completed"}')
 
     runner = FakeCommandRunner(write_response)
     model = CodexCliDecisionModel(
@@ -217,7 +219,8 @@ def test_codex_adapter_uses_schema_output_file_and_isolated_working_directory() 
     assert prompt == "same prompt"
     assert timeout == 61
     assert result.succeeded
-    assert result.stdout == result.response_text
+    assert result.stdout == '{"type":"turn.completed"}'
+    assert result.response_text == json.dumps(VALID_RESPONSE)
     assert result.response_text is not None
     assert result.decision is not None
     assert result.decision.proposals[0].code == "005930"
@@ -343,3 +346,89 @@ def _is_process_running(process_id: int) -> bool:
         return True
     state = stat.rsplit(")", maxsplit=1)[1].strip().split(maxsplit=1)[0]
     return state != "Z"
+
+
+def test_claude_adapter_isolates_user_configuration_and_sets_role() -> None:
+    runner = FakeCommandRunner(lambda _a, _p, _c: completed(claude_envelope()))
+    model = ClaudeCliDecisionModel(ClaudeSettings(), runner)
+
+    model.decide("prompt")
+
+    argv = runner.calls[0][0]
+    for flag in ("--safe-mode", "--strict-mcp-config", "--disable-slash-commands"):
+        assert flag in argv
+    assert "--bare" not in argv
+    assert argv[argv.index("--system-prompt") + 1] == DECISION_TASK.system_prompt
+
+
+def test_codex_adapter_isolates_user_configuration_and_sets_role() -> None:
+    seen: dict[str, str] = {}
+
+    def write_response(argv: Sequence[str], _prompt: str, _cwd: str) -> CommandResult:
+        setting = next(
+            argv[index + 1]
+            for index, item in enumerate(argv)
+            if item == "-c" and argv[index + 1].startswith("model_instructions_file=")
+        )
+        instructions = Path(json.loads(setting.split("=", 1)[1]))
+        seen["instructions"] = instructions.read_text(encoding="utf-8")
+        Path(argv[argv.index("-o") + 1]).write_text(
+            json.dumps(VALID_RESPONSE), encoding="utf-8"
+        )
+        return completed('{"type":"turn.completed"}')
+
+    runner = FakeCommandRunner(write_response)
+    CodexCliDecisionModel(CodexSettings(), runner).decide("prompt")
+
+    argv = runner.calls[0][0]
+    for flag in ("--json", "--ignore-user-config", "--ignore-rules"):
+        assert flag in argv
+    disabled = {argv[i + 1] for i, item in enumerate(argv) if item == "--disable"}
+    assert {"hooks", "plugins", "apps", "multi_agent"} <= disabled
+    assert "project_doc_max_bytes=0" in argv
+    assert seen["instructions"] == DECISION_TASK.system_prompt
+
+
+def test_adapters_use_the_given_task_schema_and_parser() -> None:
+    response = {
+        "summary": "s",
+        "recommendations": [
+            {
+                "code": "005930",
+                "rating": "hold",
+                "confidence": 0.5,
+                "target_price": None,
+                "stop_loss_price": None,
+                "reason": "r",
+            }
+        ],
+        "missing_info": [],
+    }
+    claude_runner = FakeCommandRunner(
+        lambda _a, _p, _c: completed(claude_envelope(response))
+    )
+
+    def write_response(argv: Sequence[str], _prompt: str, _cwd: str) -> CommandResult:
+        schema = json.loads(
+            Path(argv[argv.index("--output-schema") + 1]).read_text(encoding="utf-8")
+        )
+        assert schema == RECOMMENDATION_TASK.response_schema
+        Path(argv[argv.index("-o") + 1]).write_text(
+            json.dumps(response), encoding="utf-8"
+        )
+        return completed("events")
+
+    claude = ClaudeCliDecisionModel(
+        ClaudeSettings(), claude_runner, RECOMMENDATION_TASK
+    ).decide("p")
+    codex = CodexCliDecisionModel(
+        CodexSettings(), FakeCommandRunner(write_response), RECOMMENDATION_TASK
+    ).decide("p")
+
+    claude_schema = json.loads(
+        claude_runner.calls[0][0][claude_runner.calls[0][0].index("--json-schema") + 1]
+    )
+    assert claude_schema == RECOMMENDATION_TASK.response_schema
+    for run in (claude, codex):
+        assert isinstance(run.decision, ModelRecommendation)
+        assert run.decision.recommendations[0].target_price is None

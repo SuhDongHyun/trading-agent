@@ -4,6 +4,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from zoneinfo import ZoneInfo
 
 from trading_agent.application.errors import MarketDataUnavailable
@@ -19,6 +20,7 @@ from trading_agent.domain.models import (
     AccountSnapshot,
     MarketContext,
     MarketSnapshot,
+    ResearchSnapshot,
     StockSnapshot,
 )
 
@@ -100,13 +102,7 @@ class SnapshotBuilder:
     def build(self) -> MarketSnapshot:
         """필수 데이터가 있으면 스냅샷을 만들고 보조 실패는 기록한다."""
 
-        now = self.clock()
-        if now.tzinfo is None or now.utcoffset() is None:
-            raise ValueError("clock는 timezone-aware datetime을 반환해야 합니다.")
-        today = now.astimezone(MARKET_TIMEZONE).date()
-        end_date = today.strftime("%Y%m%d")
-        start_date = (today - timedelta(days=LOOKBACK_CALENDAR_DAYS)).strftime("%Y%m%d")
-
+        now, start_date, end_date = self._lookback_window()
         account = self.gateway.get_account()
         codes = _unique_codes(
             [*self.watchlist, *(position.code for position in account.positions)]
@@ -116,13 +112,7 @@ class SnapshotBuilder:
         missing: list[str] = []
 
         stocks = [
-            self._build_stock(
-                code,
-                quotes[code],
-                start_date,
-                end_date,
-                missing,
-            )
+            self._build_stock(code, quotes[code], start_date, end_date, missing)
             for code in codes
         ]
         market_context = self._build_market_context(start_date, end_date, missing)
@@ -133,6 +123,47 @@ class SnapshotBuilder:
             market_context=market_context,
             missing=missing,
         )
+
+    def build_research(self, codes: Sequence[str]) -> ResearchSnapshot:
+        """계좌 없이 후보 종목과 시장 데이터만으로 스냅샷을 만든다.
+
+        현재가를 못 읽은 종목은 missing에 적고 제외한다. 한 종목도 읽지 못하면 실패한다.
+        """
+
+        now, start_date, end_date = self._lookback_window()
+        missing: list[str] = []
+        quotes: dict[str, StockQuote] = {}
+        for code in _unique_codes(codes):
+            quote = self._read_optional(
+                f"{code}:quote", partial(self.gateway.get_stock_quote, code), missing
+            )
+            if quote is not None:
+                quotes[code] = quote
+        if not quotes:
+            raise MarketDataUnavailable("후보 종목 현재가를 하나도 읽지 못했습니다.")
+
+        stocks = [
+            self._build_stock(code, quote, start_date, end_date, missing)
+            for code, quote in quotes.items()
+        ]
+        market_context = self._build_market_context(start_date, end_date, missing)
+        return ResearchSnapshot(
+            created_at=now,
+            stocks=stocks,
+            market_context=market_context,
+            missing=missing,
+        )
+
+    def _lookback_window(self) -> tuple[datetime, str, str]:
+        """현재 시각과 한국 날짜 기준 조회 시작일·종료일을 반환한다."""
+
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("clock는 timezone-aware datetime을 반환해야 합니다.")
+        today = now.astimezone(MARKET_TIMEZONE).date()
+        end_date = today.strftime("%Y%m%d")
+        start_date = (today - timedelta(days=LOOKBACK_CALENDAR_DAYS)).strftime("%Y%m%d")
+        return now, start_date, end_date
 
     def _build_stock(
         self,

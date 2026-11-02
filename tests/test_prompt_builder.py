@@ -55,3 +55,28 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
     assert "news:005930" in prompt
     assert "500000" in prompt
     assert "보유하지 않은 종목은 SELL로 제안하지 마세요" in prompt
+    assert "모든 종목에 대해 proposals 항목을 정확히 하나씩" in prompt
+    assert "action을 hold, quantity를 0" in prompt
+
+
+def test_recommendation_prompt_asks_for_every_stock_without_account() -> None:
+    from trading_agent.application.recommendation_prompt import (
+        build_recommendation_prompt,
+    )
+    from trading_agent.domain.models import ResearchSnapshot
+
+    snapshot = ResearchSnapshot(
+        created_at=datetime(2026, 11, 2, tzinfo=UTC),
+        stocks=[StockSnapshot(code="086520", name="에코프로")],
+        market_context=MarketContext(),
+        missing=["market:vkospi"],
+    )
+
+    prompt = build_recommendation_prompt(snapshot)
+    serialized = json.loads(prompt.split("스냅샷 JSON:\n", maxsplit=1)[1])
+
+    assert "account" not in serialized
+    assert serialized["stocks"][0]["code"] == "086520"
+    assert "recommendations 항목을 정확히 하나씩" in prompt
+    assert "이미 있는 항목은 다시 적지 마세요" in prompt
+    assert "market:vkospi" in prompt
