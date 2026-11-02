@@ -60,6 +60,9 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
     assert "직전 20일 평균" in prompt
     assert "news:005930" in prompt
     assert "500000" in prompt
+    assert "max_order_ratio" in prompt
+    assert "effective_max_order_amount" in prompt
+    assert "손절·익절·비중 초과 축소는 시스템 규칙이 자동 처리" in prompt
     assert "보유하지 않은 종목은 SELL로 제안하지 마세요" in prompt
     assert "모든 종목에 대해 proposals 항목을 정확히 하나씩" in prompt
     assert "action을 hold, quantity를 0" in prompt

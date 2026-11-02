@@ -21,6 +21,7 @@ from trading_agent.domain.models import (
     AccountSnapshot,
     MarketContext,
     MarketSnapshot,
+    Position,
     ResearchSnapshot,
     StockSnapshot,
 )
@@ -439,16 +440,35 @@ def _unique_codes(codes: Sequence[str]) -> list[str]:
 def _with_current_prices(
     account: AccountSnapshot, quotes: dict[str, StockQuote]
 ) -> AccountSnapshot:
-    """계좌 보유 종목에 필수 현재가를 채운다."""
+    """현재가를 채우고 계좌 손익률에서 매입 단가를 계산한다."""
 
     positions = [
         replace(
             position,
             current_price=quotes[position.code].current_price,
+            average_price=_average_purchase_price(
+                position, quotes[position.code].current_price
+            ),
         )
         for position in account.positions
     ]
     return AccountSnapshot(cash=account.cash, positions=positions)
+
+
+def _average_purchase_price(
+    position: Position, current_price: Decimal
+) -> Decimal | None:
+    """trading-api 손익률과 현재가에서 평균 매입가를 추정한다."""
+
+    if position.average_price is not None:
+        return position.average_price
+    profit_loss_rate = position.profit_loss_rate
+    if profit_loss_rate is None:
+        return None
+    return_factor = Decimal(1) + profit_loss_rate / Decimal(100)
+    if return_factor <= 0:
+        return None
+    return current_price / return_factor
 
 
 def _latest_change_percent(points: Sequence[IndexPoint]) -> Decimal | None:

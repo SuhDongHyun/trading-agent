@@ -1,11 +1,16 @@
 """제안의 계좌 및 정책 한도를 검토하는 순수 로직."""
 
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, field
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
 
 from trading_agent.domain.errors import DomainError
-from trading_agent.domain.models import AccountSnapshot, Action, TradeProposal
+from trading_agent.domain.models import (
+    AccountSnapshot,
+    Action,
+    ProposalSource,
+    TradeProposal,
+)
 
 
 class RiskReasonCode(StrEnum):
@@ -50,28 +55,58 @@ class RiskPolicy:
     """매매 제안에 적용할 리스크 한도."""
 
     max_position_weight: Decimal
-    max_order_amount: Decimal
-    min_confidence: float
-    allowed_codes: set[str] | frozenset[str]
-    max_proposals_per_cycle: int
+    max_order_amount: Decimal | None = None
+    min_confidence: float = 0.7
+    allowed_codes: set[str] | frozenset[str] = field(default_factory=frozenset)
+    max_proposals_per_cycle: int = 5
+    max_order_ratio: Decimal = Decimal("0.1")
+    stop_loss_percent: Decimal | None = None
+    take_profit_percent: Decimal | None = None
+    take_profit_sell_fraction: Decimal = Decimal("0.5")
 
     def __post_init__(self) -> None:
-        for field_name in ("max_position_weight", "max_order_amount"):
+        for field_name in (
+            "max_position_weight",
+            "max_order_ratio",
+            "take_profit_sell_fraction",
+        ):
             value = getattr(self, field_name)
             try:
                 amount = value if isinstance(value, Decimal) else Decimal(str(value))
             except (TypeError, ValueError, ArithmeticError) as error:
-                raise DomainError("리스크 금액 한도가 올바르지 않습니다.") from error
+                raise DomainError("리스크 설정 값이 올바르지 않습니다.") from error
             if not amount.is_finite() or amount <= 0:
-                raise DomainError("리스크 금액 한도는 0보다 커야 합니다.")
+                raise DomainError("리스크 설정 값은 0보다 커야 합니다.")
             object.__setattr__(self, field_name, amount)
+        if self.max_order_amount is not None:
+            object.__setattr__(
+                self, "max_order_amount", _positive_decimal(self.max_order_amount)
+            )
+        for field_name in ("stop_loss_percent", "take_profit_percent"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, _positive_decimal(value))
         if self.max_position_weight > 1:
             raise DomainError("종목 비중 한도는 1 이하여야 합니다.")
+        if self.max_order_ratio > 1:
+            raise DomainError("주문 금액 비율 한도는 1 이하여야 합니다.")
+        if self.take_profit_sell_fraction > 1:
+            raise DomainError("익절 매도 비율은 1 이하여야 합니다.")
         if not 0 <= self.min_confidence <= 1:
             raise DomainError("최소 confidence는 0과 1 사이여야 합니다.")
         if self.max_proposals_per_cycle <= 0:
             raise DomainError("사이클당 제안 수는 0보다 커야 합니다.")
         object.__setattr__(self, "allowed_codes", frozenset(self.allowed_codes))
+
+    def effective_order_limit(self, total_assets: Decimal | None) -> Decimal | None:
+        """총자산 비율과 절대 금액 설정 중 더 낮은 주문 한도를 반환한다."""
+
+        if total_assets is None or total_assets <= 0:
+            return None
+        limit = total_assets * self.max_order_ratio
+        if self.max_order_amount is not None:
+            limit = min(limit, self.max_order_amount)
+        return limit
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,11 +166,21 @@ class RiskGuard:
             if proposal.confidence < policy.min_confidence:
                 reasons.append(_issue(RiskReasonCode.CONFIDENCE_TOO_LOW))
 
+            total_assets = account.total_asset_value
+            rule_sell = (
+                proposal.action is Action.SELL
+                and proposal.source is ProposalSource.RULE
+            )
+            order_limit = (
+                None if rule_sell else policy.effective_order_limit(total_assets)
+            )
+            if not rule_sell and order_limit is None:
+                reasons.append(_issue(RiskReasonCode.ACCOUNT_VALUE_UNAVAILABLE))
             order_amount = proposal.limit_price * proposal.quantity
-            if order_amount > policy.max_order_amount:
-                reasons.append(_issue(RiskReasonCode.ORDER_AMOUNT_EXCEEDED))
 
             if proposal.action is Action.BUY:
+                if order_limit is not None and order_amount > order_limit:
+                    reasons.append(_issue(RiskReasonCode.ORDER_AMOUNT_EXCEEDED))
                 if order_amount > remaining_cash:
                     reasons.append(_issue(RiskReasonCode.CASH_INSUFFICIENT))
                 _review_position_weight(proposal, account, policy, reasons)
@@ -149,6 +194,25 @@ class RiskGuard:
                     reasons.append(_issue(RiskReasonCode.POSITION_NOT_HELD))
                 elif proposal.quantity > held_quantity:
                     reasons.append(_issue(RiskReasonCode.NOT_ENOUGH_SHARES))
+                if (
+                    not rule_sell
+                    and order_limit is not None
+                    and proposal.quantity <= held_quantity
+                ):
+                    ordinary_quantity = int(
+                        (order_limit / proposal.limit_price).to_integral_value(
+                            rounding=ROUND_FLOOR
+                        )
+                    )
+                    reduction_quantity = _required_reduction_quantity(
+                        proposal, account, policy, total_assets
+                    )
+                    allowed_quantity = min(
+                        held_quantity,
+                        max(ordinary_quantity, reduction_quantity),
+                    )
+                    if proposal.quantity > allowed_quantity:
+                        reasons.append(_issue(RiskReasonCode.ORDER_AMOUNT_EXCEEDED))
             else:
                 reasons.append(_issue(RiskReasonCode.ACTION_NOT_SUPPORTED))
 
@@ -189,7 +253,10 @@ def _review_position_weight(
 
     total_assets = account.total_asset_value
     if total_assets is None or total_assets <= 0:
-        reasons.append(_issue(RiskReasonCode.ACCOUNT_VALUE_UNAVAILABLE))
+        if not any(
+            issue.code is RiskReasonCode.ACCOUNT_VALUE_UNAVAILABLE for issue in reasons
+        ):
+            reasons.append(_issue(RiskReasonCode.ACCOUNT_VALUE_UNAVAILABLE))
         return
 
     projected_weight = (
@@ -203,3 +270,51 @@ def _issue(code: RiskReasonCode) -> RiskIssue:
     """사유 코드에서 사람이 읽을 메시지를 만든다."""
 
     return RiskIssue(code=code, message=_REASON_MESSAGES[code])
+
+
+def _required_reduction_quantity(
+    proposal: TradeProposal,
+    account: AccountSnapshot,
+    policy: RiskPolicy,
+    total_assets: Decimal | None,
+) -> int:
+    """초과 비중을 한도 안으로 낮추는 데 필요한 보유 수량을 올림 계산한다."""
+
+    if total_assets is None or total_assets <= 0:
+        return 0
+    matching = [
+        position for position in account.positions if position.code == proposal.code
+    ]
+    value = Decimal(0)
+    held_quantity = 0
+    current_price = None
+    for position in matching:
+        held_quantity += position.quantity
+        if current_price is None:
+            current_price = position.current_price
+        position_value = position.evaluation_amount
+        if position_value is None and position.quantity > 0:
+            return 0
+        if position_value is not None:
+            value += position_value
+    if current_price is None or current_price <= 0:
+        return 0
+    excess_value = value - total_assets * policy.max_position_weight
+    if excess_value <= 0:
+        return 0
+    required = int(
+        (excess_value / current_price).to_integral_value(rounding=ROUND_CEILING)
+    )
+    return min(held_quantity, required)
+
+
+def _positive_decimal(value: Decimal | int | float | str) -> Decimal:
+    """리스크 설정을 유한하고 양수인 Decimal로 변환한다."""
+
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError) as error:
+        raise DomainError("리스크 설정 값이 올바르지 않습니다.") from error
+    if not result.is_finite() or result <= 0:
+        raise DomainError("리스크 설정 값은 0보다 커야 합니다.")
+    return result

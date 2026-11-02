@@ -25,7 +25,7 @@ from trading_agent.domain.recommendation import (
     StockRecommendation,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _RUN_KIND_DECISION = "decision"
 _RUN_KIND_RECOMMENDATION = "recommendation"
 _MIGRATIONS = {
@@ -104,6 +104,8 @@ _SCHEMA = (
         limit_price TEXT NOT NULL,
         confidence TEXT NOT NULL,
         reason TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'consensus',
+        rule_type TEXT,
         approved INTEGER NOT NULL,
         skipped INTEGER NOT NULL,
         reason_codes_json TEXT NOT NULL,
@@ -271,17 +273,32 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                 raise RuntimeError(f"SQLite 기록 버전 {version}은 지원하지 않습니다.")
             try:
                 connection.execute("BEGIN")
-                if version > 0:
-                    for from_version in range(version, _SCHEMA_VERSION):
-                        for statement in _MIGRATIONS.get(from_version, ()):
-                            connection.execute(statement)
+                for statement in _MIGRATIONS.get(version, ()):
+                    connection.execute(statement)
                 for statement in _SCHEMA:
                     connection.execute(statement)
+                if version < 3:
+                    self._migrate_risk_verdict_sources(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
+
+    @staticmethod
+    def _migrate_risk_verdict_sources(connection: sqlite3.Connection) -> None:
+        """기존 리스크 판정에 합의 출처 기본값과 규칙 종류 열을 추가한다."""
+
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(risk_verdicts)")
+        }
+        if "source" not in columns:
+            connection.execute(
+                "ALTER TABLE risk_verdicts ADD COLUMN source TEXT NOT NULL "
+                "DEFAULT 'consensus'"
+            )
+        if "rule_type" not in columns:
+            connection.execute("ALTER TABLE risk_verdicts ADD COLUMN rule_type TEXT")
 
     def _finish_cycle(self, result: DecisionCycleResult, finished_at: datetime) -> None:
         """run 행과 관련 상세 행을 같은 SQLite 트랜잭션으로 갱신한다."""
@@ -487,9 +504,9 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
             connection.execute(
                 """INSERT INTO risk_verdicts
                    (run_id, proposal_index, code, action, quantity, limit_price,
-                    confidence, reason, approved, skipped, reason_codes_json,
-                    reason_messages_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    confidence, reason, source, rule_type, approved, skipped,
+                    reason_codes_json, reason_messages_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     index,
@@ -499,6 +516,12 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                     str(proposal.limit_price),
                     str(proposal.confidence),
                     proposal.reason,
+                    proposal.source.value,
+                    (
+                        proposal.rule_type.value
+                        if proposal.rule_type is not None
+                        else None
+                    ),
                     int(verdict.approved),
                     int(verdict.skipped),
                     _json([reason.code.value for reason in verdict.reasons]),

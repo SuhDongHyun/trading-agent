@@ -89,9 +89,13 @@ class RiskSettings(BaseModel):
     """사이클에 적용할 리스크 한도."""
 
     max_position_weight: float = Field(default=0.2, gt=0, le=1)
-    max_order_amount: float = Field(default=500_000, gt=0)
+    max_order_ratio: float = Field(default=0.1, gt=0, le=1)
+    max_order_amount: float | None = Field(default=None, gt=0)
     min_confidence: float = Field(default=0.7, ge=0, le=1)
     max_proposals_per_cycle: int = Field(default=5, gt=0)
+    stop_loss_percent: float | None = Field(default=None, gt=0)
+    take_profit_percent: float | None = Field(default=None, gt=0)
+    take_profit_sell_fraction: float = Field(default=0.5, gt=0, le=1)
 
 
 class ClaudeSettings(BaseModel):

@@ -214,7 +214,7 @@ def test_version_1_ledger_is_migrated_in_place(tmp_path: Path) -> None:
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         assert connection.execute("SELECT kind FROM runs").fetchone() == ("decision",)
         tables = {
             row[0]
@@ -223,3 +223,59 @@ def test_version_1_ledger_is_migrated_in_place(tmp_path: Path) -> None:
             )
         }
     assert {"model_recommendations", "consensus_recommendations"} <= tables
+
+
+def test_version_2_ledger_preserves_verdicts_and_defaults_source_to_consensus(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v2.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL DEFAULT 'decision',
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                prompt TEXT,
+                snapshot_json TEXT
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO runs(id, started_at, status) VALUES "
+            "(7, '2026-11-01', 'completed')"
+        )
+        connection.execute(
+            """CREATE TABLE risk_verdicts (
+                run_id INTEGER NOT NULL,
+                proposal_index INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                action TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                limit_price TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                approved INTEGER NOT NULL,
+                skipped INTEGER NOT NULL,
+                reason_codes_json TEXT NOT NULL,
+                reason_messages_json TEXT NOT NULL,
+                PRIMARY KEY (run_id, proposal_index)
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO risk_verdicts VALUES
+               (7, 0, '005930', 'sell', 2, '100', '0.9', '기존 판정',
+                1, 0, '[]', '[]')"""
+        )
+        connection.execute("PRAGMA user_version = 2")
+
+    SQLiteDecisionLedger(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        row = connection.execute(
+            """SELECT run_id, proposal_index, code, reason, approved, source, rule_type
+               FROM risk_verdicts"""
+        ).fetchone()
+    assert row == (7, 0, "005930", "기존 판정", 1, "consensus", None)
