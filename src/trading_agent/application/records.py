@@ -3,8 +3,12 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
-from trading_agent.application.consensus_service import ConsensusDecisionResult
-from trading_agent.domain.models import MarketSnapshot
+from trading_agent.application.consensus_service import (
+    ConsensusDecisionResult,
+    RecommendationConsensusOutcome,
+)
+from trading_agent.domain.models import MarketSnapshot, ResearchSnapshot
+from trading_agent.domain.recommendation import StockRecommendation
 from trading_agent.domain.risk import RiskVerdict
 
 
@@ -31,3 +35,19 @@ class DecisionCycleResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "verdicts", list(self.verdicts or []))
+
+
+@dataclass(frozen=True, slots=True)
+class RecommendationRunResult:
+    """한 번의 종목 추천 실행 결과와 기록에 필요한 입력을 보존한다."""
+
+    run_id: int
+    status: CycleStatus
+    error: str | None = None
+    prompt: str | None = None
+    snapshot: ResearchSnapshot | None = None
+    outcome: RecommendationConsensusOutcome | None = None
+    recommendations: list[StockRecommendation] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "recommendations", list(self.recommendations or []))

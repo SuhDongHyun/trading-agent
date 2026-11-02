@@ -10,7 +10,7 @@ from enum import StrEnum
 from trading_agent.domain.errors import DomainError
 
 
-def _decimal(value: Decimal | int | float | str) -> Decimal:
+def to_decimal(value: Decimal | int | float | str) -> Decimal:
     """금액과 지표를 일관된 Decimal 값으로 바꾼다."""
 
     try:
@@ -20,6 +20,39 @@ def _decimal(value: Decimal | int | float | str) -> Decimal:
     if not result.is_finite():
         raise DomainError("숫자 값은 유한해야 합니다.")
     return result
+
+
+def require_stock_code(code: object) -> str:
+    """6자리 숫자 종목 코드를 확인한다."""
+
+    if not isinstance(code, str):
+        raise DomainError("종목 코드는 문자열이어야 합니다.")
+    if re.fullmatch(r"[0-9]{6}", code) is None:
+        raise DomainError("종목 코드는 6자리 숫자여야 합니다.")
+    return code
+
+
+def require_action(value: object) -> "Action":
+    """buy, sell, hold 중 하나인 동작을 확인한다."""
+
+    try:
+        return Action(value)
+    except (TypeError, ValueError) as error:
+        raise DomainError("action은 buy, sell, hold 중 하나여야 합니다.") from error
+
+
+def require_confidence(value: object) -> float:
+    """0과 1 사이의 유한한 확신도를 확인한다."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise DomainError("confidence는 숫자여야 합니다.")
+    try:
+        confidence = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise DomainError("confidence 값이 올바르지 않습니다.") from error
+    if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        raise DomainError("confidence는 0과 1 사이여야 합니다.")
+    return confidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +80,7 @@ class Position:
         ):
             value = getattr(self, field_name)
             if value is not None:
-                object.__setattr__(self, field_name, _decimal(value))
+                object.__setattr__(self, field_name, to_decimal(value))
 
     @property
     def evaluation_amount(self) -> Decimal | None:
@@ -68,7 +101,7 @@ class AccountSnapshot:
     positions: list[Position]
 
     def __post_init__(self) -> None:
-        cash = _decimal(self.cash)
+        cash = to_decimal(self.cash)
         if cash < 0:
             raise DomainError("현금은 음수일 수 없습니다.")
         object.__setattr__(self, "cash", cash)
@@ -123,7 +156,7 @@ class StockSnapshot:
         ):
             value = getattr(self, field_name)
             if value is not None:
-                object.__setattr__(self, field_name, _decimal(value))
+                object.__setattr__(self, field_name, to_decimal(value))
         if self.news_headlines is not None:
             object.__setattr__(self, "news_headlines", list(self.news_headlines))
 
@@ -157,7 +190,7 @@ class MarketContext:
         ):
             value = getattr(self, field_name)
             if value is not None:
-                object.__setattr__(self, field_name, _decimal(value))
+                object.__setattr__(self, field_name, to_decimal(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,8 +208,22 @@ class MarketSnapshot:
         object.__setattr__(self, "missing", list(self.missing))
 
 
+@dataclass(frozen=True, slots=True)
+class ResearchSnapshot:
+    """계좌와 무관하게 종목을 평가하기 위한 종목·시장 데이터."""
+
+    created_at: datetime
+    stocks: list[StockSnapshot]
+    market_context: MarketContext
+    missing: list[str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stocks", list(self.stocks))
+        object.__setattr__(self, "missing", list(self.missing))
+
+
 class Action(StrEnum):
-    """모델이 제안할 수 있는 매매 동작."""
+    """모델이 제안할 수 있는 매매 동작이자 종목 투자의견."""
 
     BUY = "buy"
     SELL = "sell"
@@ -195,14 +242,8 @@ class TradeProposal:
     reason: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.code, str):
-            raise DomainError("종목 코드는 문자열이어야 합니다.")
-        if re.fullmatch(r"[0-9]{6}", self.code) is None:
-            raise DomainError("종목 코드는 6자리 숫자여야 합니다.")
-        try:
-            action = Action(self.action)
-        except (TypeError, ValueError) as error:
-            raise DomainError("action은 buy, sell, hold 중 하나여야 합니다.") from error
+        require_stock_code(self.code)
+        action = require_action(self.action)
         object.__setattr__(self, "action", action)
         if not isinstance(self.quantity, int) or isinstance(self.quantity, bool):
             raise DomainError("매매 수량은 정수여야 합니다.")
@@ -214,21 +255,11 @@ class TradeProposal:
             self.limit_price, (Decimal, int, float)
         ):
             raise DomainError("지정가는 숫자여야 합니다.")
-        limit_price = _decimal(self.limit_price)
+        limit_price = to_decimal(self.limit_price)
         if limit_price <= 0:
             raise DomainError("지정가는 0보다 커야 합니다.")
         object.__setattr__(self, "limit_price", limit_price)
-        if isinstance(self.confidence, bool) or not isinstance(
-            self.confidence, (int, float, Decimal)
-        ):
-            raise DomainError("confidence는 숫자여야 합니다.")
-        try:
-            confidence = float(self.confidence)
-        except (OverflowError, TypeError, ValueError) as error:
-            raise DomainError("confidence 값이 올바르지 않습니다.") from error
-        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
-            raise DomainError("confidence는 0과 1 사이여야 합니다.")
-        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "confidence", require_confidence(self.confidence))
 
 
 @dataclass(frozen=True, slots=True)

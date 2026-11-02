@@ -6,8 +6,16 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from trading_agent.application.consensus_service import ConsensusDecisionService
-from trading_agent.application.records import DecisionCycleResult
+from trading_agent.application.consensus_service import (
+    ConsensusDecisionService,
+    RecommendationConsensusService,
+)
+from trading_agent.application.model_tasks import DECISION_TASK, RECOMMENDATION_TASK
+from trading_agent.application.recommend_stocks import RecommendStocks
+from trading_agent.application.records import (
+    DecisionCycleResult,
+    RecommendationRunResult,
+)
 from trading_agent.application.run_decision_cycle import RunDecisionCycle
 from trading_agent.application.snapshot_builder import SnapshotBuilder
 from trading_agent.domain.risk import RiskPolicy
@@ -57,8 +65,8 @@ def create_runtime(
     gateway = TradingApiMarketDataGateway(settings.trading_api)
     runner = SubprocessCommandRunner()
     consensus_service = ConsensusDecisionService(
-        ClaudeCliDecisionModel(settings.llm.claude, runner),
-        CodexCliDecisionModel(settings.llm.codex, runner),
+        ClaudeCliDecisionModel(settings.llm.claude, runner, DECISION_TASK),
+        CodexCliDecisionModel(settings.llm.codex, runner, DECISION_TASK),
     )
     risk_policy = RiskPolicy(
         max_position_weight=Decimal(str(settings.risk.max_position_weight)),
@@ -76,3 +84,44 @@ def create_runtime(
         clock=clock,
     )
     return TradingAgentRuntime(cycle=cycle, gateway=gateway)
+
+
+@dataclass(slots=True)
+class RecommendationRuntime:
+    """한 번의 종목 추천 실행과 HTTP 어댑터 정리를 제공한다."""
+
+    use_case: RecommendStocks
+    gateway: TradingApiMarketDataGateway
+
+    def run(self) -> RecommendationRunResult:
+        """조립된 추천 유스케이스를 실행한다."""
+
+        return self.use_case.run()
+
+    def close(self) -> None:
+        """trading-api HTTP 연결을 닫는다."""
+
+        self.gateway.close()
+
+
+def create_recommendation_runtime(
+    settings: AgentSettings,
+    db_path: str | Path | None = None,
+) -> RecommendationRuntime:
+    """계좌를 읽지 않는 종목 추천 유스케이스를 조립한다."""
+
+    clock = korea_now
+    gateway = TradingApiMarketDataGateway(settings.trading_api)
+    runner = SubprocessCommandRunner()
+    service = RecommendationConsensusService(
+        ClaudeCliDecisionModel(settings.llm.claude, runner, RECOMMENDATION_TASK),
+        CodexCliDecisionModel(settings.llm.codex, runner, RECOMMENDATION_TASK),
+    )
+    use_case = RecommendStocks(
+        snapshot_builder=SnapshotBuilder(gateway, settings.watchlist, clock=clock),
+        consensus_service=service,
+        universe=settings.recommendation_universe,
+        ledger=SQLiteDecisionLedger(db_path or settings.ledger.db_path),
+        clock=clock,
+    )
+    return RecommendationRuntime(use_case=use_case, gateway=gateway)

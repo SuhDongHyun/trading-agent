@@ -10,14 +10,31 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from trading_agent.application.consensus_service import ConsensusDecisionResult
 from trading_agent.application.decision_ledger import DecisionLedger
-from trading_agent.application.records import CycleStatus, DecisionCycleResult
+from trading_agent.application.ports import ModelRun
+from trading_agent.application.recommendation_ledger import RecommendationLedger
+from trading_agent.application.records import (
+    CycleStatus,
+    DecisionCycleResult,
+    RecommendationRunResult,
+)
+from trading_agent.domain.consensus import Disagreement
+from trading_agent.domain.models import ModelDecision
+from trading_agent.domain.recommendation import (
+    ModelRecommendation,
+    StockRecommendation,
+)
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_RUN_KIND_DECISION = "decision"
+_RUN_KIND_RECOMMENDATION = "recommendation"
+_MIGRATIONS = {
+    1: ("ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'decision'",),
+}
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL DEFAULT 'decision',
         started_at TEXT NOT NULL,
         finished_at TEXT,
         status TEXT NOT NULL,
@@ -93,14 +110,40 @@ _SCHEMA = (
         reason_messages_json TEXT NOT NULL,
         PRIMARY KEY (run_id, proposal_index)
     )""",
+    """CREATE TABLE IF NOT EXISTS model_recommendations (
+        run_id INTEGER NOT NULL,
+        model_id TEXT NOT NULL,
+        item_index INTEGER NOT NULL,
+        code TEXT NOT NULL,
+        rating TEXT NOT NULL,
+        confidence TEXT NOT NULL,
+        target_price TEXT,
+        stop_loss_price TEXT,
+        reason TEXT NOT NULL,
+        PRIMARY KEY (run_id, model_id, item_index),
+        FOREIGN KEY (run_id, model_id)
+            REFERENCES model_runs(run_id, model_id) ON DELETE CASCADE
+    )""",
+    """CREATE TABLE IF NOT EXISTS consensus_recommendations (
+        run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        rank INTEGER NOT NULL,
+        code TEXT NOT NULL,
+        rating TEXT NOT NULL,
+        confidence TEXT NOT NULL,
+        target_price TEXT,
+        stop_loss_price TEXT,
+        reason TEXT NOT NULL,
+        PRIMARY KEY (run_id, rank)
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_runs_recent ON runs(started_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_runs_kind ON runs(kind, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_risk_approved ON risk_verdicts(approved, run_id)",
     "CREATE INDEX IF NOT EXISTS idx_disagreement_code ON consensus_disagreements(code)",
 )
 
 
-class SQLiteDecisionLedger(DecisionLedger):
-    """디렉터리와 버전 스키마를 준비해 사이클 단위로 기록한다."""
+class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
+    """디렉터리와 버전 스키마를 준비해 매매 사이클과 추천 실행을 기록한다."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path).expanduser()
@@ -110,13 +153,7 @@ class SQLiteDecisionLedger(DecisionLedger):
     def start_cycle(self, started_at: datetime) -> int:
         """사이클을 running으로 저장하고 autoincrement 식별자를 반환한다."""
 
-        with self._connection() as connection, connection:
-            cursor = connection.execute(
-                "INSERT INTO runs(started_at, status) VALUES (?, ?)",
-                (_iso_datetime(started_at), "running"),
-            )
-            assert cursor.lastrowid is not None
-            return cursor.lastrowid
+        return self._start_run(_RUN_KIND_DECISION, started_at)
 
     def complete_cycle(
         self, result: DecisionCycleResult, finished_at: datetime
@@ -134,6 +171,97 @@ class SQLiteDecisionLedger(DecisionLedger):
             raise ValueError("실패 기록에는 실패 상태 결과가 필요합니다.")
         self._finish_cycle(result, finished_at)
 
+    def start_recommendation(self, started_at: datetime) -> int:
+        """추천 실행을 running으로 저장하고 식별자를 반환한다."""
+
+        return self._start_run(_RUN_KIND_RECOMMENDATION, started_at)
+
+    def finish_recommendation(
+        self, result: RecommendationRunResult, finished_at: datetime
+    ) -> None:
+        """추천 실행과 모델 원문, 합의 의견을 한 트랜잭션으로 저장한다."""
+
+        with self._connection() as connection, connection:
+            self._update_run(
+                connection,
+                result.run_id,
+                finished_at,
+                result.status,
+                result.error,
+                result.prompt,
+                result.snapshot,
+            )
+            outcome = result.outcome
+            if outcome is None:
+                return
+            for model_run in (outcome.claude_run, outcome.codex_run):
+                self._store_model_run(connection, result.run_id, model_run)
+                if model_run.decision is not None:
+                    self._store_model_recommendations(
+                        connection, result.run_id, model_run.decision
+                    )
+            consensus = outcome.consensus
+            if consensus is None:
+                return
+            self._store_consensus_summary(
+                connection,
+                result.run_id,
+                consensus.claude_summary,
+                consensus.codex_summary,
+                consensus.missing_info,
+            )
+            self._store_disagreements(
+                connection, result.run_id, consensus.disagreements
+            )
+            for rank, item in enumerate(result.recommendations or [], start=1):
+                connection.execute(
+                    """INSERT INTO consensus_recommendations
+                       (run_id, rank, code, rating, confidence, target_price,
+                        stop_loss_price, reason)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (result.run_id, rank, *_recommendation_values(item)),
+                )
+
+    def _start_run(self, kind: str, started_at: datetime) -> int:
+        """종류별 run을 running으로 저장한다."""
+
+        with self._connection() as connection, connection:
+            cursor = connection.execute(
+                "INSERT INTO runs(kind, started_at, status) VALUES (?, ?, ?)",
+                (kind, _iso_datetime(started_at), "running"),
+            )
+            assert cursor.lastrowid is not None
+            return cursor.lastrowid
+
+    @staticmethod
+    def _update_run(
+        connection: sqlite3.Connection,
+        run_id: int,
+        finished_at: datetime,
+        status: CycleStatus,
+        error: str | None,
+        prompt: str | None,
+        snapshot: object,
+    ) -> None:
+        """running 상태인 run만 종료 상태로 바꾼다."""
+
+        cursor = connection.execute(
+            """UPDATE runs
+               SET finished_at = ?, status = ?, error = ?, prompt = ?,
+                   snapshot_json = ?
+               WHERE id = ? AND status = 'running'""",
+            (
+                _iso_datetime(finished_at),
+                status.value,
+                error,
+                prompt,
+                _json(snapshot),
+                run_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"running 사이클을 찾을 수 없습니다: {run_id}")
+
     def _create_schema(self) -> None:
         """최초 실행 시 테이블을 만들고 지원하지 않는 DB 버전을 거절한다."""
 
@@ -143,6 +271,10 @@ class SQLiteDecisionLedger(DecisionLedger):
                 raise RuntimeError(f"SQLite 기록 버전 {version}은 지원하지 않습니다.")
             try:
                 connection.execute("BEGIN")
+                if version > 0:
+                    for from_version in range(version, _SCHEMA_VERSION):
+                        for statement in _MIGRATIONS.get(from_version, ()):
+                            connection.execute(statement)
                 for statement in _SCHEMA:
                     connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
@@ -155,75 +287,153 @@ class SQLiteDecisionLedger(DecisionLedger):
         """run 행과 관련 상세 행을 같은 SQLite 트랜잭션으로 갱신한다."""
 
         with self._connection() as connection, connection:
-            cursor = connection.execute(
-                """UPDATE runs
-                   SET finished_at = ?, status = ?, error = ?, prompt = ?,
-                       snapshot_json = ?
-                   WHERE id = ? AND status = 'running'""",
-                (
-                    _iso_datetime(finished_at),
-                    result.status.value,
-                    result.error,
-                    result.prompt,
-                    _json(result.snapshot),
-                    result.run_id,
-                ),
+            self._update_run(
+                connection,
+                result.run_id,
+                finished_at,
+                result.status,
+                result.error,
+                result.prompt,
+                result.snapshot,
             )
-            if cursor.rowcount != 1:
-                raise ValueError(f"running 사이클을 찾을 수 없습니다: {result.run_id}")
 
             if result.decision is not None:
-                self._store_model_runs(connection, result.run_id, result.decision)
+                for model_run in (
+                    result.decision.claude_run,
+                    result.decision.codex_run,
+                ):
+                    self._store_model_run(connection, result.run_id, model_run)
+                    if model_run.decision is not None:
+                        self._store_model_proposals(
+                            connection,
+                            result.run_id,
+                            model_run.model_id,
+                            model_run.decision,
+                        )
                 if result.decision.consensus is not None:
                     self._store_consensus(connection, result.run_id, result)
             self._store_risk_verdicts(connection, result.run_id, result)
 
     @staticmethod
-    def _store_model_runs(
+    def _store_model_run(
+        connection: sqlite3.Connection, run_id: int, model_run: ModelRun[Any]
+    ) -> None:
+        """모델 원문과 파싱한 판단을 저장한다."""
+
+        connection.execute(
+            """INSERT INTO model_runs
+               (run_id, model_id, exit_code, duration_seconds, error, stdout,
+                stderr, response_text, decision_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run_id,
+                model_run.model_id,
+                model_run.exit_code,
+                str(model_run.duration_seconds),
+                model_run.error,
+                model_run.stdout,
+                model_run.stderr,
+                model_run.response_text,
+                _json(model_run.decision),
+            ),
+        )
+
+    @staticmethod
+    def _store_model_proposals(
         connection: sqlite3.Connection,
         run_id: int,
-        decision: ConsensusDecisionResult,
+        model_id: str,
+        decision: ModelDecision,
     ) -> None:
-        """모델 원문, 파싱 판단, 각 모델의 제안을 저장한다."""
+        """한 모델의 매매 제안을 저장한다."""
 
-        for model_run in (decision.claude_run, decision.codex_run):
+        for index, proposal in enumerate(decision.proposals):
             connection.execute(
-                """INSERT INTO model_runs
-                   (run_id, model_id, exit_code, duration_seconds, error, stdout,
-                    stderr, response_text, decision_json)
+                """INSERT INTO model_proposals
+                   (run_id, model_id, proposal_index, code, action, quantity,
+                    limit_price, confidence, reason)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
-                    model_run.model_id,
-                    model_run.exit_code,
-                    str(model_run.duration_seconds),
-                    model_run.error,
-                    model_run.stdout,
-                    model_run.stderr,
-                    model_run.response_text,
-                    _json(model_run.decision),
+                    model_id,
+                    index,
+                    proposal.code,
+                    proposal.action.value,
+                    proposal.quantity,
+                    str(proposal.limit_price),
+                    str(proposal.confidence),
+                    proposal.reason,
                 ),
             )
-            if model_run.decision is None:
-                continue
-            for index, proposal in enumerate(model_run.decision.proposals):
-                connection.execute(
-                    """INSERT INTO model_proposals
-                       (run_id, model_id, proposal_index, code, action, quantity,
-                        limit_price, confidence, reason)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        run_id,
-                        model_run.model_id,
-                        index,
-                        proposal.code,
-                        proposal.action.value,
-                        proposal.quantity,
-                        str(proposal.limit_price),
-                        str(proposal.confidence),
-                        proposal.reason,
-                    ),
-                )
+
+    @staticmethod
+    def _store_model_recommendations(
+        connection: sqlite3.Connection,
+        run_id: int,
+        recommendation: ModelRecommendation,
+    ) -> None:
+        """한 모델의 종목별 투자의견을 저장한다."""
+
+        for index, item in enumerate(recommendation.recommendations):
+            connection.execute(
+                """INSERT INTO model_recommendations
+                   (run_id, model_id, item_index, code, rating, confidence,
+                    target_price, stop_loss_price, reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    recommendation.model_id,
+                    index,
+                    *_recommendation_values(item),
+                ),
+            )
+
+    @staticmethod
+    def _store_consensus_summary(
+        connection: sqlite3.Connection,
+        run_id: int,
+        claude_summary: str,
+        codex_summary: str,
+        missing_info: list[str],
+    ) -> None:
+        """두 모델 요약과 missing_info 합집합을 저장한다."""
+
+        connection.execute(
+            """INSERT INTO consensus_results
+               (run_id, summary, claude_summary, codex_summary, missing_info_json)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                run_id,
+                f"claude: {claude_summary}\ncodex: {codex_summary}",
+                claude_summary,
+                codex_summary,
+                _json(missing_info),
+            ),
+        )
+
+    @staticmethod
+    def _store_disagreements(
+        connection: sqlite3.Connection,
+        run_id: int,
+        disagreements: list[Disagreement],
+    ) -> None:
+        """합의하지 못한 종목과 모델별 의견을 저장한다."""
+
+        for index, disagreement in enumerate(disagreements):
+            connection.execute(
+                """INSERT INTO consensus_disagreements
+                   (run_id, disagreement_index, code, reason_code,
+                    claude_actions_json, codex_actions_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    index,
+                    disagreement.code,
+                    disagreement.reason_code.value,
+                    _json(disagreement.claude_actions),
+                    _json(disagreement.codex_actions),
+                ),
+            )
 
     @staticmethod
     def _store_consensus(
@@ -236,20 +446,12 @@ class SQLiteDecisionLedger(DecisionLedger):
         assert result.decision is not None
         consensus = result.decision.consensus
         assert consensus is not None
-        summary = (
-            f"claude: {consensus.claude_summary}\ncodex: {consensus.codex_summary}"
-        )
-        connection.execute(
-            """INSERT INTO consensus_results
-               (run_id, summary, claude_summary, codex_summary, missing_info_json)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                run_id,
-                summary,
-                consensus.claude_summary,
-                consensus.codex_summary,
-                _json(consensus.missing_info),
-            ),
+        SQLiteDecisionLedger._store_consensus_summary(
+            connection,
+            run_id,
+            consensus.claude_summary,
+            consensus.codex_summary,
+            consensus.missing_info,
         )
         for index, proposal in enumerate(consensus.proposals):
             connection.execute(
@@ -268,21 +470,9 @@ class SQLiteDecisionLedger(DecisionLedger):
                     proposal.reason,
                 ),
             )
-        for index, disagreement in enumerate(consensus.disagreements):
-            connection.execute(
-                """INSERT INTO consensus_disagreements
-                   (run_id, disagreement_index, code, reason_code,
-                    claude_actions_json, codex_actions_json)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    run_id,
-                    index,
-                    disagreement.code,
-                    disagreement.reason_code.value,
-                    _json(disagreement.claude_actions),
-                    _json(disagreement.codex_actions),
-                ),
-            )
+        SQLiteDecisionLedger._store_disagreements(
+            connection, run_id, consensus.disagreements
+        )
 
     @staticmethod
     def _store_risk_verdicts(
@@ -322,6 +512,19 @@ class SQLiteDecisionLedger(DecisionLedger):
         connection = sqlite3.connect(self.db_path)
         connection.execute("PRAGMA foreign_keys = ON")
         return closing(connection)
+
+
+def _recommendation_values(item: StockRecommendation) -> tuple[object, ...]:
+    """추천 항목을 저장 열 순서(code부터 reason까지)로 바꾼다."""
+
+    return (
+        item.code,
+        item.rating.value,
+        str(item.confidence),
+        None if item.target_price is None else str(item.target_price),
+        None if item.stop_loss_price is None else str(item.stop_loss_price),
+        item.reason,
+    )
 
 
 def _iso_datetime(value: datetime) -> str:

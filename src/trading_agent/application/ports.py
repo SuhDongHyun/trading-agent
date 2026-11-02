@@ -1,12 +1,14 @@
 """외부 데이터 조회에 필요한 애플리케이션 포트."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 
-from trading_agent.domain.models import AccountSnapshot, ModelDecision
+from trading_agent.domain.models import AccountSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +160,17 @@ class MarketDataGateway(ABC):
 
 
 @dataclass(frozen=True, slots=True)
-class ModelRun:
+class ModelTask[T]:
+    """모델에 맡길 작업의 역할 지시, 응답 스키마, 도메인 파서."""
+
+    name: str
+    system_prompt: str
+    response_schema: dict[str, Any]
+    parse: Callable[[str, str], T]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRun[T]:
     """모델 호출의 원문 출력과 검증 결과를 보존한다."""
 
     model_id: str
@@ -167,7 +179,7 @@ class ModelRun:
     exit_code: int | None
     duration_seconds: float
     response_text: str | None = None
-    decision: ModelDecision | None = None
+    decision: T | None = None
     error: str | None = None
 
     @property
@@ -177,9 +189,9 @@ class ModelRun:
         return self.exit_code == 0 and self.decision is not None and self.error is None
 
 
-class DecisionModel(ABC):
+class DecisionModel[T](ABC):
     """프롬프트를 한 모델의 검증된 판단으로 변환하는 포트."""
 
     @abstractmethod
-    def decide(self, prompt: str) -> ModelRun:
+    def decide(self, prompt: str) -> ModelRun[T]:
         """판단 원문과 도메인 결과를 반환하고 실패 시 실행 정보를 예외에 담는다."""

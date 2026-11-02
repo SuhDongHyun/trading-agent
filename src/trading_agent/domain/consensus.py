@@ -3,14 +3,21 @@
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from typing import Protocol
 
 from trading_agent.domain.models import Action, ModelDecision, TradeProposal
+
+
+class HasCode(Protocol):
+    """종목 코드로 묶을 수 있는 응답 항목."""
+
+    @property
+    def code(self) -> str: ...
 
 
 class DisagreementReasonCode(StrEnum):
     """합의하지 못한 종목의 사유 코드."""
 
-    ONE_SIDED = "one_sided"
     ACTION_MISMATCH = "action_mismatch"
     DUPLICATE_PROPOSAL = "duplicate_proposal"
 
@@ -23,6 +30,28 @@ class Disagreement:
     reason_code: DisagreementReasonCode
     claude_actions: tuple[Action, ...]
     codex_actions: tuple[Action, ...]
+
+
+def effective_action(actions: tuple[Action, ...]) -> Action:
+    """종목을 응답에서 뺀 모델은 HOLD로 간주한다."""
+
+    return actions[0] if actions else Action.HOLD
+
+
+def find_disagreement(
+    code: str,
+    claude_actions: tuple[Action, ...],
+    codex_actions: tuple[Action, ...],
+) -> Disagreement | None:
+    """중복 응답이나 서로 다른 유효 동작이면 불일치를 반환한다."""
+
+    if len(claude_actions) > 1 or len(codex_actions) > 1:
+        reason = DisagreementReasonCode.DUPLICATE_PROPOSAL
+    elif effective_action(claude_actions) is not effective_action(codex_actions):
+        reason = DisagreementReasonCode.ACTION_MISMATCH
+    else:
+        return None
+    return Disagreement(code, reason, claude_actions, codex_actions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,14 +71,17 @@ class ConsensusResult:
 
 
 class ConsensusPolicy:
-    """두 모델의 일치하는 매수·매도 제안만 안전하게 병합한다."""
+    """두 모델의 일치하는 매수·매도 제안만 안전하게 병합한다.
+
+    응답에서 빠진 종목은 HOLD로 간주하므로, HOLD와 미응답은 같은 의견이다.
+    """
 
     @staticmethod
     def reconcile(claude: ModelDecision, codex: ModelDecision) -> ConsensusResult:
         """종목 순서와 missing 정보 순서를 보존해 합의 결과를 만든다."""
 
-        claude_by_code = _group_proposals(claude.proposals)
-        codex_by_code = _group_proposals(codex.proposals)
+        claude_by_code = group_by_code(claude.proposals)
+        codex_by_code = group_by_code(codex.proposals)
         codes = dict.fromkeys([*claude_by_code, *codex_by_code])
         proposals: list[TradeProposal] = []
         disagreements: list[Disagreement] = []
@@ -57,50 +89,17 @@ class ConsensusPolicy:
         for code in codes:
             claude_items = claude_by_code.get(code, [])
             codex_items = codex_by_code.get(code, [])
-            claude_actions = tuple(item.action for item in claude_items)
-            codex_actions = tuple(item.action for item in codex_items)
-
-            if len(claude_items) > 1 or len(codex_items) > 1:
-                disagreements.append(
-                    Disagreement(
-                        code,
-                        DisagreementReasonCode.DUPLICATE_PROPOSAL,
-                        claude_actions,
-                        codex_actions,
-                    )
-                )
+            disagreement = find_disagreement(
+                code,
+                tuple(item.action for item in claude_items),
+                tuple(item.action for item in codex_items),
+            )
+            if disagreement is not None:
+                disagreements.append(disagreement)
                 continue
-
-            if not claude_items or not codex_items:
-                disagreements.append(
-                    Disagreement(
-                        code,
-                        DisagreementReasonCode.ONE_SIDED,
-                        claude_actions,
-                        codex_actions,
-                    )
-                )
+            if not claude_items or claude_items[0].action is Action.HOLD:
                 continue
-
-            claude_proposal = claude_items[0]
-            codex_proposal = codex_items[0]
-            if (
-                claude_proposal.action is Action.HOLD
-                and codex_proposal.action is Action.HOLD
-            ):
-                continue
-            if claude_proposal.action is not codex_proposal.action:
-                disagreements.append(
-                    Disagreement(
-                        code,
-                        DisagreementReasonCode.ACTION_MISMATCH,
-                        claude_actions,
-                        codex_actions,
-                    )
-                )
-                continue
-
-            proposals.append(_merge(claude_proposal, codex_proposal))
+            proposals.append(_merge(claude_items[0], codex_items[0]))
 
         return ConsensusResult(
             proposals=proposals,
@@ -113,11 +112,11 @@ class ConsensusPolicy:
         )
 
 
-def _group_proposals(proposals: list[TradeProposal]) -> dict[str, list[TradeProposal]]:
-    """각 종목의 제안을 원래 순서대로 모은다."""
+def group_by_code[T: HasCode](items: list[T]) -> dict[str, list[T]]:
+    """각 종목의 항목을 원래 순서대로 모은다."""
 
-    grouped: dict[str, list[TradeProposal]] = {}
-    for proposal in proposals:
+    grouped: dict[str, list[T]] = {}
+    for proposal in items:
         grouped.setdefault(proposal.code, []).append(proposal)
     return grouped
 

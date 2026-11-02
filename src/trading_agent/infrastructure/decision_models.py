@@ -5,12 +5,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import NoReturn
 
-from trading_agent.application.decision_schema import (
-    DECISION_RESPONSE_SCHEMA,
-    parse_model_decision,
-)
 from trading_agent.application.errors import DecisionModelError
-from trading_agent.application.ports import DecisionModel, ModelRun
+from trading_agent.application.model_tasks import DECISION_TASK
+from trading_agent.application.ports import DecisionModel, ModelRun, ModelTask
 from trading_agent.infrastructure.command_runner import (
     CommandExecutionError,
     CommandResult,
@@ -19,18 +16,54 @@ from trading_agent.infrastructure.command_runner import (
 )
 from trading_agent.infrastructure.config import ClaudeSettings, CodexSettings
 
+# 사용자 전역 설정(hooks, MCP, skills, plugins, CLAUDE.md, slash command)을 끈다.
+# --bare는 OAuth 구독 인증을 막으므로 쓰지 않는다.
+CLAUDE_ISOLATION_ARGS = (
+    "--safe-mode",
+    "--strict-mcp-config",
+    "--disable-slash-commands",
+)
 
-class ClaudeCliDecisionModel(DecisionModel):
+# 사용자 config.toml(MCP 서버, hook 신뢰 상태), execpolicy rules, 도구성 기능을 끈다.
+# 인증은 계속 CODEX_HOME을 사용한다. 전역 AGENTS.md는 끌 수 있는 설정이 없어
+# system prompt에서 적용 대상이 아니라고 명시한다.
+CODEX_DISABLED_FEATURES = (
+    "hooks",
+    "plugins",
+    "apps",
+    "multi_agent",
+    "goals",
+    "image_generation",
+    "browser_use",
+    "computer_use",
+    "in_app_browser",
+)
+CODEX_DISABLED_CONTEXT = (
+    "project_doc_max_bytes=0",
+    "include_environment_context=false",
+    "include_permissions_instructions=false",
+    "include_apps_instructions=false",
+    "include_collaboration_mode_instructions=false",
+)
+
+
+class ClaudeCliDecisionModel[T](DecisionModel[T]):
     """구독 인증을 사용하는 헤드리스 Claude CLI 어댑터."""
 
-    def __init__(self, settings: ClaudeSettings, runner: CommandRunner) -> None:
+    def __init__(
+        self,
+        settings: ClaudeSettings,
+        runner: CommandRunner,
+        task: ModelTask[T] = DECISION_TASK,  # type: ignore[assignment]
+    ) -> None:
         self.settings = settings
         self.runner = runner
+        self.task = task
 
-    def decide(self, prompt: str) -> ModelRun:
+    def decide(self, prompt: str) -> ModelRun[T]:
         """Claude structured output envelope를 도메인 판단으로 검증한다."""
 
-        schema_text = json.dumps(DECISION_RESPONSE_SCHEMA, separators=(",", ":"))
+        schema_text = json.dumps(self.task.response_schema, separators=(",", ":"))
         argv = [
             self.settings.command,
             "-p",
@@ -45,6 +78,9 @@ class ClaudeCliDecisionModel(DecisionModel):
             "--tools",
             "",
             "--no-session-persistence",
+            *CLAUDE_ISOLATION_ARGS,
+            "--system-prompt",
+            self.task.system_prompt,
         ]
         with TemporaryDirectory(prefix="trading-agent-claude-") as working_directory:
             result = _run_command(
@@ -69,7 +105,7 @@ class ClaudeCliDecisionModel(DecisionModel):
                 if isinstance(structured_output, str)
                 else json.dumps(structured_output, ensure_ascii=False)
             )
-            decision = parse_model_decision(response_text, "claude")
+            decision = self.task.parse(response_text, "claude")
         except (ValueError, TypeError) as error:
             _raise_invalid_response("claude", result, str(error), None)
         return ModelRun(
@@ -83,23 +119,31 @@ class ClaudeCliDecisionModel(DecisionModel):
         )
 
 
-class CodexCliDecisionModel(DecisionModel):
+class CodexCliDecisionModel[T](DecisionModel[T]):
     """일회성 read-only Codex CLI 실행 어댑터."""
 
-    def __init__(self, settings: CodexSettings, runner: CommandRunner) -> None:
+    def __init__(
+        self,
+        settings: CodexSettings,
+        runner: CommandRunner,
+        task: ModelTask[T] = DECISION_TASK,  # type: ignore[assignment]
+    ) -> None:
         self.settings = settings
         self.runner = runner
+        self.task = task
 
-    def decide(self, prompt: str) -> ModelRun:
+    def decide(self, prompt: str) -> ModelRun[T]:
         """임시 schema와 마지막 응답 파일을 이용해 판단을 검증한다."""
 
         with TemporaryDirectory(prefix="trading-agent-codex-") as working_directory:
-            schema_path = Path(working_directory) / "decision-schema.json"
-            output_path = Path(working_directory) / "decision-output.json"
+            schema_path = Path(working_directory) / "response-schema.json"
+            output_path = Path(working_directory) / "response-output.json"
+            instructions_path = Path(working_directory) / "instructions.md"
             schema_path.write_text(
-                json.dumps(DECISION_RESPONSE_SCHEMA, ensure_ascii=False, indent=2),
+                json.dumps(self.task.response_schema, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            instructions_path.write_text(self.task.system_prompt, encoding="utf-8")
             argv = [
                 self.settings.command,
                 "exec",
@@ -113,6 +157,13 @@ class CodexCliDecisionModel(DecisionModel):
                 str(output_path),
                 "--sandbox",
                 "read-only",
+                "--json",
+                "--ignore-user-config",
+                "--ignore-rules",
+                *_flag_pairs("--disable", CODEX_DISABLED_FEATURES),
+                *_flag_pairs("-c", CODEX_DISABLED_CONTEXT),
+                "-c",
+                f"model_instructions_file={json.dumps(str(instructions_path))}",
                 "--ephemeral",
                 "--skip-git-repo-check",
                 "-",
@@ -132,7 +183,7 @@ class CodexCliDecisionModel(DecisionModel):
                     "codex", result, f"Codex 응답 파일을 읽지 못했습니다: {error}", None
                 )
             try:
-                decision = parse_model_decision(response_text, "codex")
+                decision = self.task.parse(response_text, "codex")
             except (ValueError, TypeError) as error:
                 _raise_invalid_response("codex", result, str(error), response_text)
 
@@ -145,6 +196,12 @@ class CodexCliDecisionModel(DecisionModel):
             response_text=response_text,
             decision=decision,
         )
+
+
+def _flag_pairs(flag: str, values: tuple[str, ...]) -> list[str]:
+    """같은 옵션을 값마다 반복한 인자 목록을 만든다."""
+
+    return [item for value in values for item in (flag, value)]
 
 
 def _run_command(
