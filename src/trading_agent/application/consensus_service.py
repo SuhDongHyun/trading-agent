@@ -7,7 +7,12 @@ from time import perf_counter
 from trading_agent.application.errors import DecisionModelError
 from trading_agent.application.ports import DecisionModel, ModelRun
 from trading_agent.domain.consensus import ConsensusPolicy, ConsensusResult
-from trading_agent.domain.models import ModelDecision, TradeProposal
+from trading_agent.domain.models import (
+    ConfidenceAggregation,
+    ConsensusPolicyName,
+    ModelDecision,
+    TradeProposal,
+)
 from trading_agent.domain.recommendation import (
     ModelRecommendation,
     RecommendationConsensusPolicy,
@@ -58,9 +63,13 @@ class ConsensusDecisionService:
         self,
         claude: DecisionModel[ModelDecision],
         codex: DecisionModel[ModelDecision],
+        policy: ConsensusPolicyName = ConsensusPolicyName.STRICT,
+        confidence_aggregation: ConfidenceAggregation = ConfidenceAggregation.MIN,
     ) -> None:
         self._claude = claude
         self._codex = codex
+        self._policy = ConsensusPolicyName(policy)
+        self._confidence_aggregation = ConfidenceAggregation(confidence_aggregation)
 
     def decide(self, prompt: str) -> ConsensusDecisionResult:
         """두 호출을 모두 기다리고 하나라도 실패하면 제안을 비운다."""
@@ -69,7 +78,12 @@ class ConsensusDecisionService:
         if not claude_run.succeeded or not codex_run.succeeded:
             return ConsensusDecisionResult(claude_run, codex_run, None)
         assert claude_run.decision is not None and codex_run.decision is not None
-        consensus = ConsensusPolicy.reconcile(claude_run.decision, codex_run.decision)
+        consensus = ConsensusPolicy.reconcile(
+            claude_run.decision,
+            codex_run.decision,
+            self._policy,
+            self._confidence_aggregation,
+        )
         return ConsensusDecisionResult(claude_run, codex_run, consensus)
 
 
@@ -80,9 +94,13 @@ class RecommendationConsensusService:
         self,
         claude: DecisionModel[ModelRecommendation],
         codex: DecisionModel[ModelRecommendation],
+        policy: ConsensusPolicyName = ConsensusPolicyName.STRICT,
+        confidence_aggregation: ConfidenceAggregation = ConfidenceAggregation.MIN,
     ) -> None:
         self._claude = claude
         self._codex = codex
+        self._policy = ConsensusPolicyName(policy)
+        self._confidence_aggregation = ConfidenceAggregation(confidence_aggregation)
 
     def recommend(self, prompt: str) -> RecommendationConsensusOutcome:
         """두 호출을 모두 기다리고 하나라도 실패하면 추천을 비운다."""
@@ -92,7 +110,10 @@ class RecommendationConsensusService:
             return RecommendationConsensusOutcome(claude_run, codex_run, None)
         assert claude_run.decision is not None and codex_run.decision is not None
         consensus = RecommendationConsensusPolicy.reconcile(
-            claude_run.decision, codex_run.decision
+            claude_run.decision,
+            codex_run.decision,
+            self._policy,
+            self._confidence_aggregation,
         )
         return RecommendationConsensusOutcome(claude_run, codex_run, consensus)
 

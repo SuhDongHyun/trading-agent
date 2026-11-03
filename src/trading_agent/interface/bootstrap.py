@@ -68,6 +68,8 @@ def create_runtime(
     consensus_service = ConsensusDecisionService(
         ClaudeCliDecisionModel(settings.llm.claude, runner, DECISION_TASK),
         CodexCliDecisionModel(settings.llm.codex, runner, DECISION_TASK),
+        policy=settings.consensus.policy,
+        confidence_aggregation=settings.consensus.confidence_aggregation,
     )
     risk_policy = RiskPolicy(
         max_position_weight=Decimal(str(settings.risk.max_position_weight)),
@@ -137,6 +139,8 @@ def create_recommendation_runtime(
     service = RecommendationConsensusService(
         ClaudeCliDecisionModel(settings.llm.claude, runner, RECOMMENDATION_TASK),
         CodexCliDecisionModel(settings.llm.codex, runner, RECOMMENDATION_TASK),
+        policy=settings.consensus.policy,
+        confidence_aggregation=settings.consensus.confidence_aggregation,
     )
     use_case = RecommendStocks(
         snapshot_builder=SnapshotBuilder(gateway, settings.watchlist, clock=clock),

@@ -71,6 +71,9 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
     )
     assert "as_of_trading_date" in prompt
     assert "market_session" in prompt
+    assert "0.5는 근거가 엇갈려 동전 던지기 수준" in prompt
+    assert "0.7은 같은 근거로 10번 중 7번 맞을 수준" in prompt
+    assert "hold의 confidence도 매수·매도하지 않기로 한 판단 자체" in prompt
 
 
 def test_recommendation_prompt_asks_for_every_stock_without_account() -> None:
@@ -95,3 +98,5 @@ def test_recommendation_prompt_asks_for_every_stock_without_account() -> None:
     assert "이미 있는 항목은 다시 적지 마세요" in prompt
     assert "market:vkospi" in prompt
     assert "as_of_trading_date" in prompt
+    assert "0.5는 근거가 엇갈려 동전 던지기 수준" in prompt
+    assert "hold의 confidence도 매수·매도하지 않기로 한 판단 자체" in prompt

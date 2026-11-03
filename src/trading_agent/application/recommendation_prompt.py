@@ -3,6 +3,7 @@
 import json
 
 from trading_agent.application.prompt_builder import (
+    CONFIDENCE_SCALE_GUIDANCE,
     MARKET_FIELD_GLOSSARY,
     STOCK_FIELD_GLOSSARY,
     to_json_value,
@@ -27,7 +28,7 @@ def build_recommendation_prompt(snapshot: ResearchSnapshot) -> str:
   - buy: 지금 신규 진입해도 기대수익이 위험보다 크다.
   - hold: 진입·청산 근거가 약하거나 판단이 엇갈린다. 확신이 낮으면 hold로 적으세요.
   - sell: 보유 중이라면 줄이거나 피해야 한다.
-- confidence는 0~1 사이의 확신도입니다.
+- confidence는 아래 공통 확신도 척도에 따라 판단 자체의 확신도를 적으세요.
 - buy와 sell이면 target_price와 invalidation_price를 원 단위 숫자로 적으세요.
   - buy: target_price는 목표가, invalidation_price는 손절가입니다.
     (손절가 < 현재가 < 목표가)
@@ -38,6 +39,9 @@ def build_recommendation_prompt(snapshot: ResearchSnapshot) -> str:
 - 필요한데 제공되지 않은 데이터는 missing_info에 적되,
   아래 누락 데이터 목록에 이미 있는 항목은 다시 적지 마세요.
 - 응답은 주어진 JSON Schema에 맞는 JSON 하나만 출력하세요.
+
+확신도 척도:
+{CONFIDENCE_SCALE_GUIDANCE}
 
 필드 설명:
 - created_at: 스냅샷을 만든 시각.

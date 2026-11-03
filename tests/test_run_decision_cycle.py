@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -23,11 +24,14 @@ from trading_agent.application.snapshot_builder import SnapshotBuilder
 from trading_agent.domain.models import (
     AccountSnapshot,
     Action,
+    ConfidenceAggregation,
+    ConsensusBasis,
+    ConsensusPolicyName,
     ModelDecision,
     Position,
     TradeProposal,
 )
-from trading_agent.domain.risk import RiskPolicy
+from trading_agent.domain.risk import RiskPolicy, RiskReasonCode
 from trading_agent.infrastructure.sqlite_ledger import SQLiteDecisionLedger
 
 FIXED_NOW = datetime(2026, 10, 28, 23, 0, tzinfo=UTC)
@@ -74,13 +78,19 @@ def make_decision(model_id: str, proposals: list[TradeProposal]) -> ModelDecisio
     return ModelDecision(model_id, proposals, f"{model_id} summary", ["news"])
 
 
-def make_proposal(code: str, price: str = "100.123456789") -> TradeProposal:
+def make_proposal(
+    code: str,
+    price: str = "100.123456789",
+    *,
+    confidence: float = 0.9,
+    action: Action = Action.BUY,
+) -> TradeProposal:
     return TradeProposal(
         code=code,
-        action=Action.BUY,
-        quantity=2,
+        action=action,
+        quantity=0 if action is Action.HOLD else 2,
         limit_price=Decimal(price),
-        confidence=0.9,
+        confidence=confidence,
         reason="test signal",
     )
 
@@ -214,6 +224,81 @@ def test_cycle_records_completed_model_failed_and_data_failed(
                 ).fetchone()[0]
                 == 0
             )
+
+
+def test_one_sided_buy_reaches_risk_guard_confidence_check(tmp_path: Path) -> None:
+    db_path = tmp_path / "one-sided.sqlite"
+    cycle = build_cycle(db_path)
+    cycle.consensus_service = ConsensusDecisionService(
+        FakeDecisionModel(
+            "claude",
+            make_decision("claude", [make_proposal("005930", confidence=0.59)]),
+        ),
+        FakeDecisionModel(
+            "codex",
+            make_decision("codex", [make_proposal("005930", action=Action.HOLD)]),
+        ),
+        policy=ConsensusPolicyName.BUY_ONE_SIDE,
+        confidence_aggregation=ConfidenceAggregation.MEAN,
+    )
+
+    result = cycle.run()
+
+    assert result.status is CycleStatus.COMPLETED
+    assert result.decision is not None and result.decision.consensus is not None
+    adopted = result.decision.consensus.proposals[0]
+    assert adopted.consensus_basis is ConsensusBasis.CLAUDE_ONLY
+    assert adopted.confidence == 0.59
+    verdict = next(
+        item for item in result.verdicts or [] if item.proposal.code == "005930"
+    )
+    assert not verdict.approved
+    assert RiskReasonCode.CONFIDENCE_TOO_LOW in {
+        reason.code for reason in verdict.reasons
+    }
+
+    with sqlite3.connect(db_path) as connection:
+        policy, aggregation = connection.execute(
+            "SELECT policy, confidence_aggregation FROM consensus_results "
+            "WHERE run_id = ?",
+            (result.run_id,),
+        ).fetchone()
+        basis = connection.execute(
+            "SELECT consensus_basis FROM consensus_proposals WHERE run_id = ?",
+            (result.run_id,),
+        ).fetchone()[0]
+    assert (policy, aggregation, basis) == ("buy_one_side", "mean", "claude_only")
+
+
+def test_mean_confidence_at_minimum_threshold_is_approved(tmp_path: Path) -> None:
+    cycle = build_cycle(tmp_path / "confidence-boundary.sqlite")
+    cycle.risk_policy = replace(cycle.risk_policy, min_confidence=0.65)
+    cycle.consensus_service = ConsensusDecisionService(
+        FakeDecisionModel(
+            "claude",
+            make_decision("claude", [make_proposal("005930", confidence=0.6)]),
+        ),
+        FakeDecisionModel(
+            "codex",
+            make_decision("codex", [make_proposal("005930", confidence=0.7)]),
+        ),
+        policy=ConsensusPolicyName.STRICT,
+        confidence_aggregation=ConfidenceAggregation.MEAN,
+    )
+
+    result = cycle.run()
+
+    assert result.status is CycleStatus.COMPLETED
+    assert result.decision is not None and result.decision.consensus is not None
+    proposal = result.decision.consensus.proposals[0]
+    assert proposal.confidence == 0.65
+    verdict = next(
+        item for item in result.verdicts or [] if item.proposal.code == "005930"
+    )
+    assert verdict.approved
+    assert RiskReasonCode.CONFIDENCE_TOO_LOW not in {
+        reason.code for reason in verdict.reasons
+    }
 
 
 def test_unexpected_exception_is_recorded_as_error(tmp_path: Path) -> None:

@@ -233,6 +233,28 @@ class Action(StrEnum):
     HOLD = "hold"
 
 
+class ConsensusPolicyName(StrEnum):
+    """두 모델 의견을 합치는 정책 이름."""
+
+    STRICT = "strict"
+    BUY_ONE_SIDE = "buy_one_side"
+
+
+class ConfidenceAggregation(StrEnum):
+    """양쪽 동의 시 확신도를 집계하는 방법."""
+
+    MIN = "min"
+    MEAN = "mean"
+
+
+class ConsensusBasis(StrEnum):
+    """채택된 합의 항목의 근거 범위."""
+
+    AGREED = "agreed"
+    CLAUDE_ONLY = "claude_only"
+    CODEX_ONLY = "codex_only"
+
+
 class ProposalSource(StrEnum):
     """매매 제안이 만들어진 경로."""
 
@@ -260,6 +282,7 @@ class TradeProposal:
     reason: str
     source: ProposalSource = ProposalSource.CONSENSUS
     rule_type: RuleType | None = None
+    consensus_basis: ConsensusBasis | None = None
 
     def __post_init__(self) -> None:
         require_stock_code(self.code)
@@ -276,6 +299,12 @@ class TradeProposal:
             raise DomainError("규칙 제안에는 규칙 종류가 필요합니다.")
         object.__setattr__(self, "source", source)
         object.__setattr__(self, "rule_type", rule_type)
+        if self.consensus_basis is not None:
+            try:
+                basis = ConsensusBasis(self.consensus_basis)
+            except (TypeError, ValueError) as error:
+                raise DomainError("합의 근거가 올바르지 않습니다.") from error
+            object.__setattr__(self, "consensus_basis", basis)
         if not isinstance(self.quantity, int) or isinstance(self.quantity, bool):
             raise DomainError("매매 수량은 정수여야 합니다.")
         if action in (Action.BUY, Action.SELL) and self.quantity <= 0:

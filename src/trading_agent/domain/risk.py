@@ -56,7 +56,7 @@ class RiskPolicy:
 
     max_position_weight: Decimal
     max_order_amount: Decimal | None = None
-    min_confidence: float = 0.7
+    min_confidence: float = 0.6
     allowed_codes: set[str] | frozenset[str] = field(default_factory=frozenset)
     max_proposals_per_cycle: int = 5
     max_order_ratio: Decimal = Decimal("0.1")
