@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -130,6 +130,23 @@ class RecommendationSettings(BaseModel):
 
     universe: list[str] = Field(default_factory=list)
     max_results: int = Field(default=5, gt=0)
+    horizon_days: list[StrictInt] = Field(default_factory=lambda: [10, 20])
+
+    @field_validator("horizon_days")
+    @classmethod
+    def validate_horizon_days(cls, values: list[int]) -> list[int]:
+        """투자 기간 horizon을 오름차순의 양의 정수로 제한한다."""
+
+        if (
+            not values
+            or any(value <= 0 for value in values)
+            or values != sorted(values)
+            or len(values) != len(set(values))
+        ):
+            raise ValueError(
+                "horizon_days는 오름차순의 중복 없는 양의 정수 목록이어야 합니다."
+            )
+        return values
 
 
 class ConsensusSettings(BaseModel):

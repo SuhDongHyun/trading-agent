@@ -12,6 +12,7 @@ import pytest
 from trading_agent.application.backtest import BACKTEST_FORMAT_VERSION
 from trading_agent.application.backtest_score import (
     BacktestScoreOptions,
+    BacktestScoreResult,
     ScoreBacktest,
     _calibration,
     _cluster_bootstrap,
@@ -241,6 +242,7 @@ def test_scoring_uses_future_prices_market_benchmark_and_mask_restored_models() 
         gateway,
         BacktestScoreOptions(
             horizons=(1,),
+            primary_horizons=(1,),
             compare_policies=True,
             bootstrap_iterations=100,
             hold_bands={1: 0.5},
@@ -255,6 +257,7 @@ def test_scoring_uses_future_prices_market_benchmark_and_mask_restored_models() 
     assert result.data["counts"]["statuses"]["snapshot_only"] == 1
     assert result.data["counts"]["leakage_blocked_rows"] == 7
     assert result.data["counts"]["missing_benchmarks"] == 0
+    assert "주요 horizon: 1거래일 (그 외는 참고)" in result.markdown
     assert result.data["periods"]["before_20260701"]["date_count"] == 1
     assert result.data["periods"]["from_20260701"]["date_count"] == 1
     assert set(gateway.quote_calls) == set(CODES)
@@ -589,6 +592,77 @@ def test_markdown_formats_rates_and_percentage_points_separately() -> None:
     assert "66.7%" in markdown
     assert "7.80%p" in markdown
     assert "-5.5%" in markdown
+
+
+def test_markdown_prioritizes_configured_investment_horizons() -> None:
+    markdown = render_score_markdown(
+        {
+            "horizons": [5, 10, 20],
+            "counts": {"completed_dates": 1, "excluded_dates": 0},
+            "sources": {
+                "consensus": {
+                    "opinion_distribution": {},
+                    "horizons": {str(horizon): {"n": 0} for horizon in (5, 10, 20)},
+                }
+            },
+            "base_rates": {str(horizon): {} for horizon in (5, 10, 20)},
+        },
+        primary_horizons=(10, 20),
+    )
+
+    assert "주요 horizon: 10·20거래일 (그 외는 참고)" in markdown
+    assert markdown.index("| consensus | 10 |") < markdown.index("| consensus | 20 |")
+    assert markdown.index("| consensus | 20 |") < markdown.index("| consensus | 5 |")
+    base_rates = markdown.split("## 기준율", maxsplit=1)[1].split("## IC", maxsplit=1)[
+        0
+    ]
+    assert base_rates.index("| 10 |") < base_rates.index("| 20 |")
+    assert base_rates.index("| 20 |") < base_rates.index("| 5 |")
+
+
+def test_score_runtime_orders_primary_horizons_and_labels_references(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    horizons = (5, 10, 20)
+    data = {
+        "horizons": list(horizons),
+        "policy": "buy_one_side",
+        "confidence_aggregation": "mean",
+        "counts": {"completed_dates": 1, "excluded_dates": 0},
+        "sources": {
+            "consensus": {
+                "opinion_distribution": {},
+                "horizons": {
+                    str(horizon): {
+                        "buy_n": 1,
+                        "buy_mean_xs": horizon,
+                        "sell_mean_xs": -horizon,
+                    }
+                    for horizon in horizons
+                },
+            }
+        },
+    }
+
+    class FakeScoreUseCase:
+        options = BacktestScoreOptions(primary_horizons=(10, 20))
+
+        def run(self) -> BacktestScoreResult:
+            return BacktestScoreResult(data, "rendered by use case")
+
+    output_json = tmp_path / "score.json"
+    runtime = BacktestScoreRuntime(
+        FakeScoreUseCase(), object(), output_json, output_json.with_suffix(".md")
+    )
+
+    runtime.run()
+
+    output = capsys.readouterr().out
+    assert output.index("합의 10일:") < output.index("합의 20일:")
+    assert output.index("합의 20일:") < output.index("합의 5일(참고):")
+    assert output_json.with_suffix(".md").read_text(encoding="utf-8") == (
+        "rendered by use case"
+    )
 
 
 def test_policy_comparison_includes_selected_policy_when_full_compare_is_off() -> None:

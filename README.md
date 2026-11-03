@@ -62,6 +62,7 @@ risk:
 recommendation:
   universe: []        # 비우면 watchlist를 추천 후보로 사용
   max_results: 5      # recommend 출력에 표시할 BUY 수
+  horizon_days: [10, 20]  # 판단 기간: 오름차순의 양의 거래일 목록
 consensus:
   policy: buy_one_side       # strict 또는 buy_one_side
   confidence_aggregation: mean  # min 또는 mean
@@ -122,6 +123,20 @@ fail-closed로 제안을 승인하지 않습니다.
 확신도를 평균합니다. `min`은 기존처럼 낮은 확신도를 사용합니다. 한쪽 매수에는
 매수 모델의 확신도를 사용합니다. 채택 항목의 `consensus_basis`는 `agreed`,
 `claude_only`, `codex_only`로 기록됩니다.
+
+## 판단 원칙과 투자 기간
+
+추천과 매매 프롬프트는 `recommendation.horizon_days`를 투자 기간으로 사용합니다.
+기본값 `[10, 20]`은 약 2~4주 스윙이며, 값은 양의 정수로 오름차순·중복 없이
+설정해야 합니다. 값 하나를 지정하면 해당 거래일 수를 기간으로 표시합니다. 예를 들어
+`[10]`은 10거래일입니다. 환경변수 `TRADING_AGENT__RECOMMENDATION__HORIZON_DAYS`로도
+재정의할 수 있습니다.
+
+과열(RSI 80 이상 또는 20·60일선과의 큰 이격)만으로 매도하지 않습니다. 매도는 MACD
+하향 교차, 종가의 20일선 이탈, 거래량 증가를 동반한 하락 중 하나 이상으로 추세
+훼손이 확인될 때만 고려합니다. 5일 수익률이 10% 이상 오른 직후에는 눌림 후 지지나
+거래량 동반 돌파 같은 추가 근거 없이 매수하지 않습니다. 매매 근거가 약하거나
+확신이 낮으면 hold를 유지합니다.
 
 ## 리스크 정책
 
