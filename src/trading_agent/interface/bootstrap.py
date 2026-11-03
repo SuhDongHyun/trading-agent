@@ -35,6 +35,7 @@ from trading_agent.application.records import (
 from trading_agent.application.run_decision_cycle import RunDecisionCycle
 from trading_agent.application.snapshot_builder import SnapshotBuilder
 from trading_agent.domain.models import ConfidenceAggregation, ConsensusPolicyName
+from trading_agent.domain.price_guard import PriceGuardMode, PriceGuardPolicy
 from trading_agent.domain.risk import RiskPolicy
 from trading_agent.infrastructure.backtest_result_store import FileBacktestResultStore
 from trading_agent.infrastructure.command_runner import SubprocessCommandRunner
@@ -231,6 +232,7 @@ def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRunti
         start_date=args.start_date,
         requested_to=args.end_date,
         dates=_parse_dates_count(args.dates),
+        dates_explicit=args.dates is not None,
         explicit_dates=_explicit_dates(args.date),
         seed=args.seed,
         universe=universe,
@@ -325,6 +327,7 @@ def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRunti
             universe=codes,
             ledger=shared_ledger,
             clock=clock,
+            price_guard_policy=_price_guard_policy(settings),
         )
 
     def progress(
@@ -420,12 +423,25 @@ def create_recommendation_runtime(
             stale_run_after=timedelta(seconds=settings.ledger.stale_run_after_seconds),
         ),
         clock=clock,
+        price_guard_policy=_price_guard_policy(settings),
     )
     return RecommendationRuntime(use_case=use_case, gateway=gateway)
 
 
+def _price_guard_policy(settings: AgentSettings) -> PriceGuardPolicy:
+    """설정 값으로 도메인 추천 가격 가드를 만든다."""
+
+    return PriceGuardPolicy(
+        mode=PriceGuardMode(settings.price_guard.mode),
+        min_stop_atr_multiple=Decimal(str(settings.price_guard.min_stop_atr_multiple)),
+        min_reward_risk=Decimal(str(settings.price_guard.min_reward_risk)),
+    )
+
+
 def _parse_dates_count(value: str | None) -> str | int:
-    if value is None or value == "all":
+    if value is None:
+        return 10
+    if value == "all":
         return "all"
     try:
         count = int(value)

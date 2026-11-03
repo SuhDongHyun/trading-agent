@@ -5,6 +5,7 @@ import json
 from trading_agent.application.prompt_builder import (
     CONFIDENCE_SCALE_GUIDANCE,
     MARKET_FIELD_GLOSSARY,
+    PRICE_RECOMMENDATION_GUIDANCE,
     STOCK_FIELD_GLOSSARY,
     to_json_value,
 )
@@ -39,6 +40,8 @@ def build_recommendation_prompt(snapshot: ResearchSnapshot) -> str:
 - 필요한데 제공되지 않은 데이터는 missing_info에 적되,
   아래 누락 데이터 목록에 이미 있는 항목은 다시 적지 마세요.
 - 응답은 주어진 JSON Schema에 맞는 JSON 하나만 출력하세요.
+
+{PRICE_RECOMMENDATION_GUIDANCE}
 
 확신도 척도:
 {CONFIDENCE_SCALE_GUIDANCE}

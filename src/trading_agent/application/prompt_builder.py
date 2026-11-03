@@ -25,7 +25,29 @@ STOCK_FIELD_GLOSSARY = """- stocks[].code/name: 종목 코드와 이름.
 - stocks[].macd/macd_signal_value/macd_signal: MACD, 신호선 값, MACD 신호.
 - stocks[].volume_change_percent: 거래량 변화율입니다.
   장중에는 당일 미완성 누적 거래량을 직전 20일 평균과 비교하므로 과소평가될 수 있습니다.
+- stocks[].atr14_percent: Wilder ATR(14)을 현재가로 나눈 일간 가격 변동 폭(%)입니다.
+- stocks[].realized_volatility_20d_percent: 최근 20개 단순 일간 수익률의
+  모집단 표준편차(%)입니다. 일간 기준이며 연율화하지 않았습니다.
+- stocks[].high_20d_distance_percent: 현재가와 최근 20거래일 최고 고가의 거리(%)입니다.
+  (현재가 − 최고 고가) ÷ 최고 고가이므로 최고가 아래면 음수입니다.
+- stocks[].low_20d_distance_percent: 현재가와 최근 20거래일 최저 저가의 거리(%)입니다.
+  (현재가 − 최저 저가) ÷ 최저 저가이므로 최저가 위면 양수입니다.
+- stocks[].high_52w_position_percent: 최근 최대 252거래일 저가~고가 범위에서
+  현재가가 차지하는 위치(%)입니다. 저가가 0%, 고가가 100%이며
+  high_52w_period_trading_days가 실제 계산에 사용한 거래일 수입니다.
+- market_session이 open이면 최신 일봉에 당일 미완성 봉이 포함될 수 있습니다.
 - stocks[].news_headlines: 최근 뉴스 제목."""
+
+PRICE_RECOMMENDATION_GUIDANCE = """가격 위험 규칙:
+- ATR 금액은 현재가 × atr14_percent ÷ 100으로 계산하세요.
+- 20일 최저 저가 금액은 현재가 ÷ (1 + low_20d_distance_percent ÷ 100),
+  최고 고가 금액은 현재가 ÷ (1 + high_20d_distance_percent ÷ 100)으로 환산하세요.
+- buy invalidation_price는 현재가 − 2×ATR 금액 이하 또는 최근 20거래일 최저 저가
+  이하 중 더 낮은 가격을 기본으로 고려하세요.
+- sell invalidation_price는 현재가 + 2×ATR 금액 이상 또는 최근 20거래일 최고 고가
+  이상 중 더 높은 가격을 기본으로 고려하세요.
+- 목표 폭 ÷ 손절 폭 손익비는 최소 1.5여야 합니다.
+- ATR 또는 OHLC 근거가 없으면 임의로 계산하지 말고 missing_info에 적으세요."""
 
 MARKET_FIELD_GLOSSARY = """- market_context.kospi_change_percent, kosdaq_change_percent,
   sp500_change_percent: 각 시장 지수의 변화율.
@@ -138,6 +160,7 @@ def to_json_value(value: Any, field_name: str | None = None) -> Any:
             "limit_price",
             "target_price",
             "invalidation_price",
+            "original_invalidation_price",
         } or (field_name is not None and field_name.endswith("_amount")):
             return format(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP), "f")
         return format(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")

@@ -68,7 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--to", dest="end_date", type=_date_arg, help="종료일 YYYYMMDD"
     )
     backtest_run.add_argument(
-        "--dates", help="all 또는 무작위로 뽑을 거래일 수 (기본: all)"
+        "--dates",
+        help="all 또는 무작위로 뽑을 거래일 수 (기본: 10)",
     )
     backtest_run.add_argument(
         "--date", action="append", help="명시 날짜 YYYYMMDD (반복·콤마 목록 가능)"
@@ -359,6 +360,8 @@ def _print_recommendation(
 
     target = _price(item.target_price)
     invalidation = _price(item.invalidation_price)
+    if item.price_adjusted and item.original_invalidation_price is not None:
+        invalidation += f" (ATR 보정, 원래 {_price(item.original_invalidation_price)})"
     if item.rating is Action.SELL:
         levels = f"예상 하락가 {target}, {invalidation} 위로 오르면 매도 의견 철회"
     else:
@@ -370,6 +373,8 @@ def _print_recommendation(
         f"확신도 {item.confidence:.2f} {levels}"
     )
     print(f"     근거: {item.reason}")
+    for warning in item.price_warnings or []:
+        print(f"     가격 경고: {warning}")
 
 
 def _consensus_basis_label(basis: ConsensusBasis | None) -> str | None:

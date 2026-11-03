@@ -32,7 +32,10 @@ from trading_agent.application.ports import (
     TreasuryMaturity,
 )
 from trading_agent.application.recommend_stocks import RecommendStocks
-from trading_agent.application.snapshot_builder import SnapshotBuilder
+from trading_agent.application.snapshot_builder import (
+    LOOKBACK_CALENDAR_DAYS,
+    SnapshotBuilder,
+)
 from trading_agent.domain.models import (
     Action,
     MarketContext,
@@ -254,19 +257,95 @@ def test_date_selection_is_seeded_and_safe_to_date_uses_horizon() -> None:
     assert choose_dates(dates, dates[0], dates[-1], "all", 42) == dates
 
 
+def test_backtest_run_defaults_to_ten_dates_and_all_is_explicit() -> None:
+    from trading_agent.interface.bootstrap import _parse_dates_count
+
+    args = build_parser().parse_args(["backtest", "run"])
+
+    assert args.dates is None
+    assert _parse_dates_count(args.dates) == 10
+    assert _parse_dates_count("all") == "all"
+    explicit_args = build_parser().parse_args(["backtest", "run", "--dates", "10"])
+    assert explicit_args.dates == "10"
+
+
+def test_backtest_pit_gateway_range_covers_extended_daily_lookback(
+    tmp_path: Path,
+) -> None:
+    options = make_options(tmp_path / "extended-lookback")
+    ranges: list[tuple[str, str]] = []
+
+    assert make_runner(options, gateway_ranges=ranges).run() == 0
+
+    expected_start = (
+        datetime.strptime("20260915", "%Y%m%d")
+        - timedelta(days=LOOKBACK_CALENDAR_DAYS + 14)
+    ).strftime("%Y%m%d")
+    assert ranges == [(expected_start, "20260915")]
+
+
+def test_implicit_dates_count_is_capped_at_available_dates(tmp_path: Path) -> None:
+    options = make_options(
+        tmp_path / "implicit-short-range",
+        dates=10,
+        dates_explicit=False,
+        explicit_dates=None,
+        snapshot_only=True,
+        use_default_explicit_date=False,
+    )
+    runner = make_runner(
+        options,
+        calendar_dates=["20260914", "20260915"],
+    )
+
+    assert runner.run() == 0
+    manifest = FileBacktestResultStore(options.output_dir).read_manifest()
+    assert manifest is not None
+    assert manifest["selected_dates"] == ["20260914", "20260915"]
+
+
+def test_explicit_dates_count_larger_than_available_still_errors(
+    tmp_path: Path,
+) -> None:
+    options = make_options(
+        tmp_path / "explicit-short-range",
+        dates=10,
+        dates_explicit=True,
+        explicit_dates=None,
+        snapshot_only=True,
+        use_default_explicit_date=False,
+    )
+
+    with pytest.raises(
+        ValueError, match="요청한 날짜 수가 기간 내 거래일 수보다 큽니다"
+    ):
+        make_runner(
+            options,
+            calendar_dates=["20260914", "20260915"],
+        ).run()
+
+
 def test_masking_round_trip_restores_recommendation_code_and_prices() -> None:
     mapping = MaskingMap.create(["005930"], 123)
     recommendation = StockRecommendation(
-        "005930", Action.BUY, 0.8, Decimal("120"), Decimal("90"), "근거"
+        "005930",
+        Action.BUY,
+        0.8,
+        Decimal("120"),
+        Decimal("90"),
+        "근거",
+        original_invalidation_price=Decimal("95"),
+        price_adjusted=True,
     )
     alias = mapping.masked_code("005930")
-    masked = recommendation.__class__(
-        alias,
-        recommendation.rating,
-        recommendation.confidence,
-        mapping.scale("005930", recommendation.target_price),
-        mapping.scale("005930", recommendation.invalidation_price),
-        recommendation.reason,
+    masked = replace(
+        recommendation,
+        code=alias,
+        target_price=mapping.scale("005930", recommendation.target_price),
+        invalidation_price=mapping.scale("005930", recommendation.invalidation_price),
+        original_invalidation_price=mapping.scale(
+            "005930", recommendation.original_invalidation_price
+        ),
     )
 
     restored = restore_recommendation(masked, mapping)
@@ -275,6 +354,11 @@ def test_masking_round_trip_restores_recommendation_code_and_prices() -> None:
     assert abs(
         restored.invalidation_price - recommendation.invalidation_price
     ) < Decimal("0.0001")
+    assert abs(
+        restored.original_invalidation_price
+        - recommendation.original_invalidation_price
+    ) < Decimal("0.0001")
+    assert restored.price_adjusted is True
 
 
 def test_mask_snapshot_removes_dates_names_news_and_rate_levels() -> None:
@@ -403,6 +487,7 @@ def make_options(
     requested_to: str | None = "20260915",
     explicit_dates: list[str] | None = None,
     dates: str | int = "all",
+    dates_explicit: bool = True,
     seed: int = 20261103,
     resume: bool = True,
     use_default_explicit_date: bool = True,
@@ -411,6 +496,7 @@ def make_options(
         start_date="20260901",
         requested_to=requested_to,
         dates=dates,
+        dates_explicit=dates_explicit,
         explicit_dates=(
             ["20260915"]
             if explicit_dates is None and use_default_explicit_date
@@ -446,6 +532,7 @@ def make_runner(
     calendar_calls: list[str] | None = None,
     model_calls: list[FakeRecommendationModel] | None = None,
     progress_events: list[tuple] | None = None,
+    gateway_ranges: list[tuple[str, str]] | None = None,
 ) -> RunBacktest:
     store = FileBacktestResultStore(options.output_dir)
     ledger = MemoryLedger()
@@ -453,6 +540,7 @@ def make_runner(
     calendar_call_list = calendar_calls if calendar_calls is not None else []
     model_call_list = model_calls if model_calls is not None else []
     progress = progress_events if progress_events is not None else []
+    ranges = gateway_ranges if gateway_ranges is not None else []
     dates = calendar_dates or ["20260914", "20260915", "20260916"]
 
     def calendar_provider(start: str, end: str) -> list[str]:
@@ -460,6 +548,7 @@ def make_runner(
         return [date for date in dates if start <= date <= end]
 
     def gateway_factory(date, range_start, range_end, decision_time):
+        ranges.append((range_start, range_end))
         return DemoGateway(date)
 
     def snapshot_factory(gateway, codes, clock, mapping):
@@ -526,6 +615,9 @@ def test_run_backtest_completed_writes_reusable_plain_and_masked_results(
     assert result["consensus"]["disagreements"] == []
     assert result["recommendations"][0]["code"] == "005930"
     assert result["recommendations"][0]["target_price"] == "120"
+    assert result["recommendations"][0]["price_adjusted"] is False
+    assert "original_invalidation_price" in result["recommendations"][0]
+    assert result["recommendations"][0]["price_warnings"] == []
     assert (options.output_dir / "dates" / "20260915.prompt.txt").is_file()
     assert len(calls) == 2
 
@@ -634,6 +726,20 @@ def test_run_backtest_resume_reexecutes_error_date(tmp_path: Path) -> None:
     assert make_runner(options).run() == 0
     current = FileBacktestResultStore(options.output_dir).read_date_result("20260915")
     assert current is not None and current["status"] == "completed"
+
+
+def test_run_backtest_resume_reexecutes_model_failed_date(tmp_path: Path) -> None:
+    options = make_options(tmp_path / "model-retry")
+    calls: list[FakeRecommendationModel] = []
+
+    assert make_runner(options, fail_model="claude", model_calls=calls).run() == 2
+    previous = FileBacktestResultStore(options.output_dir).read_date_result("20260915")
+    assert previous is not None and previous["status"] == "model_failed"
+
+    assert make_runner(options, model_calls=calls).run() == 0
+    current = FileBacktestResultStore(options.output_dir).read_date_result("20260915")
+    assert current is not None and current["status"] == "completed"
+    assert len(calls) == 4
 
 
 def test_run_backtest_resume_reexecutes_corrupt_date_result_with_warning(

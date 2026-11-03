@@ -16,6 +16,11 @@ from trading_agent.application.recommendation_prompt import (
 from trading_agent.application.records import CycleStatus, RecommendationRunResult
 from trading_agent.application.snapshot_builder import SnapshotBuilder
 from trading_agent.domain.models import ResearchSnapshot
+from trading_agent.domain.price_guard import (
+    DEFAULT_PRICE_GUARD_POLICY,
+    PriceGuardPolicy,
+    apply_price_guard,
+)
 from trading_agent.domain.recommendation import StockRecommendation
 
 
@@ -32,6 +37,7 @@ class RecommendStocks:
         prompt_builder: Callable[[ResearchSnapshot], str] = (
             build_recommendation_prompt
         ),
+        price_guard_policy: PriceGuardPolicy = DEFAULT_PRICE_GUARD_POLICY,
     ) -> None:
         if not universe:
             raise ValueError("추천 후보 종목이 비어 있습니다.")
@@ -41,6 +47,7 @@ class RecommendStocks:
         self.ledger = ledger
         self.clock = clock
         self.prompt_builder = prompt_builder
+        self.price_guard_policy = price_guard_policy
 
     def run(self) -> RecommendationRunResult:
         """추천 결과를 반환하고 성공·실패와 무관하게 기록을 남긴다."""
@@ -53,7 +60,9 @@ class RecommendStocks:
             snapshot = self.snapshot_builder.build_research(self.universe)
             prompt = self.prompt_builder(snapshot)
             outcome = self.consensus_service.recommend(prompt)
-            result = _result_from_outcome(run_id, prompt, snapshot, outcome)
+            result = _result_from_outcome(
+                run_id, prompt, snapshot, outcome, self.price_guard_policy
+            )
         except MarketDataUnavailable as error:
             result = RecommendationRunResult(
                 run_id=run_id,
@@ -107,6 +116,7 @@ def _result_from_outcome(
     prompt: str,
     snapshot: ResearchSnapshot,
     outcome: RecommendationConsensusOutcome,
+    price_guard_policy: PriceGuardPolicy = DEFAULT_PRICE_GUARD_POLICY,
 ) -> RecommendationRunResult:
     """모델 실패는 model_failed로, 성공은 스냅샷 종목만 순위대로 담는다."""
 
@@ -127,7 +137,10 @@ def _result_from_outcome(
     snapshot_codes = {stock.code for stock in snapshot.stocks}
     consensus = replace(
         outcome.consensus,
-        recommendations=_within_snapshot(outcome.consensus.recommendations, snapshot),
+        recommendations=[
+            apply_price_guard(item, snapshot, price_guard_policy)
+            for item in _within_snapshot(outcome.consensus.recommendations, snapshot)
+        ],
         disagreements=[
             item
             for item in outcome.consensus.disagreements

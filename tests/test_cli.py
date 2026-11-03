@@ -219,6 +219,9 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
         Decimal("900"),
         "r",
         consensus_basis=ConsensusBasis.CLAUDE_ONLY,
+        original_invalidation_price=Decimal("950"),
+        price_adjusted=True,
+        price_warnings=["손익비 경고"],
     )
     sell = StockRecommendation(
         "086520", Action.SELL, 0.5, Decimal("66000"), Decimal("79000"), "r"
@@ -263,8 +266,10 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
     assert exit_code == 0
     assert runtime.closed
     assert (
-        "1. 000660 SK하이닉스 (claude 단독 buy) 확신도 0.90 목표가 1,200원 손절가 900원"
+        "1. 000660 SK하이닉스 (claude 단독 buy) 확신도 0.90 목표가 1,200원 "
+        "손절가 900원 (ATR 보정, 원래 950원)"
     ) in out
+    assert "가격 경고: 손익비 경고" in out
     assert "005930 삼성전자 확신도" not in out
     assert "예상 하락가 66,000원, 79,000원 위로 오르면 매도 의견 철회" in out
     assert "불일치: 086520 에코프로 (claude buy / codex 미응답)" in out
