@@ -98,6 +98,7 @@ class PointInTimeGateway(MarketDataGateway):
             today.close_price,
             change,
             market_name=actual.market_name,
+            industry=actual.industry,
         )
 
     def get_daily_bars(

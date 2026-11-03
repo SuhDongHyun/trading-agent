@@ -94,6 +94,12 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
     assert f"stocks[].rsi가 {OVERHEAT_RSI_THRESHOLD} 이상" in prompt
     assert "stocks[].macd가 stocks[].macd_signal_value를 하향 교차" in prompt
     assert "stocks[].macd_signal이" in prompt
+    assert "stocks[].relative_strength_5d_percent" in prompt
+    assert "종목 소속 시장 지수(KOSPI 또는 KOSDAQ)" in prompt
+    assert "market_name" not in prompt
+    assert "kospi_ma60_deviation_percent" in prompt
+    assert "vkospi_change_5d_points" in prompt
+    assert "지수가 60일선 위에 있고 20일 수익률이 양수면 추세장" in prompt
     assert "종가의 20일선 이탈" in " ".join(prompt.split())
     assert "거래량 증가 동반 하락" in prompt
     assert (
@@ -139,6 +145,8 @@ def test_recommendation_prompt_asks_for_every_stock_without_account() -> None:
     assert "recommendations 항목을 정확히 하나씩" in prompt
     assert "이미 있는 항목은 다시 적지 마세요" in prompt
     assert "market:vkospi" in prompt
+    assert "stocks[].industry" in prompt
+    assert "stocks[].industry_relative_strength_20d_percent" in prompt
     assert "현재가 × atr14_percent ÷ 100" in prompt
     assert "현재가 ÷ (1 + low_20d_distance_percent ÷ 100)" in prompt
     assert "현재가 ÷ (1 + high_20d_distance_percent ÷ 100)" in prompt

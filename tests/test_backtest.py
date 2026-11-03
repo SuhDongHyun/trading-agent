@@ -34,6 +34,7 @@ from trading_agent.application.ports import (
 from trading_agent.application.recommend_stocks import RecommendStocks
 from trading_agent.application.snapshot_builder import (
     LOOKBACK_CALENDAR_DAYS,
+    MARKET_INDEX_LOOKBACK_CALENDAR_DAYS,
     SnapshotBuilder,
 )
 from trading_agent.domain.models import (
@@ -64,11 +65,17 @@ class HistoricalGateway(FakeGateway):
         super().__init__()
         self.daily_reads = 0
         self.requested_ends: list[tuple[str, str]] = []
+        self.requested_market_ranges: list[tuple[str, str, str]] = []
         self.news_calls: list[str] = []
 
     def get_stock_quote(self, code: str) -> StockQuote:
         return StockQuote(
-            code, "현재 이름", Decimal("999"), Decimal("99"), market_name="KOSDAQ"
+            code,
+            "현재 이름",
+            Decimal("999"),
+            Decimal("99"),
+            market_name="KOSDAQ",
+            industry="전자",
         )
 
     def get_daily_bars(
@@ -124,6 +131,7 @@ class HistoricalGateway(FakeGateway):
         self, index: MarketIndex, start_date: str, end_date: str
     ) -> list[IndexPoint]:
         self.requested_ends.append((index.value, end_date))
+        self.requested_market_ranges.append((index.value, start_date, end_date))
         return [
             IndexPoint("20260914", Decimal("10")),
             IndexPoint("20260915", Decimal("11")),
@@ -184,6 +192,7 @@ def test_point_in_time_quote_uses_decision_close_and_previous_close() -> None:
     assert quote.current_price == Decimal("110")
     assert quote.change_percent == Decimal("10")
     assert quote.market_name == "KOSDAQ"
+    assert quote.industry == "전자"
 
 
 def test_point_in_time_quote_requires_decision_day_bar() -> None:
@@ -288,6 +297,41 @@ def test_backtest_pit_gateway_range_covers_extended_daily_lookback(
     assert ranges == [(expected_start, "20260915")]
 
 
+def test_snapshot_builder_passes_extended_korean_index_lookback_through_pit() -> None:
+    inner = HistoricalGateway()
+    decision_date = "20260915"
+    gateway = PointInTimeGateway(
+        inner,
+        decision_date,
+        "20250826",
+        decision_date,
+    )
+    builder = SnapshotBuilder(
+        gateway,
+        [],
+        clock=lambda: datetime.fromisoformat("2026-09-15T15:40:00+09:00"),
+    )
+
+    builder.build_research(["005930"])
+
+    index_start = (
+        datetime.strptime(decision_date, "%Y%m%d")
+        - timedelta(days=MARKET_INDEX_LOOKBACK_CALENDAR_DAYS)
+    ).strftime("%Y%m%d")
+    market_start = (
+        datetime.strptime(decision_date, "%Y%m%d") - timedelta(days=14)
+    ).strftime("%Y%m%d")
+    assert (MarketIndex.KOSPI.value, index_start, decision_date) in (
+        inner.requested_market_ranges
+    )
+    assert (MarketIndex.KOSDAQ.value, index_start, decision_date) in (
+        inner.requested_market_ranges
+    )
+    assert (MarketIndex.VKOSPI.value, market_start, decision_date) in (
+        inner.requested_market_ranges
+    )
+
+
 def test_implicit_dates_count_is_capped_at_available_dates(tmp_path: Path) -> None:
     options = make_options(
         tmp_path / "implicit-short-range",
@@ -377,6 +421,7 @@ def test_mask_snapshot_removes_dates_names_news_and_rate_levels() -> None:
                 macd=Decimal("2"),
                 macd_signal_value=Decimal("1"),
                 news_headlines=["기사"],
+                industry="전자",
             )
         ],
         market_context=MarketContext(
@@ -391,6 +436,7 @@ def test_mask_snapshot_removes_dates_names_news_and_rate_levels() -> None:
     assert masked.as_of_trading_date is None
     assert masked.stocks[0].name != "삼성전자"
     assert masked.stocks[0].news_headlines is None
+    assert masked.stocks[0].industry is None
     assert masked.market_context.exchange_rate is None
     assert "20260915" not in str(masked.missing)
     assert masked.stocks[0].current_price != Decimal("100")

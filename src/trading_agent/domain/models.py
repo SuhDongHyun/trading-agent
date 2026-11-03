@@ -123,7 +123,7 @@ class AccountSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class StockSnapshot:
-    """한 종목에 대해 요약한 시세, 지표, 뉴스."""
+    """한 종목의 시세·지표·뉴스와 상대강도 요약."""
 
     code: str
     name: str
@@ -146,6 +146,11 @@ class StockSnapshot:
     high_52w_position_percent: Decimal | None = None
     high_52w_period_trading_days: int | None = None
     news_headlines: list[str] | None = None
+    industry: str | None = None
+    relative_strength_5d_percent: Decimal | None = None
+    relative_strength_20d_percent: Decimal | None = None
+    universe_rank_percentile_20d: Decimal | None = None
+    industry_relative_strength_20d_percent: Decimal | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -164,6 +169,10 @@ class StockSnapshot:
             "high_20d_distance_percent",
             "low_20d_distance_percent",
             "high_52w_position_percent",
+            "relative_strength_5d_percent",
+            "relative_strength_20d_percent",
+            "universe_rank_percentile_20d",
+            "industry_relative_strength_20d_percent",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -191,6 +200,15 @@ class MarketContext:
     exchange_rate: Decimal | None = None
     korea_3y_yield: Decimal | None = None
     us_10y_yield: Decimal | None = None
+    kospi_return_5d_percent: Decimal | None = None
+    kospi_return_20d_percent: Decimal | None = None
+    kospi_ma20_deviation_percent: Decimal | None = None
+    kospi_ma60_deviation_percent: Decimal | None = None
+    kosdaq_return_5d_percent: Decimal | None = None
+    kosdaq_return_20d_percent: Decimal | None = None
+    kosdaq_ma20_deviation_percent: Decimal | None = None
+    kosdaq_ma60_deviation_percent: Decimal | None = None
+    vkospi_change_5d_points: Decimal | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -203,6 +221,15 @@ class MarketContext:
             "exchange_rate",
             "korea_3y_yield",
             "us_10y_yield",
+            "kospi_return_5d_percent",
+            "kospi_return_20d_percent",
+            "kospi_ma20_deviation_percent",
+            "kospi_ma60_deviation_percent",
+            "kosdaq_return_5d_percent",
+            "kosdaq_return_20d_percent",
+            "kosdaq_ma20_deviation_percent",
+            "kosdaq_ma60_deviation_percent",
+            "vkospi_change_5d_points",
         ):
             value = getattr(self, field_name)
             if value is not None:

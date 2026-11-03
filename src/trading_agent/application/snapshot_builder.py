@@ -8,6 +8,7 @@ from functools import partial
 from zoneinfo import ZoneInfo
 
 from trading_agent.application.errors import MarketDataUnavailable
+from trading_agent.application.market_mapping import market_index_for
 from trading_agent.application.ports import (
     DailyBar,
     IndexPoint,
@@ -30,6 +31,7 @@ from trading_agent.domain.models import (
 LOOKBACK_CALENDAR_DAYS = 380
 INDICATOR_LOOKBACK_CALENDAR_DAYS = 120
 MARKET_LOOKBACK_CALENDAR_DAYS = 14
+MARKET_INDEX_LOOKBACK_CALENDAR_DAYS = 100
 MA_SHORT_WINDOW = 20
 MA_LONG_WINDOW = 60
 RSI_WINDOW = 14
@@ -57,6 +59,85 @@ def calculate_return_percent(closes: Sequence[Decimal], periods: int) -> Decimal
     if previous_close == 0:
         return None
     return (closes[-1] - previous_close) / previous_close * Decimal(100)
+
+
+def calculate_index_return_percent(
+    points: Sequence[IndexPoint], periods: int
+) -> Decimal | None:
+    """정렬한 지수 종가에서 지정 거래일 수익률을 계산한다."""
+
+    ordered = sorted(points, key=lambda point: point.date)
+    return calculate_return_percent([point.value for point in ordered], periods)
+
+
+def calculate_index_deviation_percent(
+    points: Sequence[IndexPoint], window: int
+) -> Decimal | None:
+    """현재 지수와 최근 구간 단순 이동평균의 괴리율을 계산한다."""
+
+    if window <= 0:
+        raise ValueError("window는 0보다 커야 합니다.")
+    ordered = sorted(points, key=lambda point: point.date)
+    if len(ordered) < window:
+        return None
+    recent_values = [point.value for point in ordered[-window:]]
+    moving_average = sum(recent_values, Decimal(0)) / Decimal(window)
+    return calculate_deviation_percent(ordered[-1].value, moving_average)
+
+
+def calculate_index_change_points(
+    points: Sequence[IndexPoint], periods: int
+) -> Decimal | None:
+    """최근 지수 값과 지정 거래일 전 값의 포인트 차이를 계산한다."""
+
+    if periods <= 0:
+        raise ValueError("periods는 0보다 커야 합니다.")
+    ordered = sorted(points, key=lambda point: point.date)
+    if len(ordered) <= periods:
+        return None
+    return ordered[-1].value - ordered[-(periods + 1)].value
+
+
+def calculate_universe_rank_percentile(
+    value: Decimal | None, universe_values: Sequence[Decimal | None]
+) -> Decimal | None:
+    """동순위 평균을 사용해 universe 내 수익률 백분위를 계산한다."""
+
+    if value is None:
+        return None
+    valid_values = [candidate for candidate in universe_values if candidate is not None]
+    if len(valid_values) < 2:
+        return None
+    lower_count = sum(candidate < value for candidate in valid_values)
+    equal_count = sum(candidate == value for candidate in valid_values)
+    if equal_count == 0:
+        return None
+    average_rank_from_zero = Decimal(lower_count) + Decimal(equal_count - 1) / Decimal(
+        2
+    )
+    return average_rank_from_zero / Decimal(len(valid_values) - 1) * Decimal(100)
+
+
+def calculate_industry_relative_strength_20d_percent(
+    stock_return_percent: Decimal | None,
+    industry: str | None,
+    peers: Sequence[tuple[str | None, Decimal | None]],
+) -> Decimal | None:
+    """같은 업종의 다른 종목 평균 대비 20일 초과수익을 계산한다."""
+
+    normalized_industry = _normalize_industry(industry)
+    if normalized_industry is None or stock_return_percent is None:
+        return None
+    peer_returns = [
+        return_percent
+        for peer_industry, return_percent in peers
+        if _normalize_industry(peer_industry) == normalized_industry
+        and return_percent is not None
+    ]
+    if not peer_returns:
+        return None
+    peer_average = sum(peer_returns, Decimal(0)) / Decimal(len(peer_returns))
+    return stock_return_percent - peer_average
 
 
 def calculate_deviation_percent(
@@ -238,9 +319,14 @@ class SnapshotBuilder:
     def build(self) -> MarketSnapshot:
         """필수 데이터가 있으면 스냅샷을 만들고 보조 실패는 기록한다."""
 
-        now, daily_start_date, indicator_start_date, end_date, market_start_date = (
-            self._lookback_window()
-        )
+        (
+            now,
+            daily_start_date,
+            indicator_start_date,
+            end_date,
+            market_start_date,
+            market_index_start_date,
+        ) = self._lookback_window()
         account = self.gateway.get_account()
         codes = _unique_codes(
             [*self.watchlist, *(position.code for position in account.positions)]
@@ -263,7 +349,12 @@ class SnapshotBuilder:
         stocks = [stock for stock, _ in stock_results]
         as_of_trading_date = _latest_daily_date(stock_results)
         market_context = self._build_market_context(
-            market_start_date, end_date, missing
+            market_index_start_date, market_start_date, end_date, missing
+        )
+        stocks = _add_relative_strength_fields(
+            stocks,
+            {code: quote.market_name for code, quote in quotes.items()},
+            market_context,
         )
         return MarketSnapshot(
             created_at=now,
@@ -281,9 +372,14 @@ class SnapshotBuilder:
         현재가를 못 읽은 종목은 missing에 적고 제외한다. 한 종목도 읽지 못하면 실패한다.
         """
 
-        now, daily_start_date, indicator_start_date, end_date, market_start_date = (
-            self._lookback_window()
-        )
+        (
+            now,
+            daily_start_date,
+            indicator_start_date,
+            end_date,
+            market_start_date,
+            market_index_start_date,
+        ) = self._lookback_window()
         missing: list[str] = []
         quotes: dict[str, StockQuote] = {}
         for code in _unique_codes(codes):
@@ -309,7 +405,12 @@ class SnapshotBuilder:
         stocks = [stock for stock, _ in stock_results]
         as_of_trading_date = _latest_daily_date(stock_results)
         market_context = self._build_market_context(
-            market_start_date, end_date, missing
+            market_index_start_date, market_start_date, end_date, missing
+        )
+        stocks = _add_relative_strength_fields(
+            stocks,
+            {code: quote.market_name for code, quote in quotes.items()},
+            market_context,
         )
         return ResearchSnapshot(
             created_at=now,
@@ -320,7 +421,7 @@ class SnapshotBuilder:
             market_session=_market_session(now, as_of_trading_date, missing),
         )
 
-    def _lookback_window(self) -> tuple[datetime, str, str, str, str]:
+    def _lookback_window(self) -> tuple[datetime, str, str, str, str, str]:
         """현재 시각과 한국 날짜 기준 조회 시작일·종료일을 반환한다."""
 
         now = self.clock()
@@ -337,7 +438,17 @@ class SnapshotBuilder:
         market_start_date = (
             today - timedelta(days=MARKET_LOOKBACK_CALENDAR_DAYS)
         ).strftime("%Y%m%d")
-        return now, daily_start_date, indicator_start_date, end_date, market_start_date
+        market_index_start_date = (
+            today - timedelta(days=MARKET_INDEX_LOOKBACK_CALENDAR_DAYS)
+        ).strftime("%Y%m%d")
+        return (
+            now,
+            daily_start_date,
+            indicator_start_date,
+            end_date,
+            market_start_date,
+            market_index_start_date,
+        )
 
     def _build_stock(
         self,
@@ -514,6 +625,7 @@ class SnapshotBuilder:
             high_52w_position_percent=high_52w_position,
             high_52w_period_trading_days=high_52w_days,
             news_headlines=headlines,
+            industry=quote.industry,
         )
         return stock, latest_daily_date
 
@@ -528,28 +640,87 @@ class SnapshotBuilder:
             ) from error
 
     def _build_market_context(
-        self, start_date: str, end_date: str, missing: list[str]
+        self,
+        market_index_start_date: str,
+        market_start_date: str,
+        end_date: str,
+        missing: list[str],
     ) -> MarketContext:
-        """시장 시계열별 최신값과 최근 등락을 구성한다."""
+        """시장 시계열별 최신값과 최근 국면 지표를 구성한다."""
 
-        kospi = self._latest_optional(
+        kospi_points = self._read_optional(
             "market:kospi",
             lambda: self.gateway.get_market_index(
-                MarketIndex.KOSPI, start_date, end_date
+                MarketIndex.KOSPI, market_index_start_date, end_date
             ),
             missing,
         )
-        kosdaq = self._latest_optional(
+        kosdaq_points = self._read_optional(
             "market:kosdaq",
             lambda: self.gateway.get_market_index(
-                MarketIndex.KOSDAQ, start_date, end_date
+                MarketIndex.KOSDAQ, market_index_start_date, end_date
             ),
+            missing,
+        )
+        kospi_points = sorted(kospi_points or [], key=lambda point: point.date)
+        kosdaq_points = sorted(kosdaq_points or [], key=lambda point: point.date)
+        if not kospi_points:
+            _mark_missing("market:kospi", missing, "empty")
+        if not kosdaq_points:
+            _mark_missing("market:kosdaq", missing, "empty")
+        kospi_return_5d = calculate_index_return_percent(kospi_points, 5)
+        kospi_return_20d = calculate_index_return_percent(kospi_points, 20)
+        kospi_ma20_deviation = calculate_index_deviation_percent(kospi_points, 20)
+        kospi_ma60_deviation = calculate_index_deviation_percent(kospi_points, 60)
+        _record_market_metric_missing(
+            "market:kospi_return_5d", kospi_return_5d, kospi_points, 6, missing
+        )
+        _record_market_metric_missing(
+            "market:kospi_return_20d", kospi_return_20d, kospi_points, 21, missing
+        )
+        _record_market_metric_missing(
+            "market:kospi_ma20_deviation",
+            kospi_ma20_deviation,
+            kospi_points,
+            20,
+            missing,
+        )
+        _record_market_metric_missing(
+            "market:kospi_ma60_deviation",
+            kospi_ma60_deviation,
+            kospi_points,
+            60,
+            missing,
+        )
+
+        kosdaq_return_5d = calculate_index_return_percent(kosdaq_points, 5)
+        kosdaq_return_20d = calculate_index_return_percent(kosdaq_points, 20)
+        kosdaq_ma20_deviation = calculate_index_deviation_percent(kosdaq_points, 20)
+        kosdaq_ma60_deviation = calculate_index_deviation_percent(kosdaq_points, 60)
+        _record_market_metric_missing(
+            "market:kosdaq_return_5d", kosdaq_return_5d, kosdaq_points, 6, missing
+        )
+        _record_market_metric_missing(
+            "market:kosdaq_return_20d", kosdaq_return_20d, kosdaq_points, 21, missing
+        )
+        _record_market_metric_missing(
+            "market:kosdaq_ma20_deviation",
+            kosdaq_ma20_deviation,
+            kosdaq_points,
+            20,
+            missing,
+        )
+        _record_market_metric_missing(
+            "market:kosdaq_ma60_deviation",
+            kosdaq_ma60_deviation,
+            kosdaq_points,
+            60,
             missing,
         )
         sp500_points = self._read_optional(
             "market:sp500",
             lambda: self.gateway.get_market_index(
-                MarketIndex.SP500, start_date, end_date
+                MarketIndex.SP500, market_start_date, end_date
             ),
             missing,
         )
@@ -560,15 +731,27 @@ class SnapshotBuilder:
         vix = self._latest_optional(
             "market:vix",
             lambda: self.gateway.get_market_index(
-                MarketIndex.VIX, start_date, end_date
+                MarketIndex.VIX, market_start_date, end_date
             ),
             missing,
         )
-        vkospi = self._latest_optional(
+        vkospi_points = self._read_optional(
             "market:vkospi",
             lambda: self.gateway.get_market_index(
-                MarketIndex.VKOSPI, start_date, end_date
+                MarketIndex.VKOSPI, market_start_date, end_date
             ),
+            missing,
+        )
+        vkospi_points = sorted(vkospi_points or [], key=lambda point: point.date)
+        if not vkospi_points:
+            _mark_missing("market:vkospi", missing, "empty")
+        vkospi = vkospi_points[-1] if vkospi_points else None
+        vkospi_change_5d_points = calculate_index_change_points(vkospi_points, 5)
+        _record_market_metric_missing(
+            "market:vkospi_change_5d_points",
+            vkospi_change_5d_points,
+            vkospi_points,
+            6,
             missing,
         )
         fear_greed = self._read_optional(
@@ -579,27 +762,27 @@ class SnapshotBuilder:
         exchange_rate = self._latest_optional(
             "market:usd_krw",
             lambda: self.gateway.get_market_index(
-                MarketIndex.USD_KRW, start_date, end_date
+                MarketIndex.USD_KRW, market_start_date, end_date
             ),
             missing,
         )
         korea_3y = self._latest_optional(
             "market:korea_3y_yield",
             lambda: self.gateway.get_treasury_yield(
-                TreasuryMaturity.KOREA_3Y, start_date, end_date
+                TreasuryMaturity.KOREA_3Y, market_start_date, end_date
             ),
             missing,
         )
         us_10y = self._latest_optional(
             "market:us_10y_yield",
             lambda: self.gateway.get_treasury_yield(
-                TreasuryMaturity.US_10Y, start_date, end_date
+                TreasuryMaturity.US_10Y, market_start_date, end_date
             ),
             missing,
         )
         return MarketContext(
-            kospi_change_percent=kospi.change_percent if kospi else None,
-            kosdaq_change_percent=kosdaq.change_percent if kosdaq else None,
+            kospi_change_percent=_latest_change_percent(kospi_points),
+            kosdaq_change_percent=_latest_change_percent(kosdaq_points),
             sp500_change_percent=sp500_change,
             volatility_index=vix.value if vix else None,
             vkospi=vkospi.value if vkospi else None,
@@ -607,6 +790,15 @@ class SnapshotBuilder:
             exchange_rate=exchange_rate.value if exchange_rate else None,
             korea_3y_yield=korea_3y.value if korea_3y else None,
             us_10y_yield=us_10y.value if us_10y else None,
+            kospi_return_5d_percent=kospi_return_5d,
+            kospi_return_20d_percent=kospi_return_20d,
+            kospi_ma20_deviation_percent=kospi_ma20_deviation,
+            kospi_ma60_deviation_percent=kospi_ma60_deviation,
+            kosdaq_return_5d_percent=kosdaq_return_5d,
+            kosdaq_return_20d_percent=kosdaq_return_20d,
+            kosdaq_ma20_deviation_percent=kosdaq_ma20_deviation,
+            kosdaq_ma60_deviation_percent=kosdaq_ma60_deviation,
+            vkospi_change_5d_points=vkospi_change_5d_points,
         )
 
     @staticmethod
@@ -638,6 +830,88 @@ class SnapshotBuilder:
             _mark_missing(label, missing, "empty")
             return None
         return max(points, key=lambda point: point.date)
+
+
+def _record_market_metric_missing(
+    label: str,
+    value: Decimal | None,
+    points: Sequence[IndexPoint],
+    required_points: int,
+    missing: list[str],
+) -> None:
+    """계산할 시장 이력이 부족하거나 기준 값이 잘못되면 원인을 남긴다."""
+
+    if value is not None or not points:
+        return
+    reason = (
+        "insufficient_history" if len(points) < required_points else "invalid_baseline"
+    )
+    _mark_missing(label, missing, reason)
+
+
+def _add_relative_strength_fields(
+    stocks: Sequence[StockSnapshot],
+    market_names: dict[str, str | None],
+    market_context: MarketContext,
+) -> list[StockSnapshot]:
+    """완성된 종목 universe를 바탕으로 상대강도와 순위를 채운다."""
+
+    market_returns = {
+        MarketIndex.KOSPI: (
+            market_context.kospi_return_5d_percent,
+            market_context.kospi_return_20d_percent,
+        ),
+        MarketIndex.KOSDAQ: (
+            market_context.kosdaq_return_5d_percent,
+            market_context.kosdaq_return_20d_percent,
+        ),
+    }
+    universe_returns = [stock.return_20d_percent for stock in stocks]
+    enriched: list[StockSnapshot] = []
+    for stock in stocks:
+        market = market_index_for(market_names.get(stock.code))
+        if market is None:
+            benchmark_5d, benchmark_20d = None, None
+        else:
+            benchmark_5d, benchmark_20d = market_returns[market]
+        relative_5d = _subtract_if_available(stock.return_5d_percent, benchmark_5d)
+        relative_20d = _subtract_if_available(stock.return_20d_percent, benchmark_20d)
+        peers = [
+            (peer.industry, peer.return_20d_percent)
+            for peer in stocks
+            if peer.code != stock.code
+        ]
+        enriched.append(
+            replace(
+                stock,
+                relative_strength_5d_percent=relative_5d,
+                relative_strength_20d_percent=relative_20d,
+                universe_rank_percentile_20d=calculate_universe_rank_percentile(
+                    stock.return_20d_percent, universe_returns
+                ),
+                industry_relative_strength_20d_percent=(
+                    calculate_industry_relative_strength_20d_percent(
+                        stock.return_20d_percent, stock.industry, peers
+                    )
+                ),
+            )
+        )
+    return enriched
+
+
+def _subtract_if_available(
+    value: Decimal | None, benchmark: Decimal | None
+) -> Decimal | None:
+    if value is None or benchmark is None:
+        return None
+    return value - benchmark
+
+
+def _normalize_industry(industry: str | None) -> str | None:
+    if industry is None:
+        return None
+    normalized = industry.strip().casefold()
+    return normalized or None
 
 
 def _unique_codes(codes: Sequence[str]) -> list[str]:

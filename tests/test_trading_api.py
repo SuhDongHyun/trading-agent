@@ -144,6 +144,7 @@ def test_gateway_uses_trading_api_contract_and_parses_decimal_values() -> None:
     assert quote.current_price == Decimal("101.5")
     assert quote.change_percent == Decimal("1.5")
     assert quote.market_name == "KOSPI"
+    assert quote.industry == "전자"
     assert bars[0].close_price == Decimal("101.5")
     assert bars[0].volume == 500
     assert bars[0].open_price == Decimal("100")
