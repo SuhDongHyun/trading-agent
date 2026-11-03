@@ -99,6 +99,7 @@ def create_runtime(
         CodexCliDecisionModel(settings.llm.codex, runner, DECISION_TASK),
         policy=settings.consensus.policy,
         confidence_aggregation=settings.consensus.confidence_aggregation,
+        process_supervisor=runner,
     )
     risk_policy = RiskPolicy(
         max_position_weight=Decimal(str(settings.risk.max_position_weight)),
@@ -349,6 +350,7 @@ def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRunti
             CodexCliDecisionModel(settings.llm.codex, runner, RECOMMENDATION_TASK),
             policy=settings.consensus.policy,
             confidence_aggregation=settings.consensus.confidence_aggregation,
+            process_supervisor=runner,
         )
         assert shared_ledger is not None
         return RecommendStocks(
@@ -393,6 +395,7 @@ def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRunti
         cache_stats=cache.stats_for_current_thread,
         progress=progress,
         warning=warning,
+        process_supervisor=runner,
     )
     return BacktestRuntime(use_case, cache)
 
@@ -456,6 +459,7 @@ def create_recommendation_runtime(
         CodexCliDecisionModel(settings.llm.codex, runner, RECOMMENDATION_TASK),
         policy=settings.consensus.policy,
         confidence_aggregation=settings.consensus.confidence_aggregation,
+        process_supervisor=runner,
     )
     use_case = RecommendStocks(
         snapshot_builder=SnapshotBuilder(

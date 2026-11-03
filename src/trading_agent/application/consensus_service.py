@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from time import perf_counter
 
 from trading_agent.application.errors import DecisionModelError
-from trading_agent.application.ports import DecisionModel, ModelRun
+from trading_agent.application.ports import DecisionModel, ModelRun, ProcessSupervisor
 from trading_agent.domain.consensus import ConsensusPolicy, ConsensusResult
 from trading_agent.domain.models import (
     ConfidenceAggregation,
@@ -65,16 +65,20 @@ class ConsensusDecisionService:
         codex: DecisionModel[ModelDecision],
         policy: ConsensusPolicyName = ConsensusPolicyName.STRICT,
         confidence_aggregation: ConfidenceAggregation = ConfidenceAggregation.MIN,
+        process_supervisor: ProcessSupervisor | None = None,
     ) -> None:
         self._claude = claude
         self._codex = codex
         self._policy = ConsensusPolicyName(policy)
         self._confidence_aggregation = ConfidenceAggregation(confidence_aggregation)
+        self._process_supervisor = process_supervisor
 
     def decide(self, prompt: str) -> ConsensusDecisionResult:
         """두 호출을 모두 기다리고 하나라도 실패하면 제안을 비운다."""
 
-        claude_run, codex_run = run_both(self._claude, self._codex, prompt)
+        claude_run, codex_run = run_both(
+            self._claude, self._codex, prompt, self._process_supervisor
+        )
         if not claude_run.succeeded or not codex_run.succeeded:
             return ConsensusDecisionResult(claude_run, codex_run, None)
         assert claude_run.decision is not None and codex_run.decision is not None
@@ -96,16 +100,20 @@ class RecommendationConsensusService:
         codex: DecisionModel[ModelRecommendation],
         policy: ConsensusPolicyName = ConsensusPolicyName.STRICT,
         confidence_aggregation: ConfidenceAggregation = ConfidenceAggregation.MIN,
+        process_supervisor: ProcessSupervisor | None = None,
     ) -> None:
         self._claude = claude
         self._codex = codex
         self._policy = ConsensusPolicyName(policy)
         self._confidence_aggregation = ConfidenceAggregation(confidence_aggregation)
+        self._process_supervisor = process_supervisor
 
     def recommend(self, prompt: str) -> RecommendationConsensusOutcome:
         """두 호출을 모두 기다리고 하나라도 실패하면 추천을 비운다."""
 
-        claude_run, codex_run = run_both(self._claude, self._codex, prompt)
+        claude_run, codex_run = run_both(
+            self._claude, self._codex, prompt, self._process_supervisor
+        )
         if not claude_run.succeeded or not codex_run.succeeded:
             return RecommendationConsensusOutcome(claude_run, codex_run, None)
         assert claude_run.decision is not None and codex_run.decision is not None
@@ -119,15 +127,32 @@ class RecommendationConsensusService:
 
 
 def run_both[T](
-    claude: DecisionModel[T], codex: DecisionModel[T], prompt: str
+    claude: DecisionModel[T],
+    codex: DecisionModel[T],
+    prompt: str,
+    process_supervisor: ProcessSupervisor | None = None,
 ) -> tuple[ModelRun[T], ModelRun[T]]:
     """두 모델을 병렬로 실행하고 실패도 실행 기록으로 반환한다."""
 
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="decision-model") as pool:
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="decision-model")
+    try:
         claude_future = pool.submit(_execute, claude, "claude", prompt)
         codex_future = pool.submit(_execute, codex, "codex", prompt)
         claude_run = claude_future.result()
         codex_run = codex_future.result()
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        if process_supervisor is not None:
+            try:
+                process_supervisor.terminate_all()
+            except BaseException:
+                try:
+                    process_supervisor.terminate_all()
+                except BaseException:
+                    pass
+        raise
+    else:
+        pool.shutdown(wait=True)
     return claude_run, codex_run
 
 

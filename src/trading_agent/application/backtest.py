@@ -18,6 +18,7 @@ from trading_agent.application.ports import (
     IndicatorPoint,
     MarketIndex,
     NewsItem,
+    ProcessSupervisor,
     StockQuote,
     TreasuryMaturity,
 )
@@ -391,6 +392,7 @@ class RunBacktest:
         cache_stats: CacheStatsProvider,
         progress: ProgressCallback,
         warning: Callable[[str], None],
+        process_supervisor: ProcessSupervisor | None = None,
     ) -> None:
         self.options = options
         self.result_store = result_store
@@ -402,6 +404,7 @@ class RunBacktest:
         self.cache_stats = cache_stats
         self.progress = progress
         self.warning = warning
+        self.process_supervisor = process_supervisor
 
     def run(self) -> int:
         """유효 거래일을 고르고, 저장소 포트를 통해 날짜 결과를 남긴다."""
@@ -605,10 +608,24 @@ class RunBacktest:
         if options.workers == 1:
             exit_code = max(run_date(date) for date in selected_dates)
         else:
-            with ThreadPoolExecutor(
+            pool = ThreadPoolExecutor(
                 max_workers=options.workers, thread_name_prefix="backtest-date"
-            ) as pool:
+            )
+            try:
                 exit_code = max(pool.map(run_date, selected_dates))
+            except BaseException:
+                pool.shutdown(wait=False, cancel_futures=True)
+                if self.process_supervisor is not None:
+                    try:
+                        self.process_supervisor.terminate_all()
+                    except BaseException:
+                        try:
+                            self.process_supervisor.terminate_all()
+                        except BaseException:
+                            pass
+                raise
+            else:
+                pool.shutdown(wait=True)
         manifest["finished_at"] = self.now().isoformat()
         self.result_store.write_manifest(manifest)
         return exit_code

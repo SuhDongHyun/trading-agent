@@ -392,7 +392,11 @@ manifest에서는 현재 설정을 사용합니다. 기본값은 5입니다.
 마세요. 결과 JSON의 누락 가격·벤치마크 건수와 source별 표본 수를 함께 확인하세요.
 
 종료 코드는 cron 모니터링에 사용합니다. `run`과 `recommend`에 공통입니다.
-SIGTERM은 `SystemExit(143)`으로 바뀌며 실행 중인 유스케이스가 ERROR 상태 기록을 시도한 뒤 종료합니다.
+SIGTERM은 `SystemExit(143)`으로 바뀝니다. 실행 중인 `run`·`recommend` 기록은
+`error` 상태로 닫고, 이 실행기가 시작한 모델 CLI 프로세스 그룹에 SIGTERM을 보냅니다.
+0.2초 안에 끝나지 않은 프로세스 그룹에는 SIGKILL을 보냅니다. 백테스트 중단 때는
+완료되지 않은 날짜 결과가 없거나 `error`·`model_failed`로 남을 수 있으며, resume은
+`completed`와 `snapshot_only`만 건너뛰므로 해당 날짜를 다시 실행합니다.
 
 - `0`: `completed` (합의 제안이 0건이어도 정상 완료)
 - `2`: `model_failed`

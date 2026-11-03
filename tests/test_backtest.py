@@ -766,6 +766,46 @@ def test_run_backtest_completed_writes_reusable_plain_and_masked_results(
         assert "restored_decision" not in result["models"][0]
 
 
+def test_parallel_backtest_interruption_leaves_date_available_for_resume(
+    tmp_path: Path,
+) -> None:
+    options = replace(
+        make_options(tmp_path / "interrupted"),
+        workers=2,
+    )
+    runner = make_runner(options)
+
+    class FakeSupervisor:
+        calls = 0
+
+        def terminate_all(self) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt
+
+    supervisor = FakeSupervisor()
+    runner.process_supervisor = supervisor
+
+    def interrupt_date(
+        decision_date: str,
+        range_start: str,
+        range_end: str,
+        decision_time: time,
+    ) -> FakeGateway:
+        raise SystemExit(143)
+
+    runner.gateway_factory = interrupt_date
+
+    with pytest.raises(SystemExit) as raised:
+        runner.run()
+
+    assert raised.value.code == 143
+    assert supervisor.calls == 2
+    assert (
+        FileBacktestResultStore(options.output_dir).read_date_result("20260915") is None
+    )
+
+
 @pytest.mark.parametrize("masked", [False, True])
 def test_run_backtest_model_failed_writes_both_runs_and_returns_two(
     tmp_path: Path, masked: bool

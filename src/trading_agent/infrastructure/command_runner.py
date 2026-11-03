@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from time import monotonic, perf_counter, sleep
 
 _REMOVED_ENVIRONMENT_VARIABLES = (
@@ -64,6 +65,35 @@ class CommandRunner(ABC):
 class SubprocessCommandRunner(CommandRunner):
     """새 프로세스 세션에서 명령과 자식 프로세스를 함께 관리한다."""
 
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._processes: dict[int, subprocess.Popen[str]] = {}
+        self._terminating = False
+
+    def terminate_all(self) -> None:
+        """실행 중인 모든 프로세스 그룹에 TERM, 유예 후 KILL을 보낸다."""
+
+        with self._lock:
+            self._terminating = True
+            process_group_ids = tuple(self._processes)
+
+        for process_group_id in process_group_ids:
+            _signal_process_group(process_group_id, signal.SIGTERM)
+
+        deadline = monotonic() + _PROCESS_TERMINATION_GRACE_SECONDS
+        remaining = set(process_group_ids)
+        while remaining and monotonic() < deadline:
+            remaining = {
+                process_group_id
+                for process_group_id in remaining
+                if _process_group_exists(process_group_id)
+            }
+            if remaining:
+                sleep(_PROCESS_GROUP_POLL_SECONDS)
+
+        for process_group_id in remaining:
+            _signal_process_group(process_group_id, signal.SIGKILL)
+
     def run(
         self,
         argv: Sequence[str],
@@ -78,38 +108,48 @@ class SubprocessCommandRunner(CommandRunner):
             environment.pop(variable, None)
         started = perf_counter()
         try:
-            process = subprocess.Popen(
-                list(argv),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=cwd,
-                env=environment,
-                shell=False,
-                start_new_session=True,
-            )
+            with self._lock:
+                if self._terminating:
+                    raise CommandExecutionError(
+                        "프로세스 실행기가 종료 중입니다.", perf_counter() - started
+                    )
+                process = subprocess.Popen(
+                    list(argv),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=cwd,
+                    env=environment,
+                    shell=False,
+                    start_new_session=True,
+                )
+                self._processes[process.pid] = process
         except OSError as error:
             raise CommandExecutionError(str(error), perf_counter() - started) from error
 
         try:
-            stdout, stderr = process.communicate(
-                input=input_text, timeout=timeout_seconds
-            )
-        except subprocess.TimeoutExpired as error:
-            stdout, stderr = _terminate_process_group(process, error)
-            raise CommandTimeoutError(
-                stdout,
-                stderr,
-                perf_counter() - started,
-            ) from error
+            try:
+                stdout, stderr = process.communicate(
+                    input=input_text, timeout=timeout_seconds
+                )
+            except subprocess.TimeoutExpired as error:
+                stdout, stderr = _terminate_process_group(process, error)
+                raise CommandTimeoutError(
+                    stdout,
+                    stderr,
+                    perf_counter() - started,
+                ) from error
 
-        return CommandResult(
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=process.returncode,
-            duration_seconds=perf_counter() - started,
-        )
+            return CommandResult(
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=process.returncode,
+                duration_seconds=perf_counter() - started,
+            )
+        finally:
+            with self._lock:
+                self._processes.pop(process.pid, None)
 
 
 def _terminate_process_group(
