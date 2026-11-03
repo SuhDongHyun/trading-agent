@@ -42,6 +42,7 @@ from trading_agent.domain.models import (
     Action,
     MarketContext,
     MarketSnapshot,
+    NewsSnapshotItem,
     ResearchSnapshot,
     StockSnapshot,
 )
@@ -227,6 +228,52 @@ def test_point_in_time_news_hides_later_search_dates_and_after_clock_articles() 
     assert gateway.get_stock_news("005930", "20260916") == []
     assert inner.news_calls == ["20260915"]
     assert gateway.leakage["news_articles"] == 2
+
+
+def test_point_in_time_news_age_uses_the_decision_snapshot_time() -> None:
+    point_gateway = PointInTimeGateway(
+        HistoricalGateway(),
+        "20260915",
+        "20260901",
+        "20260916",
+        decision_time=time(15, 40),
+    )
+    snapshot = SnapshotBuilder(
+        point_gateway,
+        [],
+        clock=lambda: datetime.fromisoformat("2026-09-15T15:40:00+09:00"),
+    ).build_research(["005930"])
+
+    assert [item.title for item in snapshot.stocks[0].news] == ["이전"]
+    assert snapshot.stocks[0].news[0].age_hours == 0.0
+    assert snapshot.stocks[0].news[0].published_at.isoformat() == (
+        "2026-09-15T15:39:00+09:00"
+    )
+
+
+def test_point_in_time_news_dates_include_decision_bar_and_three_prior_days() -> None:
+    class RecentHistoricalGateway(HistoricalGateway):
+        def get_daily_bars(
+            self, code: str, start_date: str, end_date: str
+        ) -> list[DailyBar]:
+            return [
+                DailyBar(date, Decimal("100") + index, index + 1)
+                for index, date in enumerate(
+                    ["20260910", "20260911", "20260914", "20260915", "20260916"]
+                )
+            ]
+
+    inner = RecentHistoricalGateway()
+    point_gateway = PointInTimeGateway(
+        inner, "20260915", "20260901", "20260916", decision_time=time(15, 40)
+    )
+    SnapshotBuilder(
+        point_gateway,
+        [],
+        clock=lambda: datetime.fromisoformat("2026-09-15T15:40:00+09:00"),
+    ).build_research(["005930"])
+
+    assert inner.news_calls == ["20260915", "20260914", "20260911", "20260910"]
 
 
 def test_point_in_time_market_cutoffs_include_korea_and_exclude_us_decision_day() -> (
@@ -420,7 +467,15 @@ def test_mask_snapshot_removes_dates_names_news_and_rate_levels() -> None:
                 current_price=Decimal("100"),
                 macd=Decimal("2"),
                 macd_signal_value=Decimal("1"),
-                news_headlines=["기사"],
+                news=[
+                    NewsSnapshotItem(
+                        "기사",
+                        "source",
+                        datetime.fromisoformat("2026-09-15T15:31:00+09:00"),
+                        1.0,
+                        True,
+                    )
+                ],
                 industry="전자",
             )
         ],
@@ -435,7 +490,7 @@ def test_mask_snapshot_removes_dates_names_news_and_rate_levels() -> None:
     assert masked.created_at.year == 2000
     assert masked.as_of_trading_date is None
     assert masked.stocks[0].name != "삼성전자"
-    assert masked.stocks[0].news_headlines is None
+    assert masked.stocks[0].news == []
     assert masked.stocks[0].industry is None
     assert masked.market_context.exchange_rate is None
     assert "20260915" not in str(masked.missing)

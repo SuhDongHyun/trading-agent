@@ -14,8 +14,10 @@ from trading_agent.application.prompt_builder import (
 )
 from trading_agent.domain.models import (
     AccountSnapshot,
+    DataBasis,
     MarketContext,
     MarketSnapshot,
+    NewsSnapshotItem,
     Position,
     StockSnapshot,
 )
@@ -39,10 +41,30 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
                 volume_change_percent=Decimal("-12.5"),
                 atr14_percent=Decimal("1.234"),
                 realized_volatility_20d_percent=Decimal("2.345"),
+                news=[
+                    NewsSnapshotItem(
+                        "장 마감 뒤 기사",
+                        "연합뉴스",
+                        datetime.fromisoformat("2026-10-29T15:31:00+09:00"),
+                        0.2,
+                        True,
+                    )
+                ],
             )
         ],
         market_context=MarketContext(volatility_index=None),
         missing=["market:vix", "news:005930"],
+        data_basis=DataBasis(
+            price_basis="adjusted",
+            rsi=14,
+            rsi_signal_ema=9,
+            macd=(12, 26),
+            macd_signal_ema=9,
+            ma=(20, 60),
+            atr=14,
+            realized_volatility=20,
+            news_lookback_trading_days=3,
+        ),
     )
     policy = RiskPolicy(
         max_position_weight=Decimal("0.2"),
@@ -69,10 +91,35 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
     assert serialized["stocks"][0]["volume_change_percent"] == "-12.50"
     assert serialized["stocks"][0]["atr14_percent"] == "1.23"
     assert serialized["stocks"][0]["realized_volatility_20d_percent"] == "2.35"
+    assert serialized["stocks"][0]["news"] == [
+        {
+            "title": "장 마감 뒤 기사",
+            "source": "연합뉴스",
+            "published_at": "2026-10-29T15:31:00+09:00",
+            "age_hours": 0.2,
+            "after_close": True,
+        }
+    ]
+    assert serialized["data_basis"] == {
+        "price_basis": "adjusted",
+        "rsi": 14,
+        "rsi_signal_ema": 9,
+        "macd": [12, 26],
+        "macd_signal_ema": 9,
+        "ma": [20, 60],
+        "atr": 14,
+        "realized_volatility": 20,
+        "news_lookback_trading_days": 3,
+    }
     assert "Wilder ATR(14)" in prompt
     assert "연율화하지 않았습니다" in prompt
     assert "장중에는 당일 미완성 누적 거래량" in prompt
     assert "직전 20일 평균" in prompt
+    assert "stocks[].news" in prompt
+    assert "after_close는" in prompt
+    assert "15:30 KST 뒤 게시된" in prompt
+    assert "data_basis.price_basis" in prompt
+    assert "stocks[].news_headlines" not in prompt
     assert "news:005930" in prompt
     assert "500000" in prompt
     assert "max_order_ratio" in prompt
