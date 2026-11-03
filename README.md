@@ -207,9 +207,10 @@ uv run trading-agent run --force
 
 스냅샷에는 가장 최근 일봉 날짜인 `as_of_trading_date`와 KST 기준
 `market_session`(open, closed, pre_open, holiday)이 포함됩니다. 시장 지표는 최근
-14 calendar days, 일봉은 380 calendar days, 이동평균·RSI·MACD 지표는 기존 120
-calendar days를 조회합니다. 일봉 조회 기간을 늘려도 지표 API 요청 기간은 늘지
-않습니다. `run`은 주말에는 스냅샷 수집 없이, 평일 09:00 이후에는 실제로 받은
+14 calendar days, KOSPI·KOSDAQ 지수는 60일선을 계산할 수 있도록 100 calendar days,
+일봉은 380 calendar days, 이동평균·RSI·MACD 지표는 기존 120 calendar days를
+조회합니다. 일봉 조회 기간을 늘려도 지표 API 요청 기간은 늘지 않습니다. `run`은
+주말에는 스냅샷 수집 없이, 평일 09:00 이후에는 실제로 받은
 최신 일봉 날짜가 오늘보다 이전일 때 `skipped` 상태로 기록하고 LLM 판단 없이 종료
 코드 0으로 끝납니다. 일봉을 받지 못했거나 조회가 실패해 날짜를 확인하지 못하면
 휴장으로 단정하지 않고 누락 원인을 기록한 뒤 판단을 진행합니다. `--force`는 휴장
@@ -224,6 +225,18 @@ skip을 건너뜁니다. `recommend`는 휴장일에도 실행합니다.
 | `high_20d_distance_percent` | (현재가 − 최근 20거래일 최고 고가) ÷ 최고 고가 × 100. 최고가 아래면 음수입니다. |
 | `low_20d_distance_percent` | (현재가 − 최근 20거래일 최저 저가) ÷ 최저 저가 × 100. 최저가 위면 양수입니다. |
 | `high_52w_position_percent` | 최근 최대 252거래일 저가~고가 범위에서 현재가 위치. 저가가 0%, 고가가 100%이며 계산한 거래일 수는 `high_52w_period_trading_days`에 표시합니다. |
+
+스냅샷의 시장 국면·상대강도 필드는 다음과 같습니다.
+
+| 필드 | 정의 |
+| --- | --- |
+| `market_context.kospi_return_5d_percent`, `kospi_return_20d_percent` (KOSDAQ도 동일) | 지수 최신 값과 각각 5/20거래일 전 값의 수익률(%). |
+| `market_context.kospi_ma20_deviation_percent`, `kospi_ma60_deviation_percent` (KOSDAQ도 동일) | 최신 지수 값과 최근 20/60거래일 단순 이동평균 괴리(%). 양수면 이동평균 위입니다. |
+| `market_context.vkospi_change_5d_points` | 현재 VKOSPI에서 5거래일 전 값을 뺀 포인트 변화입니다. |
+| `stocks[].industry` | 현재 종목 quote의 업종 메타데이터입니다. |
+| `stocks[].relative_strength_5d_percent`, `relative_strength_20d_percent` | 종목 수익률에서 `market_name`으로 판별한 KOSPI 또는 KOSDAQ 수익률을 뺀 초과수익(%p). |
+| `stocks[].universe_rank_percentile_20d` | 같은 스냅샷에서 20일 수익률이 유효한 종목의 백분위(0~100). 높을수록 강하고 동순위는 평균 순위입니다. 비교 종목이 하나뿐이면 null입니다. |
+| `stocks[].industry_relative_strength_20d_percent` | 종목 20일 수익률에서 같은 업종의 다른 종목 평균을 뺀 초과수익(%p). 동종 비교 종목이 없으면 null입니다. |
 
 `market_session = open`이면 최신 일봉에 당일 미완성 봉이 포함될 수 있습니다.
 
@@ -291,9 +304,10 @@ manifest에 저장하고 재개 실행에서 다시 사용하므로 날짜 표�
 | S&P 500, VIX, USD/KRW, 미 10년 | D 이전 |
 | 뉴스 | 검색일이 D 이하이고 게시 시각이 판단 시각 이하 |
 | 공포탐욕 지수 | 과거 조회 불가로 missing 처리 |
+| 종목 업종 (`industry`) | 현재 quote 메타데이터를 사용합니다. 가격 시계열의 미래값이 아니므로 누수로 보지 않습니다. |
 
 일봉에서 D 종가와 직전 거래일 종가로 현재가와 등락률을 재구성합니다. `--mask`는
-모델 입력에서 날짜·종목 식별자·종목명·뉴스를 감추고 종목별 가격 배율을 적용합니다.
+모델 입력에서 날짜·종목 식별자·종목명·뉴스·업종을 감추고 종목별 가격 배율을 적용합니다.
 결과에는 별도 역변환표와 복구한 추천을 함께 저장합니다.
 
 기본 결과는 `data/backtest/<run-id>/` 아래 `manifest.json`, `dates/<D>.json`,

@@ -13,13 +13,14 @@ from trading_agent.domain.models import AccountSnapshot
 
 @dataclass(frozen=True, slots=True)
 class StockQuote:
-    """현재가와 선택적 시장 구분을 포함한 종목 가격 요약."""
+    """현재가, 선택적 시장 구분과 업종을 포함한 종목 가격 요약."""
 
     code: str
     name: str
     current_price: Decimal
     change_percent: Decimal
     market_name: str | None = None
+    industry: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

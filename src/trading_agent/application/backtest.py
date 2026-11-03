@@ -285,13 +285,14 @@ ProgressCallback = Callable[[str, str, int, int, bool, str | None], None]
 
 
 def mask_snapshot(snapshot: ResearchSnapshot, mapping: MaskingMap) -> ResearchSnapshot:
-    """프롬프트용 스냅샷에서 식별자·시각·뉴스·금리 수준을 감춘다."""
+    """프롬프트용 스냅샷에서 식별자·시각·뉴스·업종·금리 수준을 감춘다."""
 
     stocks = [
         replace(
             stock,
             code=mapping.masked_code(stock.code),
             name="마스킹 종목",
+            industry=None,
             current_price=mapping.scale(stock.code, stock.current_price),
             macd=mapping.scale(stock.code, stock.macd),
             macd_signal_value=mapping.scale(stock.code, stock.macd_signal_value),

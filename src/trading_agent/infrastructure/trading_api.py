@@ -131,7 +131,7 @@ class TradingApiMarketDataGateway(MarketDataGateway):
         return _decode("GET /account", data, parse)
 
     def get_stock_quote(self, code: str) -> StockQuote:
-        """현재가 응답에서 종목명과 가격, 등락률을 읽는다."""
+        """현재가 응답에서 종목명, 가격, 등락률과 업종을 읽는다."""
 
         data = self.client.request_json(
             "POST", "/stock_quote", {"market": "J", "code": code}
@@ -148,6 +148,7 @@ class TradingApiMarketDataGateway(MarketDataGateway):
                 current_price=current_price,
                 change_percent=_decimal(body, "price_diff_rate"),
                 market_name=_optional_string(body.get("market_name")),
+                industry=_optional_string(body.get("industry")),
             )
 
         return _decode("POST /stock_quote", data, parse)

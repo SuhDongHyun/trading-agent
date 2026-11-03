@@ -20,8 +20,13 @@ from trading_agent.application.snapshot_builder import (
     calculate_52w_position,
     calculate_atr14_percent,
     calculate_deviation_percent,
+    calculate_index_change_points,
+    calculate_index_deviation_percent,
+    calculate_index_return_percent,
+    calculate_industry_relative_strength_20d_percent,
     calculate_realized_volatility_20d_percent,
     calculate_return_percent,
+    calculate_universe_rank_percentile,
     calculate_volume_change_percent,
 )
 from trading_agent.domain.models import AccountSnapshot, Position, RuleType
@@ -36,6 +41,7 @@ class FakeMarketDataGateway(MarketDataGateway):
         self.failures = failures or set()
         self.quote_calls: list[str] = []
         self.request_ranges: list[tuple[str, str]] = []
+        self.market_requests: list[tuple[MarketIndex, str, str]] = []
         self.news_calls: list[tuple[str, str]] = []
         self.news_by_date: dict[str, list[NewsItem]] = {}
 
@@ -150,16 +156,48 @@ class FakeMarketDataGateway(MarketDataGateway):
     ) -> list[IndexPoint]:
         self._check(f"market:{index.name.lower()}")
         self._range(start_date, end_date)
+        self.market_requests.append((index, start_date, end_date))
         if index is MarketIndex.SP500:
             return [
                 IndexPoint("20261028", Decimal("100")),
                 IndexPoint("20261029", Decimal("110")),
             ]
+        if index in (MarketIndex.KOSPI, MarketIndex.KOSDAQ):
+            weekdays = [
+                datetime.strptime(end_date, "%Y%m%d") - timedelta(days=offset)
+                for offset in range(100)
+                if (
+                    datetime.strptime(end_date, "%Y%m%d") - timedelta(days=offset)
+                ).weekday()
+                < 5
+            ]
+            dates = [day.strftime("%Y%m%d") for day in reversed(weekdays[:65])]
+            base = Decimal(1000) if index is MarketIndex.KOSPI else Decimal(2000)
+            points = [
+                IndexPoint(
+                    date,
+                    base + Decimal(position),
+                    Decimal("0.6") if position == len(dates) - 1 else None,
+                )
+                for position, date in enumerate(dates)
+            ]
+            return points
+        if index is MarketIndex.VKOSPI:
+            weekdays = [
+                datetime.strptime(end_date, "%Y%m%d") - timedelta(days=offset)
+                for offset in range(10)
+                if (
+                    datetime.strptime(end_date, "%Y%m%d") - timedelta(days=offset)
+                ).weekday()
+                < 5
+            ]
+            dates = [day.strftime("%Y%m%d") for day in reversed(weekdays[:6])]
+            return [
+                IndexPoint(date, Decimal("11.25") + Decimal(position))
+                for position, date in enumerate(dates)
+            ]
         value = Decimal("16.25") if index is MarketIndex.VIX else Decimal("2")
-        change = (
-            Decimal("0.6") if index in (MarketIndex.KOSPI, MarketIndex.KOSDAQ) else None
-        )
-        return [IndexPoint("20261029", value, change)]
+        return [IndexPoint(end_date, value)]
 
     def get_fear_and_greed_index(self) -> IndexPoint:
         self._check("market:fear_and_greed")
@@ -228,6 +266,11 @@ def test_snapshot_builder_merges_watchlist_and_holdings_and_summarizes_data() ->
     )
     assert snapshot.account.total_asset_value == Decimal("1400")
     assert snapshot.market_context.kospi_change_percent == Decimal("0.6")
+    assert snapshot.market_context.kospi_return_5d_percent is not None
+    assert snapshot.market_context.kospi_return_20d_percent is not None
+    assert snapshot.market_context.kospi_ma20_deviation_percent is not None
+    assert snapshot.market_context.kospi_ma60_deviation_percent is not None
+    assert snapshot.market_context.vkospi_change_5d_points == Decimal("5")
     assert snapshot.market_context.sp500_change_percent == Decimal("10")
     assert snapshot.market_context.volatility_index == Decimal("16.25")
     assert snapshot.market_context.fear_greed_index == Decimal("62.5")
@@ -237,8 +280,20 @@ def test_snapshot_builder_merges_watchlist_and_holdings_and_summarizes_data() ->
     assert set(gateway.request_ranges) == {
         ("20251014", "20261029"),
         ("20260701", "20261029"),
+        ("20260721", "20261029"),
         ("20261015", "20261029"),
     }
+    assert (
+        gateway.market_requests.count((MarketIndex.KOSPI, "20260721", "20261029")) == 1
+    )
+    assert (
+        gateway.market_requests.count((MarketIndex.KOSDAQ, "20260721", "20261029")) == 1
+    )
+    assert all(
+        start == "20261015"
+        for index, start, _ in gateway.market_requests
+        if index not in (MarketIndex.KOSPI, MarketIndex.KOSDAQ)
+    )
 
 
 def test_snapshot_builder_continues_after_optional_data_failures() -> None:
@@ -290,6 +345,7 @@ def test_snapshot_builder_uses_kst_date_when_utc_clock_crosses_day_boundary() ->
     assert set(gateway.request_ranges) == {
         ("20251015", "20261030"),
         ("20260702", "20261030"),
+        ("20260722", "20261030"),
         ("20261016", "20261030"),
     }
 
@@ -690,3 +746,154 @@ def test_calculation_helpers_cover_boundaries() -> None:
         calculate_return_percent([Decimal("1")], periods=0)
     with pytest.raises(ValueError):
         calculate_volume_change_percent([1], window=0)
+
+
+def test_market_index_calculations_cover_returns_deviations_and_history_limits() -> (
+    None
+):
+    points = [IndexPoint(f"202601{day:02}", Decimal(100 + day)) for day in range(1, 62)]
+
+    assert calculate_index_return_percent(points, 5) == (
+        Decimal(5) / Decimal(156) * Decimal(100)
+    )
+    assert calculate_index_return_percent(points, 20) == (
+        Decimal(20) / Decimal(141) * Decimal(100)
+    )
+    assert calculate_index_deviation_percent(points, 20) == (
+        (Decimal(161) - Decimal("151.5")) / Decimal("151.5") * Decimal(100)
+    )
+    assert calculate_index_deviation_percent(points, 60) is not None
+    assert calculate_index_return_percent(points[-5:], 5) is None
+    assert calculate_index_return_percent(points[-20:], 20) is None
+    assert calculate_index_deviation_percent(points[-19:], 20) is None
+    assert calculate_index_deviation_percent(points[-59:], 60) is None
+    assert (
+        calculate_index_return_percent(
+            [IndexPoint("20260101", Decimal(0)), IndexPoint("20260102", Decimal(1))], 1
+        )
+        is None
+    )
+
+
+def test_vkospi_five_trading_day_change_uses_points_and_requires_six_values() -> None:
+    points = [IndexPoint(f"202601{day:02}", Decimal(day)) for day in range(1, 7)]
+
+    assert calculate_index_change_points(points, 5) == Decimal(5)
+    assert calculate_index_change_points(points[:-1], 5) is None
+
+
+def test_relative_strength_rank_and_industry_helpers_define_ties_and_no_peers() -> None:
+    assert calculate_universe_rank_percentile(Decimal(10), [Decimal(10)]) is None
+    assert calculate_universe_rank_percentile(
+        Decimal(10), [Decimal(10), Decimal(10)]
+    ) == Decimal(50)
+    assert calculate_universe_rank_percentile(
+        Decimal(10), [Decimal(5), Decimal(10), Decimal(10), Decimal(20), None]
+    ) == Decimal(50)
+    assert calculate_universe_rank_percentile(
+        Decimal(5), [None, Decimal(5), Decimal(10)]
+    ) == Decimal(0)
+    assert calculate_universe_rank_percentile(None, [Decimal(5), Decimal(10)]) is None
+    assert calculate_industry_relative_strength_20d_percent(
+        Decimal(10), "전자", [("전자", Decimal(4)), ("전자", Decimal(6))]
+    ) == Decimal(5)
+    assert (
+        calculate_industry_relative_strength_20d_percent(Decimal(10), "전자", [])
+        is None
+    )
+    assert (
+        calculate_industry_relative_strength_20d_percent(
+            Decimal(10), None, [("전자", Decimal(4))]
+        )
+        is None
+    )
+
+
+def test_snapshot_builder_enriches_run_and_recommend_snapshots_after_collection() -> (
+    None
+):
+    class RelativeStrengthGateway(FakeMarketDataGateway):
+        quote_data = {
+            "005930": ("KOSPI200", "전자", 2),
+            "000660": ("KSQ150", "전자", 1),
+            "051910": ("KOSPI", "화학", 0.5),
+            "086520": (None, None, 3),
+        }
+
+        def get_stock_quote(self, code: str) -> StockQuote:
+            market_name, industry, _ = self.quote_data[code]
+            return StockQuote(
+                code,
+                f"종목-{code}",
+                Decimal(100),
+                Decimal(0),
+                market_name=market_name,
+                industry=industry,
+            )
+
+        def get_daily_bars(
+            self, code: str, start_date: str, end_date: str
+        ) -> list[DailyBar]:
+            _, _, increment = self.quote_data[code]
+            return [
+                DailyBar(
+                    f"202610{day:02}",
+                    Decimal(100) + Decimal(str(increment)) * Decimal(day),
+                    100,
+                    high_price=Decimal(102) + Decimal(str(increment)) * Decimal(day),
+                    low_price=Decimal(98) + Decimal(str(increment)) * Decimal(day),
+                )
+                for day in range(1, 26)
+            ]
+
+    gateway = RelativeStrengthGateway()
+    now = datetime(2026, 10, 29, tzinfo=UTC)
+    builder = SnapshotBuilder(gateway, ["005930", "000660"], clock=lambda: now)
+
+    run_snapshot = builder.build()
+    recommend_snapshot = builder.build_research(
+        ["005930", "000660", "051910", "086520"]
+    )
+
+    for snapshot in (run_snapshot, recommend_snapshot):
+        stocks = {stock.code: stock for stock in snapshot.stocks}
+        assert stocks["005930"].industry == "전자"
+        assert stocks["005930"].relative_strength_5d_percent is not None
+        assert stocks["005930"].relative_strength_20d_percent is not None
+        assert stocks["005930"].universe_rank_percentile_20d is not None
+        assert stocks["005930"].industry_relative_strength_20d_percent is not None
+        assert stocks["000660"].relative_strength_20d_percent is not None
+        assert stocks["000660"].industry_relative_strength_20d_percent is not None
+        assert stocks["051910"].relative_strength_20d_percent is not None
+    recommend_stocks = {stock.code: stock for stock in recommend_snapshot.stocks}
+    assert recommend_stocks["086520"].relative_strength_5d_percent is None
+    assert recommend_stocks["086520"].relative_strength_20d_percent is None
+    assert recommend_stocks["086520"].industry_relative_strength_20d_percent is None
+
+
+def test_insufficient_market_history_is_reported_for_new_fields() -> None:
+    class ShortMarketGateway(FakeMarketDataGateway):
+        def get_market_index(
+            self, index: MarketIndex, start_date: str, end_date: str
+        ) -> list[IndexPoint]:
+            if index in (MarketIndex.KOSPI, MarketIndex.KOSDAQ, MarketIndex.VKOSPI):
+                return [
+                    IndexPoint(f"202610{day:02}", Decimal(day)) for day in range(1, 6)
+                ]
+            return super().get_market_index(index, start_date, end_date)
+
+    snapshot = SnapshotBuilder(
+        ShortMarketGateway(),
+        [],
+        clock=lambda: datetime(2026, 10, 29, tzinfo=UTC),
+    ).build_research(["005930"])
+
+    assert snapshot.market_context.kospi_return_5d_percent is None
+    assert snapshot.market_context.kospi_return_20d_percent is None
+    assert snapshot.market_context.kospi_ma20_deviation_percent is None
+    assert snapshot.market_context.kospi_ma60_deviation_percent is None
+    assert snapshot.market_context.vkospi_change_5d_points is None
+    assert "market:kospi_return_5d(insufficient_history)" in snapshot.missing
+    assert "market:kospi_return_20d(insufficient_history)" in snapshot.missing
+    assert "market:kospi_ma60_deviation(insufficient_history)" in snapshot.missing
+    assert "market:vkospi_change_5d_points(insufficient_history)" in snapshot.missing

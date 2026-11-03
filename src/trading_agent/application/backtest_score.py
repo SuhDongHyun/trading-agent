@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from trading_agent.application.backtest import BACKTEST_FORMAT_VERSION
+from trading_agent.application.market_mapping import market_index_for
 from trading_agent.application.ports import (
     DailyBar,
     IndexPoint,
@@ -622,21 +623,6 @@ class ScoreBacktest:
             },
             "window_trading_days": max_horizon,
         }
-
-
-def market_index_for(market_name: str | None) -> MarketIndex | None:
-    """응답의 시장명으로 종목 벤치마크를 고른다."""
-
-    normalized = (market_name or "").strip().upper()
-    if (
-        normalized.startswith("KOSPI")
-        or "코스피" in normalized
-        or "유가증권" in normalized
-    ):
-        return MarketIndex.KOSPI
-    if normalized.startswith(("KOSDAQ", "KSQ")) or "코스닥" in normalized:
-        return MarketIndex.KOSDAQ
-    return None
 
 
 def price_outcome(

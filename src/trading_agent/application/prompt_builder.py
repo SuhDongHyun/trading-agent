@@ -22,8 +22,16 @@ JSON 하나만 출력합니다. 코딩 작업용 지침(AGENTS.md, 테스트·�
 이 작업에 적용되지 않습니다."""
 
 STOCK_FIELD_GLOSSARY = """- stocks[].code/name: 종목 코드와 이름.
+- stocks[].industry: 현재 종목 quote에 포함된 업종 메타데이터입니다.
 - stocks[].current_price/change_percent: 현재가와 당일 변화율.
 - stocks[].return_5d_percent/return_20d_percent: 최근 5일/20일 수익률.
+- stocks[].relative_strength_5d_percent/relative_strength_20d_percent:
+  종목 수익률에서 종목 소속 시장 지수(KOSPI 또는 KOSDAQ) 수익률을 뺀 초과수익(%p)입니다.
+- stocks[].universe_rank_percentile_20d: 같은 스냅샷에서 20일 수익률이 유효한 종목의
+  순위 백분위(0~100)입니다. 높을수록 강하며 동순위에는 평균 순위를 씁니다.
+  비교 종목이 하나뿐이면 null입니다.
+- stocks[].industry_relative_strength_20d_percent: 종목 20일 수익률에서 같은 업종의
+  다른 종목 평균을 뺀 초과수익(%p)입니다. 비교할 동종 종목이 없으면 null입니다.
 - stocks[].ma20_deviation_percent/ma60_deviation_percent:
   현재가와 20일/60일 이동평균의 괴리율.
 - stocks[].rsi/rsi_signal: RSI 값과 RSI 신호.
@@ -56,6 +64,16 @@ PRICE_RECOMMENDATION_GUIDANCE = """가격 위험 규칙:
 
 MARKET_FIELD_GLOSSARY = """- market_context.kospi_change_percent, kosdaq_change_percent,
   sp500_change_percent: 각 시장 지수의 변화율.
+- market_context.kospi_return_5d_percent/kospi_return_20d_percent와
+  kosdaq_return_5d_percent/kosdaq_return_20d_percent: 각 지수의 최근 5/20거래일
+  수익률(%)입니다.
+- market_context.kospi_ma20_deviation_percent/kospi_ma60_deviation_percent와
+  kosdaq_ma20_deviation_percent/kosdaq_ma60_deviation_percent: 최신 지수 값과
+  최근 20/60거래일 단순 이동평균의 괴리율(%)입니다. 양수면 이동평균 위입니다.
+- market_context.vkospi_change_5d_points: 현재 VKOSPI에서 5거래일 전 값을 뺀
+  포인트 변화입니다.
+- 지수가 60일선 위에 있고 20일 수익률이 양수면 추세장, 반대면 약세·반전장으로 보고
+  같은 종목 지표도 시장 국면에 따라 다르게 해석하세요.
 - market_context.volatility_index/vkospi/fear_greed_index:
   변동성 및 공포·탐욕 지표.
 - market_context.exchange_rate/korea_3y_yield/us_10y_yield: 환율과 국채 금리.
