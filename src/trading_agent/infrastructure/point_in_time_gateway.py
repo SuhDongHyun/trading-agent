@@ -92,7 +92,13 @@ class PointInTimeGateway(MarketDataGateway):
             / previous.close_price
             * Decimal(100)
         )
-        return StockQuote(code, actual.name, today.close_price, change)
+        return StockQuote(
+            code,
+            actual.name,
+            today.close_price,
+            change,
+            market_name=actual.market_name,
+        )
 
     def get_daily_bars(
         self, code: str, start_date: str, end_date: str

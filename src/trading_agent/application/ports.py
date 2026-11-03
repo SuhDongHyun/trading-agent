@@ -13,21 +13,25 @@ from trading_agent.domain.models import AccountSnapshot
 
 @dataclass(frozen=True, slots=True)
 class StockQuote:
-    """현재가 API에서 읽은 종목 가격 요약."""
+    """현재가와 선택적 시장 구분을 포함한 종목 가격 요약."""
 
     code: str
     name: str
     current_price: Decimal
     change_percent: Decimal
+    market_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DailyBar:
-    """종목의 일별 종가와 거래량."""
+    """종목의 일별 가격과 거래량, 선택적 OHLC 값."""
 
     date: str
     close_price: Decimal
     volume: int
+    open_price: Decimal | None = None
+    high_price: Decimal | None = None
+    low_price: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

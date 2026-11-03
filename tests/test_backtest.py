@@ -60,16 +60,36 @@ class HistoricalGateway(FakeGateway):
         self.news_calls: list[str] = []
 
     def get_stock_quote(self, code: str) -> StockQuote:
-        return StockQuote(code, "현재 이름", Decimal("999"), Decimal("99"))
+        return StockQuote(
+            code, "현재 이름", Decimal("999"), Decimal("99"), market_name="KOSDAQ"
+        )
 
     def get_daily_bars(
         self, code: str, start_date: str, end_date: str
     ) -> list[DailyBar]:
         self.daily_reads += 1
         return [
-            DailyBar("20260914", Decimal("100"), 1),
-            DailyBar("20260915", Decimal("110"), 2),
-            DailyBar("20260916", Decimal("120"), 3),
+            DailyBar(
+                "20260914",
+                Decimal("100"),
+                1,
+                high_price=Decimal("101"),
+                low_price=Decimal("99"),
+            ),
+            DailyBar(
+                "20260915",
+                Decimal("110"),
+                2,
+                high_price=Decimal("111"),
+                low_price=Decimal("109"),
+            ),
+            DailyBar(
+                "20260916",
+                Decimal("120"),
+                3,
+                high_price=Decimal("121"),
+                low_price=Decimal("119"),
+            ),
         ]
 
     def get_rsi(
@@ -137,6 +157,12 @@ def test_point_in_time_gateway_cuts_daily_rows_and_shares_ticker_cache() -> None
     ]
     assert first.leakage["daily_rows"] == 1
     assert second.leakage["daily_rows"] == 0
+    assert first.get_daily_bars("005930", "20260901", "20260916")[
+        -1
+    ].high_price == Decimal("111")
+    assert first.get_daily_bars("005930", "20260901", "20260916")[
+        -1
+    ].low_price == Decimal("109")
     assert inner.daily_reads == 1
 
 
@@ -150,6 +176,7 @@ def test_point_in_time_quote_uses_decision_close_and_previous_close() -> None:
     assert quote.name == "현재 이름"
     assert quote.current_price == Decimal("110")
     assert quote.change_percent == Decimal("10")
+    assert quote.market_name == "KOSDAQ"
 
 
 def test_point_in_time_quote_requires_decision_day_bar() -> None:
@@ -770,7 +797,7 @@ def test_backtest_cli_without_subcommand_prints_help_and_returns_2(capsys) -> No
     assert main(["backtest"]) == 2
     output = capsys.readouterr().out
     assert "usage: trading-agent backtest" in output
-    assert "{run}" in output
+    assert "{run,score}" in output
 
 
 def test_backtest_runtime_rejects_operating_database_before_gateway_creation(

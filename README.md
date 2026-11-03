@@ -251,6 +251,38 @@ manifest에 저장하고 재개 실행에서 다시 사용하므로 날짜 표�
 한계입니다. 모델 실행은 날짜마다 Claude와 Codex를 한 번씩 호출하므로 구독 사용량을
 확인하고, 먼저 `--snapshot-only`로 API 데이터와 결과 범위를 점검하세요.
 
+저장한 결과는 `backtest score`로 실제 이후 일봉과 시장 지수를 조회해 별도 채점할 수
+있습니다. 기본 horizon은 manifest의 `5,10,20`이며 결과 디렉터리에 `score.json`과
+`score.md`를 씁니다. 점수 명령은 저장된 모델별 파싱 결과로 합의 정책을 다시 적용하므로
+모델을 재호출하지 않습니다.
+
+```sh
+uv run trading-agent backtest score data/backtest/sample
+uv run trading-agent backtest score data/backtest/sample \
+  --policy buy_one_side --confidence-aggregation mean
+uv run trading-agent backtest score data/backtest/sample --compare-policies
+```
+
+주 지표 `xs`는 같은 판단일 universe의 평균 수익률을 뺀 종목 상대수익(%p)입니다.
+buy는 `xs > 0`, sell은 `xs < 0`, hold는 horizon별 기본 밴드 안(`5일 2.5`,
+`10일 3.5`, `20일 5.0` %p)이면 적중으로 봅니다. 밴드는 `--hold-bands 5:2.5,10:3.5,20:5.0`
+형식으로 바꿀 수 있습니다. IC는 의견 방향에 확신도를 곱한 점수와 xs 사이 날짜별
+Spearman 상관의 평균이며, 날짜별 유효 종목이 3개 미만이면 IC에서 제외하고 합의
+불일치는 0점으로 넣습니다. 신뢰구간은 날짜를 cluster로 재표집한 bootstrap 95% 구간이며,
+정렬된 표본에서 `int(q × 반복 수)` 위치를 분위수로 씁니다. 확신도 보정은 buy/sell과
+hold를 분리하고 `[lo, hi)` 구간(마지막 구간은 1.0 포함)을 사용합니다. 목표가와
+무효화 가격은 이후 일봉 고가·저가에서 먼저 닿은 쪽을 출처·의견별로 셉니다. 가격 수준
+하나라도 없거나 OHLC 경로가 완전하지 않으면 `no_price`로 기록합니다. 손절가·목표가의
+중앙 변화율은 buy/sell별로 부호를 유지합니다. 종목 시장에 맞춰 KOSPI 또는 KOSDAQ
+수익률을 차감한 `exc`와 절대 수익률 기준율도 함께 저장합니다.
+
+가격·지수 조회 종료일은 계산한 horizon 여유 날짜와 KST 전날 중 이른 날로 제한합니다.
+이를 통해 아직 끝나지 않은 오늘 응답을 영구 응답 캐시에 저장하지 않습니다.
+
+2026-07 이전 판단일이 있으면 결과 상단에 모델 기억 누수 가능성을 알리고, 기간별
+지표도 나눠 보여줍니다. 작은 표본이나 넓은 신뢰구간에서는 정책 간 순위를 단정하지
+마세요. 결과 JSON의 누락 가격·벤치마크 건수와 source별 표본 수를 함께 확인하세요.
+
 종료 코드는 cron 모니터링에 사용합니다. `run`과 `recommend`에 공통입니다.
 SIGTERM은 `SystemExit(143)`으로 바뀌며 실행 중인 유스케이스가 ERROR 상태 기록을 시도한 뒤 종료합니다.
 

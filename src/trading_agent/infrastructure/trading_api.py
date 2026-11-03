@@ -147,6 +147,7 @@ class TradingApiMarketDataGateway(MarketDataGateway):
                 name=_string(body, "name"),
                 current_price=current_price,
                 change_percent=_decimal(body, "price_diff_rate"),
+                market_name=_optional_string(body.get("market_name")),
             )
 
         return _decode("POST /stock_quote", data, parse)
@@ -154,7 +155,7 @@ class TradingApiMarketDataGateway(MarketDataGateway):
     def get_daily_bars(
         self, code: str, start_date: str, end_date: str
     ) -> list[DailyBar]:
-        """일봉 응답을 종가와 거래량 형식으로 변환한다."""
+        """일봉 응답의 종가, 거래량, 선택적 OHLC 가격을 변환한다."""
 
         data = self._historical_request(
             "/stock_quote/daily", code, start_date, end_date
@@ -167,6 +168,9 @@ class TradingApiMarketDataGateway(MarketDataGateway):
                     date=_string(_mapping(item), "date"),
                     close_price=_decimal(_mapping(item), "close_price"),
                     volume=_integer(_mapping(item), "accumulated_volume"),
+                    open_price=_optional_decimal(_mapping(item).get("open_price")),
+                    high_price=_optional_decimal(_mapping(item).get("high_price")),
+                    low_price=_optional_decimal(_mapping(item).get("low_price")),
                 )
                 for item in _sequence(payload)
             ],
@@ -534,13 +538,21 @@ def _datetime(body: dict[str, Any], field: str) -> datetime:
 
 
 def _optional_string(value: Any) -> str | None:
-    """선택적 기사 key를 문자열로 바꾼다."""
+    """선택적 문자열 값을 검증한다."""
 
     if value is None:
         return None
     if not isinstance(value, (str, int)) or isinstance(value, bool):
-        raise ValueError("기사 key는 문자열이어야 합니다.")
+        raise ValueError("문자 값은 문자열이어야 합니다.")
     return str(value)
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    """선택적 숫자 응답을 유한한 Decimal로 바꾼다."""
+
+    if value is None:
+        return None
+    return _decimal_value(value)
 
 
 def _clean_news_text(value: str) -> str:
