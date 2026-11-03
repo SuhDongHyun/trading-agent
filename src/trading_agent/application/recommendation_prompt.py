@@ -1,28 +1,37 @@
 """계좌와 무관한 종목 추천 프롬프트를 만든다."""
 
 import json
+from collections.abc import Sequence
 
 from trading_agent.application.prompt_builder import (
     CONFIDENCE_SCALE_GUIDANCE,
+    DEFAULT_HORIZON_DAYS,
     MARKET_FIELD_GLOSSARY,
     PRICE_RECOMMENDATION_GUIDANCE,
     STOCK_FIELD_GLOSSARY,
+    TRADE_DECISION_GUIDANCE,
+    format_horizon_period,
     to_json_value,
 )
 from trading_agent.domain.models import ResearchSnapshot
 
 
-def build_recommendation_prompt(snapshot: ResearchSnapshot) -> str:
+def build_recommendation_prompt(
+    snapshot: ResearchSnapshot,
+    horizon_days: Sequence[int] = DEFAULT_HORIZON_DAYS,
+) -> str:
     """후보 종목 전체에 대한 투자의견을 요청하는 프롬프트를 만든다."""
 
     snapshot_json = json.dumps(
         to_json_value(snapshot), ensure_ascii=False, indent=2, allow_nan=False
     )
+    horizon_period = format_horizon_period(horizon_days)
     return f"""계좌 잔고나 보유 여부와 무관하게,
 아래 후보 종목 각각의 투자의견을 내세요.
-투자 기간은 일봉 기준 2~8주 스윙입니다.
+투자 기간은 일봉 기준 {horizon_period} 스윙입니다.
 
 판단 규칙:
+{TRADE_DECISION_GUIDANCE}
 - stocks의 모든 종목에 대해 recommendations 항목을 정확히 하나씩 작성하세요.
   스냅샷에 없는 종목은 적지 마세요.
 - rating은 buy, hold, sell 중 하나입니다.

@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -27,7 +28,11 @@ from trading_agent.application.consensus_service import (
 )
 from trading_agent.application.model_tasks import DECISION_TASK, RECOMMENDATION_TASK
 from trading_agent.application.ports import MarketIndex
+from trading_agent.application.prompt_builder import build_decision_prompt
 from trading_agent.application.recommend_stocks import RecommendStocks
+from trading_agent.application.recommendation_prompt import (
+    build_recommendation_prompt,
+)
 from trading_agent.application.records import (
     DecisionCycleResult,
     RecommendationRunResult,
@@ -128,6 +133,9 @@ def create_runtime(
             stale_run_after=timedelta(seconds=settings.ledger.stale_run_after_seconds),
         ),
         clock=clock,
+        prompt_builder=partial(
+            build_decision_prompt, horizon_days=settings.recommendation.horizon_days
+        ),
         force=force,
     )
     return TradingAgentRuntime(cycle=cycle, gateway=gateway)
@@ -194,10 +202,19 @@ class BacktestScoreRuntime:
             f"{counts['completed_dates']}일, policy={scored.data['policy']}/"
             f"{scored.data['confidence_aggregation']}"
         )
-        for horizon in scored.data["horizons"]:
+        available_horizons = [int(value) for value in scored.data["horizons"]]
+        primary_horizons = self.use_case.options.primary_horizons
+        primary = [value for value in primary_horizons if value in available_horizons]
+        ordered_horizons = primary + [
+            value for value in available_horizons if value not in primary
+        ]
+        for horizon in ordered_horizons:
             metric = scored.data["sources"]["consensus"]["horizons"][str(horizon)]
+            label = (
+                f"{horizon}일" if horizon in primary_horizons else f"{horizon}일(참고)"
+            )
             print(
-                f"합의 {horizon}일: buy {metric['buy_n']}건, "
+                f"합의 {label}: buy {metric['buy_n']}건, "
                 f"buy xs 평균 {metric['buy_mean_xs']}, "
                 f"sell xs 평균 {metric['sell_mean_xs']}"
             )
@@ -327,6 +344,10 @@ def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRunti
             universe=codes,
             ledger=shared_ledger,
             clock=clock,
+            prompt_builder=partial(
+                build_recommendation_prompt,
+                horizon_days=settings.recommendation.horizon_days,
+            ),
             price_guard_policy=_price_guard_policy(settings),
         )
 
@@ -384,6 +405,7 @@ def create_backtest_score_runtime(
     gateway.client = cache  # type: ignore[assignment]
     options = BacktestScoreOptions(
         horizons=args.horizons,
+        primary_horizons=tuple(settings.recommendation.horizon_days),
         policy=ConsensusPolicyName(args.policy) if args.policy else None,
         confidence_aggregation=(
             ConfidenceAggregation(args.confidence_aggregation)
@@ -396,7 +418,12 @@ def create_backtest_score_runtime(
         hold_bands=args.hold_bands,
     )
     use_case = ScoreBacktest(result_store, gateway, options)
-    return BacktestScoreRuntime(use_case, gateway, output_json, output_markdown)
+    return BacktestScoreRuntime(
+        use_case,
+        gateway,
+        output_json,
+        output_markdown,
+    )
 
 
 def create_recommendation_runtime(
@@ -423,6 +450,10 @@ def create_recommendation_runtime(
             stale_run_after=timedelta(seconds=settings.ledger.stale_run_after_seconds),
         ),
         clock=clock,
+        prompt_builder=partial(
+            build_recommendation_prompt,
+            horizon_days=settings.recommendation.horizon_days,
+        ),
         price_guard_policy=_price_guard_policy(settings),
     )
     return RecommendationRuntime(use_case=use_case, gateway=gateway)

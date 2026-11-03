@@ -1,6 +1,7 @@
 """스냅샷과 리스크 정책을 모델 판단 프롬프트로 직렬화한다."""
 
 import json
+from collections.abc import Sequence
 from dataclasses import fields, is_dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -9,6 +10,10 @@ from typing import Any
 
 from trading_agent.domain.models import MarketSnapshot
 from trading_agent.domain.risk import RiskPolicy
+
+DEFAULT_HORIZON_DAYS = (10, 20)
+OVERHEAT_RSI_THRESHOLD = 80
+CHASE_BUY_RETURN_5D_THRESHOLD_PERCENT = 10
 
 MODEL_SYSTEM_PROMPT = """당신은 한국 주식의 일봉 기반 스윙 투자 판단 보조자입니다.
 사용자 메시지의 지침과 스냅샷 데이터만 근거로 판단합니다.
@@ -65,8 +70,48 @@ CONFIDENCE_SCALE_GUIDANCE = """- confidence는 0~1 사이의 판단 자체에 �
   0.9 이상은 거의 확실한 경우로 드물게 사용하세요.
   hold의 confidence도 매수·매도하지 않기로 한 판단 자체의 확신도입니다."""
 
+TRADE_DECISION_GUIDANCE = f"""- stocks[].rsi가 {OVERHEAT_RSI_THRESHOLD} 이상이거나
+  stocks[].ma20_deviation_percent 또는 stocks[].ma60_deviation_percent의 이격이
+  크다는 이유만으로 sell하지 마세요. 강한 추세에서는 과열이 오래 지속될 수 있습니다.
+- sell은 다음 추세 훼손 신호 중 하나 이상이 함께 확인될 때만 내세요:
+  stocks[].macd가 stocks[].macd_signal_value를 하향 교차해 stocks[].macd_signal이
+  sell로 표시되는 경우, stocks[].ma20_deviation_percent가 0 미만인 종가의 20일선
+  이탈, 또는 stocks[].change_percent가 0 미만이면서
+  stocks[].volume_change_percent가 0 초과인 거래량 증가 동반 하락.
+- stocks[].return_5d_percent가 {CHASE_BUY_RETURN_5D_THRESHOLD_PERCENT}% 이상인
+  급등 직후에는 추격 매수 위험이 큽니다. 눌림 후 지지 확인이나 거래량 동반 돌파처럼
+  별도의 매수 근거가 하나 더 있을 때만 buy하세요."""
 
-def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
+
+def format_horizon_period(horizon_days: Sequence[int] = DEFAULT_HORIZON_DAYS) -> str:
+    """거래일 horizon 목록을 사람이 읽는 투자 기간으로 바꾼다."""
+
+    values = tuple(horizon_days)
+    if (
+        not values
+        or any(type(value) is not int or value <= 0 for value in values)
+        or values != tuple(sorted(values))
+        or len(values) != len(set(values))
+    ):
+        raise ValueError(
+            "horizon_days는 오름차순의 중복 없는 양의 정수 목록이어야 합니다."
+        )
+    if len(values) == 1:
+        return f"{values[0]}거래일"
+
+    def weeks(days: int) -> str:
+        return format(Decimal(days) / Decimal(5), "f").rstrip("0").rstrip(".")
+
+    return (
+        f"{values[0]}~{values[-1]}거래일(약 {weeks(values[0])}~{weeks(values[-1])}주)"
+    )
+
+
+def build_decision_prompt(
+    snapshot: MarketSnapshot,
+    policy: RiskPolicy,
+    horizon_days: Sequence[int] = DEFAULT_HORIZON_DAYS,
+) -> str:
     """한국어 지침과 손실 없는 JSON 요약을 포함한 프롬프트를 만든다."""
 
     snapshot_json = json.dumps(
@@ -106,7 +151,9 @@ def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
         for position in snapshot.account.positions
         if position.quantity > 0
     ]
+    horizon_period = format_horizon_period(horizon_days)
     return f"""당신은 일봉 기반 스윙 매매 판단 보조자입니다.
+투자 기간은 일봉 기준 {horizon_period} 스윙입니다.
 
 판단 규칙:
 - 입력 스냅샷에 있는 종목만 제안하세요.
@@ -115,7 +162,8 @@ def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
 - 보유하지 않은 종목은 SELL로 제안하지 마세요. 현재 보유 종목 코드는 {held_codes}입니다.
 - 현금, 허용 종목, 주문 금액·종목 비중·최소 확신도 정책을 지키세요.
 - 손절·익절·비중 초과 축소는 시스템 규칙이 자동 처리하므로 같은 매도를 제안하지 마세요.
-- 확신이 낮으면 buy·sell 대신 hold로 적으세요.
+- 과열·급등 및 추세 훼손 판단에는 아래 공통 매매 원칙을 먼저 적용하세요.
+- 매매 근거가 약하거나 판단 확신이 낮으면 buy·sell 대신 hold로 적으세요.
 - 필요한데 제공되지 않은 데이터는 missing_info에 적으세요.
 - snapshot.missing에 이미 있는 항목은 missing_info에 다시 적지 마세요.
 - 각 제안의 confidence는 아래 공통 척도를 따르세요.
@@ -123,6 +171,9 @@ def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
 
 확신도 척도:
 {CONFIDENCE_SCALE_GUIDANCE}
+
+공통 매매 원칙:
+{TRADE_DECISION_GUIDANCE}
 
 리스크 정책:
 {json.dumps(risk_policy, ensure_ascii=False, indent=2)}

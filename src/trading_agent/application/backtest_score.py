@@ -64,6 +64,7 @@ class BacktestScoreOptions:
     """백테스트 채점과 재채점 옵션."""
 
     horizons: tuple[int, ...] | None = None
+    primary_horizons: tuple[int, ...] = ()
     policy: ConsensusPolicyName | None = None
     confidence_aggregation: ConfidenceAggregation | None = None
     compare_policies: bool = False
@@ -265,7 +266,12 @@ class ScoreBacktest:
             "periods": period_results,
             "generated_at": self.now.isoformat(),
         }
-        return BacktestScoreResult(result_data, render_score_markdown(result_data))
+        return BacktestScoreResult(
+            result_data,
+            render_score_markdown(
+                result_data, primary_horizons=self.options.primary_horizons
+            ),
+        )
 
     def _load_dates(
         self, date_names: Sequence[str]
@@ -666,13 +672,17 @@ def price_outcome(
     return "neither"
 
 
-def render_score_markdown(result: Mapping[str, Any]) -> str:
+def render_score_markdown(
+    result: Mapping[str, Any], primary_horizons: Sequence[int] = ()
+) -> str:
     """점수 JSON의 핵심 표와 해석 경고를 Markdown으로 만든다."""
 
     def row(*cells: Any) -> str:
         return "| " + " | ".join(str(cell) for cell in cells) + " |"
 
-    horizons = [str(value) for value in result.get("horizons", [])]
+    saved_horizons = [str(value) for value in result.get("horizons", [])]
+    primary = [str(value) for value in primary_horizons if str(value) in saved_horizons]
+    horizons = primary + [value for value in saved_horizons if value not in primary]
     counts = result.get("counts", {})
     lines = [
         "# 백테스트 채점 요약",
@@ -683,6 +693,8 @@ def render_score_markdown(result: Mapping[str, Any]) -> str:
         f"- 날짜: {counts.get('completed_dates', 0)} completed / "
         f"{counts.get('excluded_dates', 0)} 제외",
     ]
+    if primary:
+        lines.append(f"- 주요 horizon: {'·'.join(primary)}거래일 (그 외는 참고)")
     if result.get("memory_leak_warning"):
         lines.extend(
             [
@@ -784,7 +796,9 @@ def render_score_markdown(result: Mapping[str, Any]) -> str:
             row("---:", "---:", "---:", "---:", "---:", "---:"),
         ]
     )
-    for horizon, metric in result.get("base_rates", {}).items():
+    base_rates = result.get("base_rates", {})
+    for horizon in horizons:
+        metric = base_rates.get(horizon, {})
         lines.append(
             row(
                 horizon,

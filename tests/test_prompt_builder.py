@@ -2,7 +2,16 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from trading_agent.application.prompt_builder import build_decision_prompt
+import pytest
+
+from trading_agent.application.prompt_builder import (
+    CHASE_BUY_RETURN_5D_THRESHOLD_PERCENT,
+    DEFAULT_HORIZON_DAYS,
+    OVERHEAT_RSI_THRESHOLD,
+    TRADE_DECISION_GUIDANCE,
+    build_decision_prompt,
+    format_horizon_period,
+)
 from trading_agent.domain.models import (
     AccountSnapshot,
     MarketContext,
@@ -80,6 +89,20 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
     assert "0.5는 근거가 엇갈려 동전 던지기 수준" in prompt
     assert "0.7은 같은 근거로 10번 중 7번 맞을 수준" in prompt
     assert "hold의 confidence도 매수·매도하지 않기로 한 판단 자체" in prompt
+    assert "10~20거래일(약 2~4주)" in prompt
+    assert TRADE_DECISION_GUIDANCE in prompt
+    assert f"stocks[].rsi가 {OVERHEAT_RSI_THRESHOLD} 이상" in prompt
+    assert "stocks[].macd가 stocks[].macd_signal_value를 하향 교차" in prompt
+    assert "stocks[].macd_signal이" in prompt
+    assert "종가의 20일선 이탈" in " ".join(prompt.split())
+    assert "거래량 증가 동반 하락" in prompt
+    assert (
+        f"stocks[].return_5d_percent가 "
+        f"{CHASE_BUY_RETURN_5D_THRESHOLD_PERCENT}% 이상" in prompt
+    )
+    assert "매매 근거가 약하거나 판단 확신이 낮으면" in prompt
+    configured_prompt = build_decision_prompt(snapshot, policy, horizon_days=[5, 15])
+    assert "5~15거래일(약 1~3주)" in configured_prompt
 
 
 def test_recommendation_prompt_asks_for_every_stock_without_account() -> None:
@@ -126,3 +149,28 @@ def test_recommendation_prompt_asks_for_every_stock_without_account() -> None:
     assert "as_of_trading_date" in prompt
     assert "0.5는 근거가 엇갈려 동전 던지기 수준" in prompt
     assert "hold의 confidence도 매수·매도하지 않기로 한 판단 자체" in prompt
+    assert "10~20거래일(약 2~4주)" in prompt
+    assert TRADE_DECISION_GUIDANCE in prompt
+    assert f"stocks[].rsi가 {OVERHEAT_RSI_THRESHOLD} 이상" in prompt
+    assert "stocks[].macd가 stocks[].macd_signal_value를 하향 교차" in prompt
+    assert "stocks[].macd_signal이" in prompt
+    assert "종가의 20일선 이탈" in " ".join(prompt.split())
+    assert "거래량 증가 동반 하락" in prompt
+    assert (
+        f"stocks[].return_5d_percent가 "
+        f"{CHASE_BUY_RETURN_5D_THRESHOLD_PERCENT}% 이상" in prompt
+    )
+    configured_prompt = build_recommendation_prompt(snapshot, horizon_days=[10])
+    assert "10거래일 스윙" in configured_prompt
+
+
+def test_horizon_period_uses_trading_day_range() -> None:
+    assert DEFAULT_HORIZON_DAYS == (10, 20)
+    assert format_horizon_period([10, 20]) == "10~20거래일(약 2~4주)"
+    assert format_horizon_period([10]) == "10거래일"
+
+
+@pytest.mark.parametrize("horizon_days", [[], [0], [20, 10], [10, 10], [True]])
+def test_horizon_period_rejects_invalid_values(horizon_days: list[object]) -> None:
+    with pytest.raises(ValueError, match="horizon_days"):
+        format_horizon_period(horizon_days)

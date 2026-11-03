@@ -89,6 +89,33 @@ def test_missing_default_config_uses_builtin_defaults(
     assert settings.risk.take_profit_sell_fraction == 0.5
 
 
+def test_recommendation_horizon_defaults_and_environment_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("{}\n", encoding="utf-8")
+
+    settings = load_settings(config_file)
+    assert settings.recommendation.horizon_days == [10, 20]
+
+    monkeypatch.setenv("TRADING_AGENT__RECOMMENDATION__HORIZON_DAYS", "[5, 15]")
+    settings = load_settings(config_file)
+    assert settings.recommendation.horizon_days == [5, 15]
+
+
+@pytest.mark.parametrize(
+    "horizon_days",
+    [[], [0], [-1], [20, 10], [10, 10], [True], [10.5]],
+)
+def test_recommendation_horizon_rejects_invalid_values(
+    horizon_days: list[object],
+) -> None:
+    from trading_agent.infrastructure.config import RecommendationSettings
+
+    with pytest.raises(ValidationError):
+        RecommendationSettings(horizon_days=horizon_days)
+
+
 def test_market_indicator_timeout_override_uses_default_when_missing() -> None:
     settings = TradingApiSettings(
         timeout_seconds=10,

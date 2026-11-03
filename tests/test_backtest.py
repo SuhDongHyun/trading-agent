@@ -37,13 +37,17 @@ from trading_agent.application.snapshot_builder import (
     SnapshotBuilder,
 )
 from trading_agent.domain.models import (
+    AccountSnapshot,
     Action,
     MarketContext,
+    MarketSnapshot,
     ResearchSnapshot,
     StockSnapshot,
 )
 from trading_agent.domain.recommendation import ModelRecommendation, StockRecommendation
+from trading_agent.domain.risk import RiskPolicy
 from trading_agent.infrastructure.backtest_result_store import FileBacktestResultStore
+from trading_agent.infrastructure.config import load_settings
 from trading_agent.infrastructure.point_in_time_gateway import (
     PointInTimeGateway,
     SharedDailyCache,
@@ -923,6 +927,89 @@ def test_backtest_runtime_rejects_operating_database_before_gateway_creation(
     monkeypatch.setattr(bootstrap, "TradingApiMarketDataGateway", unexpected_gateway)
     with pytest.raises(ValueError, match="ledger.db_path"):
         bootstrap.create_backtest_runtime(settings, args)
+
+
+def test_configured_horizon_reaches_run_recommend_and_backtest_prompts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from trading_agent.interface.bootstrap import (
+        create_backtest_runtime,
+        create_recommendation_runtime,
+        create_runtime,
+    )
+
+    for name in (
+        "TRADING_AGENT__RECOMMENDATION__HORIZON_DAYS",
+        "TRADING_AGENT__RECOMMENDATION__UNIVERSE",
+        "TRADING_AGENT__LEDGER__DB_PATH",
+        "TRADING_AGENT__WATCHLIST",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    config_file = tmp_path / "agent.yaml"
+    config_file.write_text(
+        f"recommendation:\n  universe: ['005930']\n  horizon_days: [5, 15]\n"
+        f"ledger:\n  db_path: {tmp_path / 'agent.sqlite'}\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(config_file)
+    created_at = datetime(2026, 11, 4)
+    market_snapshot = MarketSnapshot(
+        created_at=created_at,
+        account=AccountSnapshot(Decimal("100000"), []),
+        stocks=[],
+        market_context=MarketContext(),
+        missing=[],
+    )
+    research_snapshot = ResearchSnapshot(
+        created_at=created_at,
+        stocks=[],
+        market_context=MarketContext(),
+        missing=[],
+    )
+
+    run_runtime = create_runtime(settings, db_path=tmp_path / "run.sqlite")
+    try:
+        run_prompt = run_runtime.cycle.prompt_builder(
+            market_snapshot,
+            RiskPolicy(max_position_weight=Decimal("0.2")),
+        )
+        assert "5~15거래일(약 1~3주)" in run_prompt
+    finally:
+        run_runtime.close()
+
+    recommendation_runtime = create_recommendation_runtime(
+        settings, db_path=tmp_path / "recommend.sqlite"
+    )
+    try:
+        recommend_prompt = recommendation_runtime.use_case.prompt_builder(
+            research_snapshot
+        )
+        assert "5~15거래일(약 1~3주)" in recommend_prompt
+    finally:
+        recommendation_runtime.close()
+
+    args = build_parser().parse_args(
+        [
+            "backtest",
+            "run",
+            "--snapshot-only",
+            "--out",
+            str(tmp_path / "backtest-out"),
+            "--db",
+            str(tmp_path / "backtest.sqlite"),
+            "--cache-dir",
+            str(tmp_path / "backtest-cache"),
+        ]
+    )
+    backtest_runtime = create_backtest_runtime(settings, args)
+    try:
+        recommendation = backtest_runtime.use_case.recommendation_factory(
+            object(), ["005930"], lambda: created_at, None
+        )
+        backtest_prompt = recommendation.prompt_builder(research_snapshot)
+        assert "5~15거래일(약 1~3주)" in backtest_prompt
+    finally:
+        backtest_runtime.close()
 
 
 def test_backtest_cli_prints_runtime_error_detail_and_closes_runtime(
