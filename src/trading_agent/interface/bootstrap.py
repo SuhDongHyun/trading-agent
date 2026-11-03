@@ -124,7 +124,13 @@ def create_runtime(
         take_profit_sell_fraction=Decimal(str(settings.risk.take_profit_sell_fraction)),
     )
     cycle = RunDecisionCycle(
-        snapshot_builder=SnapshotBuilder(gateway, settings.watchlist, clock=clock),
+        snapshot_builder=SnapshotBuilder(
+            gateway,
+            settings.watchlist,
+            clock=clock,
+            news_limit=settings.snapshot.news_limit,
+            news_lookback_trading_days=settings.snapshot.news_lookback_trading_days,
+        ),
         consensus_service=consensus_service,
         risk_policy=risk_policy,
         watchlist=settings.watchlist,
@@ -313,7 +319,13 @@ def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRunti
         clock: Any,
         mapping: Any,
     ) -> Any:
-        builder = SnapshotBuilder(point_gateway, codes, clock=clock)
+        builder = SnapshotBuilder(
+            point_gateway,
+            codes,
+            clock=clock,
+            news_limit=settings.snapshot.news_limit,
+            news_lookback_trading_days=settings.snapshot.news_lookback_trading_days,
+        )
         return MaskedSnapshotProvider(builder, mapping) if mapping else builder
 
     def recommendation_factory(
@@ -446,7 +458,13 @@ def create_recommendation_runtime(
         confidence_aggregation=settings.consensus.confidence_aggregation,
     )
     use_case = RecommendStocks(
-        snapshot_builder=SnapshotBuilder(gateway, settings.watchlist, clock=clock),
+        snapshot_builder=SnapshotBuilder(
+            gateway,
+            settings.watchlist,
+            clock=clock,
+            news_limit=settings.snapshot.news_limit,
+            news_lookback_trading_days=settings.snapshot.news_lookback_trading_days,
+        ),
         consensus_service=service,
         universe=settings.recommendation_universe,
         ledger=SQLiteDecisionLedger(

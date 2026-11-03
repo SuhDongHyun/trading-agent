@@ -3,7 +3,7 @@
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, time, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from functools import partial
 from zoneinfo import ZoneInfo
 
@@ -21,8 +21,10 @@ from trading_agent.application.ports import (
 )
 from trading_agent.domain.models import (
     AccountSnapshot,
+    DataBasis,
     MarketContext,
     MarketSnapshot,
+    NewsSnapshotItem,
     Position,
     ResearchSnapshot,
     StockSnapshot,
@@ -45,7 +47,9 @@ REALIZED_VOLATILITY_WINDOW = 20
 PRICE_RANGE_WINDOW = 20
 WEEK_52_TRADING_DAYS = 252
 DEFAULT_NEWS_LIMIT = 5
+DEFAULT_NEWS_LOOKBACK_TRADING_DAYS = 3
 MARKET_TIMEZONE = ZoneInfo("Asia/Seoul")
+MARKET_CLOSE_TIME = time(15, 30)
 
 
 def calculate_return_percent(closes: Sequence[Decimal], periods: int) -> Decimal | None:
@@ -308,13 +312,25 @@ class SnapshotBuilder:
         watchlist: Sequence[str],
         clock: Callable[[], datetime] = _seoul_now,
         news_limit: int = DEFAULT_NEWS_LIMIT,
+        news_lookback_trading_days: int = DEFAULT_NEWS_LOOKBACK_TRADING_DAYS,
     ) -> None:
-        if news_limit <= 0:
-            raise ValueError("news_limit는 0보다 커야 합니다.")
+        if (
+            isinstance(news_limit, bool)
+            or not isinstance(news_limit, int)
+            or not 1 <= news_limit <= 20
+        ):
+            raise ValueError("news_limit는 1~20이어야 합니다.")
+        if (
+            isinstance(news_lookback_trading_days, bool)
+            or not isinstance(news_lookback_trading_days, int)
+            or not 1 <= news_lookback_trading_days <= 10
+        ):
+            raise ValueError("news_lookback_trading_days는 1~10이어야 합니다.")
         self.gateway = gateway
         self.watchlist = tuple(watchlist)
         self.clock = clock
         self.news_limit = news_limit
+        self.news_lookback_trading_days = news_lookback_trading_days
 
     def build(self) -> MarketSnapshot:
         """필수 데이터가 있으면 스냅샷을 만들고 보조 실패는 기록한다."""
@@ -339,6 +355,7 @@ class SnapshotBuilder:
             self._build_stock(
                 code,
                 quotes[code],
+                now,
                 daily_start_date,
                 indicator_start_date,
                 end_date,
@@ -364,6 +381,7 @@ class SnapshotBuilder:
             missing=missing,
             as_of_trading_date=as_of_trading_date,
             market_session=_market_session(now, as_of_trading_date, missing),
+            data_basis=_data_basis(self.news_lookback_trading_days),
         )
 
     def build_research(self, codes: Sequence[str]) -> ResearchSnapshot:
@@ -395,6 +413,7 @@ class SnapshotBuilder:
             self._build_stock(
                 code,
                 quote,
+                now,
                 daily_start_date,
                 indicator_start_date,
                 end_date,
@@ -419,6 +438,7 @@ class SnapshotBuilder:
             missing=missing,
             as_of_trading_date=as_of_trading_date,
             market_session=_market_session(now, as_of_trading_date, missing),
+            data_basis=_data_basis(self.news_lookback_trading_days),
         )
 
     def _lookback_window(self) -> tuple[datetime, str, str, str, str, str]:
@@ -454,6 +474,7 @@ class SnapshotBuilder:
         self,
         code: str,
         quote: StockQuote,
+        created_at: datetime,
         daily_start_date: str,
         indicator_start_date: str,
         end_date: str,
@@ -525,7 +546,14 @@ class SnapshotBuilder:
         if not sorted_daily:
             _mark_missing(f"{code}:daily", missing, "empty")
         latest_daily_date = sorted_daily[-1].date if sorted_daily else None
-        news_dates = list(dict.fromkeys((end_date, latest_daily_date)))
+        trading_dates = list(
+            dict.fromkeys(bar.date for bar in sorted_daily if bar.date < end_date)
+        )
+        news_dates = list(
+            dict.fromkeys(
+                [end_date, *reversed(trading_dates[-self.news_lookback_trading_days :])]
+            )
+        )
         news_items = []
         for search_date in news_dates:
             if search_date is None:
@@ -539,7 +567,12 @@ class SnapshotBuilder:
                 failure_detail=search_date,
             )
             news_items.extend(items or [])
-        unique_news = _unique_news(news_items)
+        unique_news = _unique_news(
+            [
+                replace(item, published_at=_to_kst(item.published_at))
+                for item in news_items
+            ]
+        )
         if not unique_news:
             _mark_missing(f"{code}:news", missing, "empty")
         sorted_closes = [bar.close_price for bar in sorted_daily]
@@ -590,14 +623,18 @@ class SnapshotBuilder:
             )
         latest_ma20 = ma20.value if ma20 else None
         latest_ma60 = ma60.value if ma60 else None
-        headlines = None
-        if unique_news:
-            headlines = [
-                item.title
-                for item in sorted(
-                    unique_news, key=lambda item: item.published_at, reverse=True
-                )[: self.news_limit]
-            ]
+        news = [
+            NewsSnapshotItem(
+                title=item.title,
+                source=item.source,
+                published_at=item.published_at,
+                age_hours=_age_hours(created_at, item.published_at),
+                after_close=(
+                    item.published_at.timetz().replace(tzinfo=None) > MARKET_CLOSE_TIME
+                ),
+            )
+            for item in unique_news[: self.news_limit]
+        ]
 
         stock = StockSnapshot(
             code=code,
@@ -624,7 +661,7 @@ class SnapshotBuilder:
             low_20d_distance_percent=low_20d_distance,
             high_52w_position_percent=high_52w_position,
             high_52w_period_trading_days=high_52w_days,
-            news_headlines=headlines,
+            news=news,
             industry=quote.industry,
         )
         return stock, latest_daily_date
@@ -1003,7 +1040,7 @@ def _market_session(
         and not has_daily_request_failure(missing)
     ):
         return "holiday"
-    if local_now.time() < time(15, 30):
+    if local_now.time() < MARKET_CLOSE_TIME:
         return "open"
     return "closed"
 
@@ -1024,6 +1061,39 @@ def _unique_news(news: Sequence[NewsItem]) -> list[NewsItem]:
             seen_titles.add(title)
         unique.append(item)
     return unique
+
+
+def _to_kst(value: datetime) -> datetime:
+    """timezone-naive 기사는 KST로 보고 모든 게시 시각을 KST로 정규화한다."""
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=MARKET_TIMEZONE)
+    return value.astimezone(MARKET_TIMEZONE)
+
+
+def _age_hours(created_at: datetime, published_at: datetime) -> float:
+    """스냅샷 생성 시각과 게시 시각 사이의 경과 시간을 소수 첫째 자리로 계산한다."""
+
+    seconds = Decimal(str((created_at - published_at).total_seconds()))
+    return float(
+        (seconds / Decimal(3600)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    )
+
+
+def _data_basis(news_lookback_trading_days: int) -> DataBasis:
+    """지표 계산에 사용한 코드 상수와 가격 기준을 스냅샷에 기록한다."""
+
+    return DataBasis(
+        price_basis="adjusted",
+        rsi=RSI_WINDOW,
+        rsi_signal_ema=RSI_SIGNAL_WINDOW,
+        macd=(MACD_SHORT_WINDOW, MACD_LONG_WINDOW),
+        macd_signal_ema=MACD_SIGNAL_WINDOW,
+        ma=(MA_SHORT_WINDOW, MA_LONG_WINDOW),
+        atr=ATR_WINDOW,
+        realized_volatility=REALIZED_VOLATILITY_WINDOW,
+        news_lookback_trading_days=news_lookback_trading_days,
+    )
 
 
 def _mark_missing(

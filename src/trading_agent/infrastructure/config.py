@@ -150,6 +150,22 @@ class RecommendationSettings(BaseModel):
         return values
 
 
+class SnapshotSettings(BaseModel):
+    """스냅샷 뉴스 수집 범위와 프롬프트 항목 수."""
+
+    news_lookback_trading_days: int = Field(default=3, ge=1, le=10)
+    news_limit: int = Field(default=5, ge=1, le=20)
+
+    @field_validator("news_lookback_trading_days", "news_limit", mode="before")
+    @classmethod
+    def reject_non_integer_news_settings(cls, value: Any) -> Any:
+        """boolean과 실수는 거부하면서 정수형 환경변수 문자열은 허용한다."""
+
+        if isinstance(value, (bool, float)):
+            raise ValueError("뉴스 설정은 정수여야 합니다.")
+        return value
+
+
 class ConsensusSettings(BaseModel):
     """합의 정책과 확신도 집계 설정."""
 
@@ -184,6 +200,7 @@ class AgentSettings(BaseSettings):
     recommendation: RecommendationSettings = Field(
         default_factory=RecommendationSettings
     )
+    snapshot: SnapshotSettings = Field(default_factory=SnapshotSettings)
     consensus: ConsensusSettings = Field(default_factory=ConsensusSettings)
     price_guard: PriceGuardSettings = Field(default_factory=PriceGuardSettings)
     ledger: LedgerSettings = Field(default_factory=LedgerSettings)

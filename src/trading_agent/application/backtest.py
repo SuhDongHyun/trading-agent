@@ -297,7 +297,7 @@ def mask_snapshot(snapshot: ResearchSnapshot, mapping: MaskingMap) -> ResearchSn
             current_price=mapping.scale(stock.code, stock.current_price),
             macd=mapping.scale(stock.code, stock.macd),
             macd_signal_value=mapping.scale(stock.code, stock.macd_signal_value),
-            news_headlines=None,
+            news=[],
         )
         for stock in snapshot.stocks
     ]

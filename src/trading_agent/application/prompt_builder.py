@@ -49,7 +49,18 @@ STOCK_FIELD_GLOSSARY = """- stocks[].code/name: 종목 코드와 이름.
   현재가가 차지하는 위치(%)입니다. 저가가 0%, 고가가 100%이며
   high_52w_period_trading_days가 실제 계산에 사용한 거래일 수입니다.
 - market_session이 open이면 최신 일봉에 당일 미완성 봉이 포함될 수 있습니다.
-- stocks[].news_headlines: 최근 뉴스 제목."""
+- stocks[].news: 조회 기간 안에 게시된 최신 뉴스 항목 목록입니다.
+  각 항목은 title, source, published_at(KST ISO 시각), age_hours(스냅샷 생성 시각 기준
+  경과 시간, 소수 첫째 자리), after_close를 포함합니다. after_close는
+  15:30 KST 뒤 게시된
+  기사이며 다음 거래일 판단에 반영될 수 있습니다.
+- data_basis.price_basis: 가격 지표의 기준이며 adjusted는 수정주가를 뜻합니다.
+- data_basis.rsi/rsi_signal_ema: RSI와 RSI 신호 EMA 계산 기간(거래일).
+- data_basis.macd/macd_signal_ema: MACD 단기·장기 기간과 신호 EMA 기간(거래일).
+- data_basis.ma: 단기·장기 이동평균 계산 기간(거래일).
+- data_basis.atr/realized_volatility: ATR과 실현 변동성 계산 기간(거래일).
+- data_basis.news_lookback_trading_days: 오늘 날짜 외에 뉴스 검색에 포함한 이전 일봉
+  거래일 수."""
 
 PRICE_RECOMMENDATION_GUIDANCE = """가격 위험 규칙:
 - ATR 금액은 현재가 × atr14_percent ÷ 100으로 계산하세요.

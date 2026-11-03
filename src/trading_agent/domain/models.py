@@ -2,7 +2,7 @@
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -122,6 +122,32 @@ class AccountSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class NewsSnapshotItem:
+    """프롬프트에 전달하는 뉴스 기사와 시점 정보."""
+
+    title: str
+    source: str
+    published_at: datetime
+    age_hours: float
+    after_close: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DataBasis:
+    """스냅샷 가격 기준과 지표 계산 기간."""
+
+    price_basis: str
+    rsi: int
+    rsi_signal_ema: int
+    macd: tuple[int, int]
+    macd_signal_ema: int
+    ma: tuple[int, int]
+    atr: int
+    realized_volatility: int
+    news_lookback_trading_days: int
+
+
+@dataclass(frozen=True, slots=True)
 class StockSnapshot:
     """한 종목의 시세·지표·뉴스와 상대강도 요약."""
 
@@ -145,7 +171,7 @@ class StockSnapshot:
     low_20d_distance_percent: Decimal | None = None
     high_52w_position_percent: Decimal | None = None
     high_52w_period_trading_days: int | None = None
-    news_headlines: list[str] | None = None
+    news: list[NewsSnapshotItem] = field(default_factory=list)
     industry: str | None = None
     relative_strength_5d_percent: Decimal | None = None
     relative_strength_20d_percent: Decimal | None = None
@@ -183,8 +209,7 @@ class StockSnapshot:
             or self.high_52w_period_trading_days <= 0
         ):
             raise DomainError("52주 위치 계산 거래일 수는 양의 정수여야 합니다.")
-        if self.news_headlines is not None:
-            object.__setattr__(self, "news_headlines", list(self.news_headlines))
+        object.__setattr__(self, "news", list(self.news))
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +272,7 @@ class MarketSnapshot:
     missing: list[str]
     as_of_trading_date: str | None = None
     market_session: str = "closed"
+    data_basis: DataBasis | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stocks", list(self.stocks))
@@ -263,6 +289,7 @@ class ResearchSnapshot:
     missing: list[str]
     as_of_trading_date: str | None = None
     market_session: str = "closed"
+    data_basis: DataBasis | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stocks", list(self.stocks))

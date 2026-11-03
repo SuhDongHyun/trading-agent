@@ -4,7 +4,11 @@ import pytest
 from pydantic import ValidationError
 
 from trading_agent.domain.models import ConfidenceAggregation, ConsensusPolicyName
-from trading_agent.infrastructure.config import TradingApiSettings, load_settings
+from trading_agent.infrastructure.config import (
+    SnapshotSettings,
+    TradingApiSettings,
+    load_settings,
+)
 
 
 def test_yaml_settings_are_loaded(tmp_path: Path) -> None:
@@ -98,6 +102,8 @@ def test_recommendation_horizon_defaults_and_environment_override(
     settings = load_settings(config_file)
     assert settings.recommendation.horizon_days == [10, 20]
     assert settings.recommendation.top_candidates == 5
+    assert settings.snapshot.news_lookback_trading_days == 3
+    assert settings.snapshot.news_limit == 5
 
     monkeypatch.setenv("TRADING_AGENT__RECOMMENDATION__HORIZON_DAYS", "[5, 15]")
     settings = load_settings(config_file)
@@ -123,6 +129,38 @@ def test_recommendation_top_candidates_must_be_positive(value: int) -> None:
 
     with pytest.raises(ValidationError):
         RecommendationSettings(top_candidates=value)
+
+
+def test_snapshot_news_settings_yaml_and_environment_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "snapshot:\n  news_lookback_trading_days: 4\n  news_limit: 8\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_file)
+    assert settings.snapshot.news_lookback_trading_days == 4
+    assert settings.snapshot.news_limit == 8
+
+    monkeypatch.setenv("TRADING_AGENT__SNAPSHOT__NEWS_LOOKBACK_TRADING_DAYS", "2")
+    monkeypatch.setenv("TRADING_AGENT__SNAPSHOT__NEWS_LIMIT", "12")
+    settings = load_settings(config_file)
+    assert settings.snapshot.news_lookback_trading_days == 2
+    assert settings.snapshot.news_limit == 12
+
+
+@pytest.mark.parametrize("value", [0, -1, 11, True, 5.5])
+def test_snapshot_news_lookback_must_be_one_to_ten_integer(value: object) -> None:
+    with pytest.raises(ValidationError):
+        SnapshotSettings(news_lookback_trading_days=value)
+
+
+@pytest.mark.parametrize("value", [0, 21, True, 5.5])
+def test_snapshot_news_limit_must_be_from_one_through_twenty(value: object) -> None:
+    with pytest.raises(ValidationError):
+        SnapshotSettings(news_limit=value)
 
 
 def test_market_indicator_timeout_override_uses_default_when_missing() -> None:

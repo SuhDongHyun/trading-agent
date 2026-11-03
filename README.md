@@ -64,6 +64,9 @@ recommendation:
   max_results: 5      # recommend 출력에 표시할 BUY 수
   top_candidates: 5   # score 기준 상대강도 후보 수
   horizon_days: [10, 20]  # 판단 기간: 오름차순의 양의 거래일 목록
+snapshot:
+  news_lookback_trading_days: 3  # 오늘 이전 일봉 거래일 수 (1~10)
+  news_limit: 5                  # 종목별 프롬프트 뉴스 수 (1~20)
 consensus:
   policy: buy_one_side       # strict 또는 buy_one_side
   confidence_aggregation: mean  # min 또는 mean
@@ -93,6 +96,20 @@ ledger:
 대신합니다. `TRADING_AGENT__CONSENSUS__POLICY`와
 `TRADING_AGENT__CONSENSUS__CONFIDENCE_AGGREGATION` 환경변수로 합의 설정을
 덮어쓸 수도 있습니다.
+
+스냅샷은 KST 오늘 날짜와 그 날짜보다 앞선 최근 `snapshot.news_lookback_trading_days`
+일봉 거래일 날짜로 종목 뉴스를 순차 조회합니다. 설정 범위는 1~10이며, 오늘 일봉이
+있어도 오늘 이전 거래일 N개를 고르므로 종목당 요청은 최대 N+1회입니다. 일봉이 없으면
+오늘 날짜만 조회합니다. 결과는 key 또는 제목이
+같은 기사를 합친 뒤 최신순으로 정렬하고 `snapshot.news_limit`개까지 프롬프트에 넣습니다.
+각 뉴스에는 제목, 출처, KST 게시 시각, 스냅샷 생성 시각부터의 경과 시간(시간 단위,
+소수 첫째 자리), 15:30 KST 뒤 게시 여부가 포함됩니다. 장 마감 뒤 기사는 다음 거래일
+판단에 반영될 수 있습니다. 환경변수 `TRADING_AGENT__SNAPSHOT__NEWS_LIMIT`과
+`TRADING_AGENT__SNAPSHOT__NEWS_LOOKBACK_TRADING_DAYS`로 설정을 덮어쓸 수 있습니다.
+
+프롬프트 스냅샷의 최상위 `data_basis`는 수정주가 여부와 코드에서 사용하는 RSI, MACD,
+이동평균, ATR, 실현 변동성 기간 및 뉴스 조회 거래일 수를 기록합니다. trading-api 일봉
+요청은 `adjusted_price: true`를 사용합니다.
 
 ### 추천 가격 가드 설정
 

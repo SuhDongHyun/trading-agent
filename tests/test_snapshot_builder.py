@@ -15,6 +15,17 @@ from trading_agent.application.ports import (
     TreasuryMaturity,
 )
 from trading_agent.application.snapshot_builder import (
+    ATR_WINDOW,
+    DEFAULT_NEWS_LIMIT,
+    DEFAULT_NEWS_LOOKBACK_TRADING_DAYS,
+    MA_LONG_WINDOW,
+    MA_SHORT_WINDOW,
+    MACD_LONG_WINDOW,
+    MACD_SHORT_WINDOW,
+    MACD_SIGNAL_WINDOW,
+    REALIZED_VOLATILITY_WINDOW,
+    RSI_SIGNAL_WINDOW,
+    RSI_WINDOW,
     SnapshotBuilder,
     calculate_20d_price_distances,
     calculate_52w_position,
@@ -252,7 +263,7 @@ def test_snapshot_builder_merges_watchlist_and_holdings_and_summarizes_data() ->
         Decimal(100) - Decimal(1)
     ) / Decimal(26) * Decimal(100)
     assert snapshot.stocks[0].high_52w_period_trading_days == 25
-    assert snapshot.stocks[0].news_headlines == [
+    assert [item.title for item in snapshot.stocks[0].news] == [
         "뉴스 0",
         "뉴스 1",
         "뉴스 2",
@@ -306,7 +317,7 @@ def test_snapshot_builder_continues_after_optional_data_failures() -> None:
 
     assert snapshot.stocks[0].current_price == Decimal("100")
     assert snapshot.stocks[0].return_5d_percent is None
-    assert snapshot.stocks[0].news_headlines is None
+    assert snapshot.stocks[0].news == []
     assert snapshot.market_context.volatility_index is None
     assert "005930:daily(unavailable)" in snapshot.missing
     assert "005930:news(20261029 unavailable)" in snapshot.missing
@@ -408,7 +419,7 @@ def test_snapshot_rate_triggers_rule_at_boundary_for_non_divisible_price(
     assert proposals[0].rule_type is expected_rule
 
 
-def test_research_fetches_news_for_today_and_latest_bar_and_deduplicates() -> None:
+def test_research_fetches_today_and_recent_daily_dates_and_deduplicates() -> None:
     gateway = FakeMarketDataGateway()
     gateway.news_by_date = {
         "20261029": [
@@ -436,6 +447,12 @@ def test_research_fetches_news_for_today_and_latest_bar_and_deduplicates() -> No
             ),
             NewsItem("이전 기사", "source", datetime(2026, 10, 28, 9, tzinfo=UTC)),
         ],
+        "20261024": [
+            NewsItem("24일 기사", "source", datetime(2026, 10, 24, 12, tzinfo=UTC))
+        ],
+        "20261023": [
+            NewsItem("23일 기사", "source", datetime(2026, 10, 23, 12, tzinfo=UTC))
+        ],
     }
     snapshot = SnapshotBuilder(
         gateway,
@@ -446,12 +463,15 @@ def test_research_fetches_news_for_today_and_latest_bar_and_deduplicates() -> No
     assert gateway.news_calls == [
         ("005930", "20261029"),
         ("005930", "20261025"),
+        ("005930", "20261024"),
+        ("005930", "20261023"),
     ]
-    assert snapshot.stocks[0].news_headlines == [
+    assert [item.title for item in snapshot.stocks[0].news] == [
         "반복 기사",
         "오늘 기사",
         "제목 중복",
         "이전 기사",
+        "24일 기사",
     ]
 
 
@@ -653,7 +673,7 @@ def test_news_failure_on_one_date_does_not_discard_other_date_results() -> None:
         clock=lambda: datetime(2026, 10, 29, 0, tzinfo=UTC),
     ).build_research(["005930"])
 
-    assert snapshot.stocks[0].news_headlines == ["이전 기사"]
+    assert [item.title for item in snapshot.stocks[0].news] == ["이전 기사"]
     assert snapshot.missing.count("005930:news(20261029 timeout)") == 1
 
 
@@ -672,6 +692,168 @@ def test_news_failures_keep_the_searched_date_and_each_failure_reason() -> None:
 
     assert "005930:news(20261029 timeout)" in snapshot.missing
     assert "005930:news(20261025 http 503)" in snapshot.missing
+
+
+@pytest.mark.parametrize(
+    ("created_at", "today"),
+    [
+        (datetime.fromisoformat("2026-10-29T11:00:00+09:00"), "20261029"),
+        (datetime.fromisoformat("2026-10-29T16:00:00+09:00"), "20261029"),
+        (datetime.fromisoformat("2026-10-31T10:00:00+09:00"), "20261031"),
+    ],
+)
+def test_news_dates_include_today_and_recent_available_bars(
+    created_at: datetime, today: str
+) -> None:
+    gateway = FakeMarketDataGateway()
+
+    SnapshotBuilder(gateway, [], clock=lambda: created_at).build_research(["005930"])
+
+    assert [date for _, date in gateway.news_calls] == [
+        today,
+        "20261025",
+        "20261024",
+        "20261023",
+    ]
+
+
+@pytest.mark.parametrize(
+    "created_at",
+    [
+        datetime.fromisoformat("2026-10-29T11:00:00+09:00"),
+        datetime.fromisoformat("2026-10-29T16:00:00+09:00"),
+    ],
+)
+def test_live_news_dates_include_today_and_n_previous_days_when_today_bar_exists(
+    created_at: datetime,
+) -> None:
+    class TodayAndPreviousBars(FakeMarketDataGateway):
+        def get_daily_bars(
+            self, code: str, start_date: str, end_date: str
+        ) -> list[DailyBar]:
+            return [
+                DailyBar(f"202610{day}", Decimal(day), day) for day in range(26, 30)
+            ]
+
+    gateway = TodayAndPreviousBars()
+
+    SnapshotBuilder(gateway, [], clock=lambda: created_at).build_research(["005930"])
+
+    assert [date for _, date in gateway.news_calls] == [
+        "20261029",
+        "20261028",
+        "20261027",
+        "20261026",
+    ]
+
+
+def test_news_dates_deduplicate_daily_rows_and_work_without_daily_bars() -> None:
+    class DuplicateDailyGateway(FakeMarketDataGateway):
+        def get_daily_bars(
+            self, code: str, start_date: str, end_date: str
+        ) -> list[DailyBar]:
+            return [
+                DailyBar("20261028", Decimal("100"), 1),
+                DailyBar("20261028", Decimal("101"), 2),
+                DailyBar("20261027", Decimal("99"), 3),
+            ]
+
+    now = datetime.fromisoformat("2026-10-29T10:00:00+09:00")
+    duplicate_gateway = DuplicateDailyGateway()
+    SnapshotBuilder(duplicate_gateway, [], clock=lambda: now).build_research(["005930"])
+    assert [date for _, date in duplicate_gateway.news_calls] == [
+        "20261029",
+        "20261028",
+        "20261027",
+    ]
+
+    no_bars = FakeMarketDataGateway({"daily"})
+    SnapshotBuilder(no_bars, [], clock=lambda: now).build_research(["005930"])
+    assert [date for _, date in no_bars.news_calls] == ["20261029"]
+
+
+def test_news_items_normalize_times_and_include_age_and_after_close() -> None:
+    gateway = FakeMarketDataGateway()
+    gateway.news_by_date["20261029"] = [
+        NewsItem(
+            "장 마감 시각",
+            "source",
+            datetime.fromisoformat("2026-10-29T06:30:00+00:00"),
+        ),
+        NewsItem("장 마감 뒤", "source", datetime(2026, 10, 29, 15, 31)),
+    ]
+    now = datetime.fromisoformat("2026-10-29T15:40:00+09:00")
+
+    snapshot = SnapshotBuilder(
+        gateway,
+        [],
+        clock=lambda: now,
+        news_lookback_trading_days=1,
+        news_limit=2,
+    ).build_research(["005930"])
+
+    assert [item.title for item in snapshot.stocks[0].news] == [
+        "장 마감 뒤",
+        "장 마감 시각",
+    ]
+    assert (
+        snapshot.stocks[0].news[0].published_at.isoformat()
+        == "2026-10-29T15:31:00+09:00"
+    )
+    assert snapshot.stocks[0].news[0].age_hours == 0.2
+    assert snapshot.stocks[0].news[0].after_close is True
+    assert (
+        snapshot.stocks[0].news[1].published_at.isoformat()
+        == "2026-10-29T15:30:00+09:00"
+    )
+    assert snapshot.stocks[0].news[1].age_hours == 0.2
+    assert snapshot.stocks[0].news[1].after_close is False
+
+
+def test_data_basis_matches_indicator_constants_and_news_settings() -> None:
+    builder = SnapshotBuilder(
+        FakeMarketDataGateway(),
+        [],
+        clock=lambda: datetime.fromisoformat("2026-10-29T10:00:00+09:00"),
+        news_lookback_trading_days=4,
+    )
+    snapshot = builder.build_research(["005930"])
+    market_snapshot = SnapshotBuilder(
+        FakeMarketDataGateway(),
+        ["005930"],
+        clock=lambda: datetime.fromisoformat("2026-10-29T10:00:00+09:00"),
+        news_lookback_trading_days=4,
+    ).build()
+
+    assert snapshot.data_basis is not None
+    assert snapshot.data_basis.price_basis == "adjusted"
+    assert snapshot.data_basis.rsi == RSI_WINDOW
+    assert snapshot.data_basis.rsi_signal_ema == RSI_SIGNAL_WINDOW
+    assert snapshot.data_basis.macd == (MACD_SHORT_WINDOW, MACD_LONG_WINDOW)
+    assert snapshot.data_basis.macd_signal_ema == MACD_SIGNAL_WINDOW
+    assert snapshot.data_basis.ma == (MA_SHORT_WINDOW, MA_LONG_WINDOW)
+    assert snapshot.data_basis.atr == ATR_WINDOW
+    assert snapshot.data_basis.realized_volatility == REALIZED_VOLATILITY_WINDOW
+    assert snapshot.data_basis.news_lookback_trading_days == 4
+    assert market_snapshot.data_basis == snapshot.data_basis
+    assert DEFAULT_NEWS_LOOKBACK_TRADING_DAYS == 3
+    assert DEFAULT_NEWS_LIMIT == 5
+
+
+@pytest.mark.parametrize(
+    ("news_limit", "news_lookback_trading_days"),
+    [(0, 3), (21, 3), (5, 0), (5, 11)],
+)
+def test_snapshot_builder_rejects_out_of_range_news_settings(
+    news_limit: int, news_lookback_trading_days: int
+) -> None:
+    with pytest.raises(ValueError):
+        SnapshotBuilder(
+            FakeMarketDataGateway(),
+            [],
+            news_limit=news_limit,
+            news_lookback_trading_days=news_lookback_trading_days,
+        )
 
 
 @pytest.mark.parametrize(
