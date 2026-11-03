@@ -1,7 +1,7 @@
 # trading-agent
 
-스냅샷을 수집하고 Claude와 Codex가 같은 판단에 합의한 경우에만 Risk Guard를
-통과시켜 기록하는 paper trading 1단계입니다. **실계좌 주문은 전송하지 않습니다.**
+스냅샷을 수집하고 Claude와 Codex의 의견을 합의 정책으로 판단한 뒤 Risk Guard를
+거쳐 기록하는 paper trading 1단계입니다. **실계좌 주문은 전송하지 않습니다.**
 
 ## 설치와 실행 전제
 
@@ -54,7 +54,7 @@ risk:
   max_position_weight: 0.2
   max_order_ratio: 0.1
   max_order_amount: 500000
-  min_confidence: 0.7
+  min_confidence: 0.6
   max_proposals_per_cycle: 5
   stop_loss_percent: 10
   take_profit_percent: 20
@@ -62,6 +62,9 @@ risk:
 recommendation:
   universe: []        # 비우면 watchlist를 추천 후보로 사용
   max_results: 5      # recommend 출력에 표시할 BUY 수
+consensus:
+  policy: buy_one_side       # strict 또는 buy_one_side
+  confidence_aggregation: mean  # min 또는 mean
 llm:
   claude:
     command: claude
@@ -80,6 +83,27 @@ ledger:
 환경변수는 `TRADING_AGENT__RISK__MAX_ORDER_AMOUNT`처럼 중첩 키를
 `__`로 구분합니다.
 
+`risk.min_confidence`를 `config.yaml`에 직접 적으면 해당 값이 코드 기본값을
+대신합니다. `TRADING_AGENT__CONSENSUS__POLICY`와
+`TRADING_AGENT__CONSENSUS__CONFIDENCE_AGGREGATION` 환경변수로 합의 설정을
+덮어쓸 수도 있습니다.
+
+## 합의 정책
+
+`consensus.policy`의 기본값은 `buy_one_side`입니다. `strict`는 두 모델의 유효
+동작이 같을 때만 매수·매도를 채택하는 기존 규칙입니다. `buy_one_side`는 한 모델이
+매수하고 다른 모델이 HOLD 또는 종목 응답 누락이면 매수를 채택합니다. 반대 모델이
+매도라면 불일치로 남기고, 매도는 두 모델 모두 매도일 때만 채택합니다. 두 모델의
+중복 응답은 어느 정책에서도 불일치입니다. 모델 하나가 실패하면 두 정책 모두
+fail-closed로 제안을 승인하지 않습니다.
+
+한쪽 매수 채택은 그 모델의 가격·수량·확신도를 그대로 사용합니다. 두 모델이
+동의하면 매수 가격은 낮은 값, 매도 가격은 높은 값, 수량은 낮은 값을 사용합니다.
+`consensus.confidence_aggregation` 기본값은 `mean`이며 두 모델이 동의한 항목의
+확신도를 평균합니다. `min`은 기존처럼 낮은 확신도를 사용합니다. 한쪽 매수에는
+매수 모델의 확신도를 사용합니다. 채택 항목의 `consensus_basis`는 `agreed`,
+`claude_only`, `codex_only`로 기록됩니다.
+
 ## 리스크 정책
 
 주문 금액 한도는 계좌 총자산의 `max_order_ratio` 비율로 계산합니다(기본값
@@ -92,6 +116,7 @@ ledger:
 | `max_position_weight` | `0.2` | 매수 후 한 종목이 총자산에서 차지할 수 있는 최대 비중 |
 | `max_order_ratio` | `0.1` | 1회 주문 금액의 총자산 비율 상한 (`0 < 값 ≤ 1`) |
 | `max_order_amount` | `null` | 선택적인 1회 주문 절대 금액 상한 |
+| `min_confidence` | `0.6` | Risk Guard 최소 확신도. `config.yaml`에 직접 적은 값이 우선 |
 | `stop_loss_percent` | `null` | 평균 매입가 대비 해당 하락률 이하이면 전량 매도 규칙을 평가 |
 | `take_profit_percent` | `null` | 평균 매입가 대비 해당 상승률 이상이면 일부 매도 규칙을 평가 |
 | `take_profit_sell_fraction` | `0.5` | 익절 시 매도할 보유 수량 비율 (`0 < 값 ≤ 1`, 내림 후 최소 1주) |
@@ -140,9 +165,10 @@ uv run trading-agent run --force
 한 사이클은 계좌·시장 스냅샷 수집, Claude와 Codex의 독립 판단, 일치 제안의
 합의, Risk Guard 검토, SQLite 기록 순서로 진행합니다. 두 모델은 스냅샷의 모든
 종목에 대해 `buy`/`sell`/`hold` 중 하나를 정확히 한 번 냅니다. 응답에서 빠진
-종목은 `hold`로 간주하므로 hold와 미응답은 같은 의견입니다. 유효 동작이 다른
-종목은 불일치(`action_mismatch`) 이력에 남기며, 한 모델이라도 실패하면 그 사이클은
-`model_failed`로 기록하고 제안을 승인하지 않습니다. 저장소는 기본적으로
+종목은 `hold`로 간주하므로 hold와 미응답은 같은 의견입니다. `buy_one_side`에서는
+매수와 HOLD/미응답 조합을 채택하고 근거에 두 모델 의견을 남깁니다. 채택되지 않은
+유효 동작 불일치는 불일치(`action_mismatch`) 이력에 남기며, 한 모델이라도 실패하면
+그 사이클은 `model_failed`로 기록하고 제안을 승인하지 않습니다. 저장소는 기본적으로
 `data/trading-agent.db`이며 필요한 부모 디렉터리를 만듭니다.
 
 스냅샷에는 가장 최근 일봉 날짜인 `as_of_trading_date`와 KST 기준
@@ -164,8 +190,10 @@ uv run trading-agent recommend --top 3 --db ./data/paper.sqlite
 계좌 잔고·보유 여부와 무관하게 `recommendation.universe`(비어 있으면 watchlist)
 종목마다 두 모델이 투자의견(`buy`/`hold`/`sell`), 확신도, 목표가,
 `invalidation_price`를 냅니다. buy의 `invalidation_price`는 손절가이고, sell에서는
-그 위로 오르면 매도 의견을 철회할 가격입니다. 의견이 같은 종목만 채택하고,
-확신도는 낮은 쪽, 가격은 보수적인 쪽을 씁니다(buy: 낮은 목표가·높은 손절가).
+그 위로 오르면 매도 의견을 철회할 가격입니다. 기본 `buy_one_side` 정책에서는 한
+모델의 buy와 다른 모델의 hold/미응답도 채택합니다. 동의한 의견의 확신도는 기본적으로
+평균, 가격은 보수적인 쪽을 씁니다(buy: 낮은 목표가·높은 손절가). 한쪽 buy는 그
+모델의 값과 확신도를 그대로 씁니다.
 sell의 목표가는 예상 하락 가격입니다. 출력 문구도 의견에 맞춰 표시합니다. 결과는
 BUY 확신도 순, SELL, HOLD,
 불일치 순서로 출력하고 `runs.kind = 'recommendation'`으로 기록합니다. 계좌를
@@ -202,13 +230,28 @@ WHERE approved = 1
   );
 ```
 
+최근 매매 합의의 정책, 집계 방식, 항목별 근거:
+
+```sql
+SELECT c.code, c.action, c.confidence, c.consensus_basis,
+       r.policy, r.confidence_aggregation
+FROM consensus_proposals AS c
+JOIN consensus_results AS r ON r.run_id = c.run_id
+WHERE c.run_id = (
+  SELECT id FROM runs WHERE kind = 'decision'
+  ORDER BY started_at DESC, id DESC LIMIT 1
+)
+ORDER BY c.proposal_index;
+```
+
 종목별 모델 불일치 이력:
 
 ```sql
-SELECT r.started_at, r.kind, d.code, d.reason_code,
+SELECT r.started_at, r.kind, d.code, d.reason_code, c.policy,
        d.claude_actions_json, d.codex_actions_json
 FROM consensus_disagreements AS d
 JOIN runs AS r ON r.id = d.run_id
+JOIN consensus_results AS c ON c.run_id = d.run_id
 WHERE r.kind = 'decision'
 ORDER BY r.started_at DESC, d.disagreement_index;
 ```
@@ -216,8 +259,10 @@ ORDER BY r.started_at DESC, d.disagreement_index;
 최근 추천 순위:
 
 ```sql
-SELECT c.rank, c.code, c.rating, c.confidence, c.target_price, c.invalidation_price
+SELECT c.rank, c.code, c.rating, c.confidence, c.consensus_basis,
+       c.target_price, c.invalidation_price, r.policy, r.confidence_aggregation
 FROM consensus_recommendations AS c
+JOIN consensus_results AS r ON r.run_id = c.run_id
 WHERE c.run_id = (
   SELECT id FROM runs WHERE kind = 'recommendation'
   ORDER BY started_at DESC, id DESC LIMIT 1
@@ -225,7 +270,9 @@ WHERE c.run_id = (
 ORDER BY c.rank;
 ```
 
-기존 v1·v2·v3 DB는 처음 열 때 v4로 자동 이전됩니다. 기존 리스크 판정에는
+기존 v1·v2·v3·v4 DB는 처음 열 때 v5로 자동 이전됩니다. 기존 합의 결과에는 당시
+동작인 `policy = 'strict'`, `confidence_aggregation = 'min'`, 항목 basis는
+`agreed`가 채워집니다. 기존 리스크 판정에는
 `source = 'consensus'`가 채워지고, 새 규칙 제안은 `source = 'rule'`과 규칙 종류를
 함께 기록합니다. 오래된 `running` 행은 DB를 열 때 `stale_run_after_seconds`
 (기본 3600초)보다 오래된 경우 `abandoned`로 정리합니다.

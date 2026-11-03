@@ -19,13 +19,17 @@ from trading_agent.application.records import (
     RecommendationRunResult,
 )
 from trading_agent.domain.consensus import Disagreement
-from trading_agent.domain.models import ModelDecision
+from trading_agent.domain.models import (
+    ConfidenceAggregation,
+    ConsensusPolicyName,
+    ModelDecision,
+)
 from trading_agent.domain.recommendation import (
     ModelRecommendation,
     StockRecommendation,
 )
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _RUN_KIND_DECISION = "decision"
 _RUN_KIND_RECOMMENDATION = "recommendation"
 
@@ -72,10 +76,33 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """합의 정책·집계 방식과 항목별 합의 근거를 기록한다."""
+
+    additions = {
+        "consensus_results": (
+            ("policy", "TEXT NOT NULL DEFAULT 'strict'"),
+            ("confidence_aggregation", "TEXT NOT NULL DEFAULT 'min'"),
+        ),
+        "consensus_proposals": (("consensus_basis", "TEXT NOT NULL DEFAULT 'agreed'"),),
+        "consensus_recommendations": (
+            ("consensus_basis", "TEXT NOT NULL DEFAULT 'agreed'"),
+        ),
+    }
+    for table, columns_to_add in additions.items():
+        columns = _table_columns(connection, table)
+        for name, definition in columns_to_add:
+            if columns and name not in columns:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                )
+
+
 _MIGRATIONS = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
+    4: _migrate_v4_to_v5,
 }
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS runs (
@@ -119,7 +146,9 @@ _SCHEMA = (
         summary TEXT NOT NULL,
         claude_summary TEXT NOT NULL,
         codex_summary TEXT NOT NULL,
-        missing_info_json TEXT NOT NULL
+        missing_info_json TEXT NOT NULL,
+        policy TEXT NOT NULL DEFAULT 'strict',
+        confidence_aggregation TEXT NOT NULL DEFAULT 'min'
     )""",
     """CREATE TABLE IF NOT EXISTS consensus_proposals (
         run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -130,6 +159,7 @@ _SCHEMA = (
         limit_price TEXT NOT NULL,
         confidence TEXT NOT NULL,
         reason TEXT NOT NULL,
+        consensus_basis TEXT NOT NULL DEFAULT 'agreed',
         PRIMARY KEY (run_id, proposal_index)
     )""",
     """CREATE TABLE IF NOT EXISTS consensus_disagreements (
@@ -181,6 +211,7 @@ _SCHEMA = (
         target_price TEXT,
         invalidation_price TEXT,
         reason TEXT NOT NULL,
+        consensus_basis TEXT NOT NULL DEFAULT 'agreed',
         PRIMARY KEY (run_id, rank)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_runs_recent ON runs(started_at DESC, id DESC)",
@@ -265,6 +296,8 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                 consensus.claude_summary,
                 consensus.codex_summary,
                 consensus.missing_info,
+                consensus.policy,
+                consensus.confidence_aggregation,
             )
             self._store_disagreements(
                 connection, result.run_id, consensus.disagreements
@@ -273,9 +306,16 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                 connection.execute(
                     """INSERT INTO consensus_recommendations
                        (run_id, rank, code, rating, confidence, target_price,
-                        invalidation_price, reason)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (result.run_id, rank, *_recommendation_values(item)),
+                        invalidation_price, reason, consensus_basis)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        result.run_id,
+                        rank,
+                        *_recommendation_values(item),
+                        item.consensus_basis.value
+                        if item.consensus_basis is not None
+                        else "agreed",
+                    ),
                 )
 
     def _start_run(self, kind: str, started_at: datetime) -> int:
@@ -467,19 +507,24 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
         claude_summary: str,
         codex_summary: str,
         missing_info: list[str],
+        policy: ConsensusPolicyName,
+        confidence_aggregation: ConfidenceAggregation,
     ) -> None:
         """두 모델 요약과 missing_info 합집합을 저장한다."""
 
         connection.execute(
             """INSERT INTO consensus_results
-               (run_id, summary, claude_summary, codex_summary, missing_info_json)
-               VALUES (?, ?, ?, ?, ?)""",
+               (run_id, summary, claude_summary, codex_summary, missing_info_json,
+                policy, confidence_aggregation)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 f"claude: {claude_summary}\ncodex: {codex_summary}",
                 claude_summary,
                 codex_summary,
                 _json(missing_info),
+                policy.value,
+                confidence_aggregation.value,
             ),
         )
 
@@ -524,13 +569,15 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
             consensus.claude_summary,
             consensus.codex_summary,
             consensus.missing_info,
+            consensus.policy,
+            consensus.confidence_aggregation,
         )
         for index, proposal in enumerate(consensus.proposals):
             connection.execute(
                 """INSERT INTO consensus_proposals
                    (run_id, proposal_index, code, action, quantity, limit_price,
-                    confidence, reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    confidence, reason, consensus_basis)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     index,
@@ -540,6 +587,9 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                     str(proposal.limit_price),
                     str(proposal.confidence),
                     proposal.reason,
+                    proposal.consensus_basis.value
+                    if proposal.consensus_basis is not None
+                    else "agreed",
                 ),
             )
         SQLiteDecisionLedger._store_disagreements(

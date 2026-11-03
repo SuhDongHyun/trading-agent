@@ -6,12 +6,17 @@ from decimal import Decimal
 
 from trading_agent.domain.consensus import (
     Disagreement,
-    find_disagreement,
+    aggregate_confidence,
+    consensus_reason,
     group_by_code,
+    resolve_consensus_actions,
 )
 from trading_agent.domain.errors import DomainError
 from trading_agent.domain.models import (
     Action,
+    ConfidenceAggregation,
+    ConsensusBasis,
+    ConsensusPolicyName,
     require_action,
     require_confidence,
     require_stock_code,
@@ -29,11 +34,18 @@ class StockRecommendation:
     target_price: Decimal | None
     invalidation_price: Decimal | None
     reason: str
+    consensus_basis: ConsensusBasis | None = None
 
     def __post_init__(self) -> None:
         require_stock_code(self.code)
         object.__setattr__(self, "rating", require_action(self.rating))
         object.__setattr__(self, "confidence", require_confidence(self.confidence))
+        if self.consensus_basis is not None:
+            try:
+                basis = ConsensusBasis(self.consensus_basis)
+            except (TypeError, ValueError) as error:
+                raise DomainError("합의 근거가 올바르지 않습니다.") from error
+            object.__setattr__(self, "consensus_basis", basis)
         for field_name in ("target_price", "invalidation_price"):
             value = getattr(self, field_name)
             if value is None:
@@ -67,6 +79,8 @@ class RecommendationConsensusResult:
     missing_info: list[str]
     claude_summary: str
     codex_summary: str
+    policy: ConsensusPolicyName = ConsensusPolicyName.STRICT
+    confidence_aggregation: ConfidenceAggregation = ConfidenceAggregation.MIN
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "recommendations", list(self.recommendations))
@@ -91,9 +105,15 @@ class RecommendationConsensusPolicy:
 
     @staticmethod
     def reconcile(
-        claude: ModelRecommendation, codex: ModelRecommendation
+        claude: ModelRecommendation,
+        codex: ModelRecommendation,
+        policy: ConsensusPolicyName = ConsensusPolicyName.STRICT,
+        confidence_aggregation: ConfidenceAggregation = ConfidenceAggregation.MIN,
     ) -> RecommendationConsensusResult:
         """종목 순서를 보존해 합의 의견과 불일치를 만든다."""
+
+        policy = ConsensusPolicyName(policy)
+        confidence_aggregation = ConfidenceAggregation(confidence_aggregation)
 
         claude_by_code = group_by_code(claude.recommendations)
         codex_by_code = group_by_code(codex.recommendations)
@@ -104,15 +124,30 @@ class RecommendationConsensusPolicy:
         for code in codes:
             claude_items = claude_by_code.get(code, [])
             codex_items = codex_by_code.get(code, [])
-            disagreement = find_disagreement(
+            basis, disagreement = resolve_consensus_actions(
                 code,
                 tuple(item.rating for item in claude_items),
                 tuple(item.rating for item in codex_items),
+                policy,
             )
             if disagreement is not None:
                 disagreements.append(disagreement)
+            elif basis in (ConsensusBasis.CLAUDE_ONLY, ConsensusBasis.CODEX_ONLY):
+                assert basis is not None
+                claude_item = claude_items[0] if claude_items else None
+                codex_item = codex_items[0] if codex_items else None
+                buy_item = (
+                    claude_item if basis is ConsensusBasis.CLAUDE_ONLY else codex_item
+                )
+                assert buy_item is not None
+                agreed.append(_adopt_one_side(buy_item, claude_item, codex_item, basis))
             elif claude_items and codex_items:
-                agreed.append(_merge(claude_items[0], codex_items[0]))
+                assert basis is not None
+                agreed.append(
+                    _merge(
+                        claude_items[0], codex_items[0], confidence_aggregation, basis
+                    )
+                )
 
         return RecommendationConsensusResult(
             recommendations=agreed,
@@ -122,11 +157,16 @@ class RecommendationConsensusPolicy:
             ),
             claude_summary=claude.summary,
             codex_summary=codex.summary,
+            policy=policy,
+            confidence_aggregation=confidence_aggregation,
         )
 
 
 def _merge(
-    claude: StockRecommendation, codex: StockRecommendation
+    claude: StockRecommendation,
+    codex: StockRecommendation,
+    confidence_aggregation: ConfidenceAggregation,
+    basis: ConsensusBasis | None,
 ) -> StockRecommendation:
     """같은 의견을 낮은 확신도와 보수적인 목표가·무효화 가격으로 합친다."""
 
@@ -141,10 +181,40 @@ def _merge(
     return StockRecommendation(
         code=claude.code,
         rating=claude.rating,
-        confidence=min(claude.confidence, codex.confidence),
+        confidence=aggregate_confidence(
+            claude.confidence, codex.confidence, confidence_aggregation
+        ),
         target_price=target,
         invalidation_price=invalidation,
-        reason=f"[claude] {claude.reason} / [codex] {codex.reason}",
+        reason=consensus_reason(
+            claude.reason, codex.reason, basis or ConsensusBasis.AGREED
+        ),
+        consensus_basis=basis,
+    )
+
+
+def _adopt_one_side(
+    buy: StockRecommendation,
+    claude: StockRecommendation | None,
+    codex: StockRecommendation | None,
+    basis: ConsensusBasis,
+) -> StockRecommendation:
+    """한쪽 BUY의 가격·확신도를 그대로 채택한다."""
+
+    return StockRecommendation(
+        code=buy.code,
+        rating=buy.rating,
+        confidence=buy.confidence,
+        target_price=buy.target_price,
+        invalidation_price=buy.invalidation_price,
+        reason=consensus_reason(
+            claude.reason if claude is not None else "",
+            codex.reason if codex is not None else "",
+            basis,
+            claude_present=claude is not None,
+            codex_present=codex is not None,
+        ),
+        consensus_basis=basis,
     )
 
 

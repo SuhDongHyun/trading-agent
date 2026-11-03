@@ -12,6 +12,8 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from trading_agent.domain.models import ConfidenceAggregation, ConsensusPolicyName
+
 _DEFAULT_CONFIG_FILE = Path("config.yaml")
 _MARKET_TIMEOUT_KEYS = {
     "kospi",
@@ -91,7 +93,7 @@ class RiskSettings(BaseModel):
     max_position_weight: float = Field(default=0.2, gt=0, le=1)
     max_order_ratio: float = Field(default=0.1, gt=0, le=1)
     max_order_amount: float | None = Field(default=None, gt=0)
-    min_confidence: float = Field(default=0.7, ge=0, le=1)
+    min_confidence: float = Field(default=0.6, ge=0, le=1)
     max_proposals_per_cycle: int = Field(default=5, gt=0)
     stop_loss_percent: float | None = Field(default=None, gt=0)
     take_profit_percent: float | None = Field(default=None, gt=0)
@@ -130,6 +132,13 @@ class RecommendationSettings(BaseModel):
     max_results: int = Field(default=5, gt=0)
 
 
+class ConsensusSettings(BaseModel):
+    """합의 정책과 확신도 집계 설정."""
+
+    policy: ConsensusPolicyName = ConsensusPolicyName.BUY_ONE_SIDE
+    confidence_aggregation: ConfidenceAggregation = ConfidenceAggregation.MEAN
+
+
 class LedgerSettings(BaseModel):
     """결정 기록 저장 위치."""
 
@@ -149,6 +158,7 @@ class AgentSettings(BaseSettings):
     recommendation: RecommendationSettings = Field(
         default_factory=RecommendationSettings
     )
+    consensus: ConsensusSettings = Field(default_factory=ConsensusSettings)
     ledger: LedgerSettings = Field(default_factory=LedgerSettings)
 
     model_config = SettingsConfigDict(

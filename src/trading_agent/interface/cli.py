@@ -14,7 +14,7 @@ from trading_agent.application.records import (
     DecisionCycleResult,
     RecommendationRunResult,
 )
-from trading_agent.domain.models import Action, TradeProposal
+from trading_agent.domain.models import Action, ConsensusBasis, TradeProposal
 from trading_agent.domain.recommendation import StockRecommendation
 from trading_agent.infrastructure.config import AgentSettings, load_settings
 from trading_agent.interface.bootstrap import (
@@ -160,6 +160,9 @@ def _proposal_origin(proposal: TradeProposal) -> str:
 
     if proposal.rule_type is not None:
         return f"규칙({proposal.rule_type.value})"
+    basis = _consensus_basis_label(proposal.consensus_basis)
+    if basis:
+        return f"합의({basis})"
     return "합의(consensus)"
 
 
@@ -217,8 +220,23 @@ def _print_recommendation(
         levels = f"예상 하락가 {target}, {invalidation} 위로 오르면 매도 의견 철회"
     else:
         levels = f"목표가 {target} 손절가 {invalidation}"
-    print(f"  {rank}. {_label(item.code, names)} 확신도 {item.confidence:.2f} {levels}")
+    basis = _consensus_basis_label(item.consensus_basis)
+    basis_suffix = f" ({basis})" if basis else ""
+    print(
+        f"  {rank}. {_label(item.code, names)}{basis_suffix} "
+        f"확신도 {item.confidence:.2f} {levels}"
+    )
     print(f"     근거: {item.reason}")
+
+
+def _consensus_basis_label(basis: ConsensusBasis | None) -> str | None:
+    """한쪽 BUY 채택 사유를 CLI 표시용 문구로 만든다."""
+
+    if basis is ConsensusBasis.CLAUDE_ONLY:
+        return "claude 단독 buy"
+    if basis is ConsensusBasis.CODEX_ONLY:
+        return "codex 단독 buy"
+    return None
 
 
 def _label(code: str, names: dict[str, str]) -> str:

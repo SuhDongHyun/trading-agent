@@ -9,7 +9,12 @@ from trading_agent.application.recommendation_schema import (
 )
 from trading_agent.domain.consensus import DisagreementReasonCode
 from trading_agent.domain.errors import DomainError
-from trading_agent.domain.models import Action
+from trading_agent.domain.models import (
+    Action,
+    ConfidenceAggregation,
+    ConsensusBasis,
+    ConsensusPolicyName,
+)
 from trading_agent.domain.recommendation import (
     ModelRecommendation,
     RecommendationConsensusPolicy,
@@ -191,3 +196,106 @@ def test_schema_requires_every_property_and_forbids_extra() -> None:
     ):
         assert schema["additionalProperties"] is False
         assert set(schema["required"]) == set(schema["properties"])
+
+
+@pytest.mark.parametrize("policy", list(ConsensusPolicyName))
+@pytest.mark.parametrize("aggregation", list(ConfidenceAggregation))
+@pytest.mark.parametrize(
+    ("claude_ratings", "codex_ratings", "strict_basis", "buy_basis"),
+    [
+        ((Action.BUY,), (Action.BUY,), ConsensusBasis.AGREED, ConsensusBasis.AGREED),
+        ((Action.BUY,), (Action.HOLD,), None, ConsensusBasis.CLAUDE_ONLY),
+        ((Action.BUY,), (), None, ConsensusBasis.CLAUDE_ONLY),
+        ((Action.HOLD,), (Action.BUY,), None, ConsensusBasis.CODEX_ONLY),
+        ((), (Action.BUY,), None, ConsensusBasis.CODEX_ONLY),
+        ((Action.BUY,), (Action.SELL,), None, None),
+        ((Action.SELL,), (Action.HOLD,), None, None),
+        ((Action.SELL,), (Action.SELL,), ConsensusBasis.AGREED, ConsensusBasis.AGREED),
+        (
+            (Action.BUY, Action.BUY),
+            (Action.BUY,),
+            None,
+            None,
+        ),
+    ],
+)
+def test_recommendation_policy_and_aggregation_matrix(
+    policy: ConsensusPolicyName,
+    aggregation: ConfidenceAggregation,
+    claude_ratings: tuple[Action, ...],
+    codex_ratings: tuple[Action, ...],
+    strict_basis: ConsensusBasis | None,
+    buy_basis: ConsensusBasis | None,
+) -> None:
+    def entries(ratings: tuple[Action, ...]) -> list[StockRecommendation]:
+        return [
+            item(
+                rating=rating,
+                target=None if rating is Action.HOLD else "120",
+                stop=None if rating is Action.HOLD else "90",
+            )
+            for rating in ratings
+        ]
+
+    result = RecommendationConsensusPolicy.reconcile(
+        opinion(entries(claude_ratings)),
+        opinion(entries(codex_ratings)),
+        policy,
+        aggregation,
+    )
+
+    expected_basis = strict_basis if policy is ConsensusPolicyName.STRICT else buy_basis
+    assert result.policy is policy
+    assert result.confidence_aggregation is aggregation
+    if expected_basis is None:
+        assert result.recommendations == []
+        assert len(result.disagreements) == 1
+        expected_reason = (
+            DisagreementReasonCode.DUPLICATE_PROPOSAL
+            if len(claude_ratings) > 1 or len(codex_ratings) > 1
+            else DisagreementReasonCode.ACTION_MISMATCH
+        )
+        assert result.disagreements[0].reason_code is expected_reason
+    else:
+        assert len(result.recommendations) == 1
+        merged = result.recommendations[0]
+        assert merged.consensus_basis is expected_basis
+        assert merged.rating in (Action.BUY, Action.SELL)
+        assert result.disagreements == []
+        if expected_basis in (ConsensusBasis.CLAUDE_ONLY, ConsensusBasis.CODEX_ONLY):
+            assert merged.confidence == 0.8
+            assert merged.target_price == Decimal("120")
+            if expected_basis is ConsensusBasis.CLAUDE_ONLY and codex_ratings:
+                assert "[codex:hold]" in merged.reason
+            if expected_basis is ConsensusBasis.CODEX_ONLY and claude_ratings:
+                assert "[claude:hold]" in merged.reason
+
+
+@pytest.mark.parametrize("policy", list(ConsensusPolicyName))
+@pytest.mark.parametrize(
+    ("aggregation", "expected"),
+    [
+        (ConfidenceAggregation.MIN, 0.6),
+        (ConfidenceAggregation.MEAN, 0.65),
+    ],
+)
+def test_recommendation_confidence_aggregation_and_one_sided_value(
+    policy: ConsensusPolicyName,
+    aggregation: ConfidenceAggregation,
+    expected: float,
+) -> None:
+    agreed = RecommendationConsensusPolicy.reconcile(
+        opinion([item(confidence=0.6)]),
+        opinion([item(confidence=0.7)]),
+        policy,
+        aggregation,
+    )
+    one_sided = RecommendationConsensusPolicy.reconcile(
+        opinion([item(confidence=0.8)]),
+        opinion([]),
+        ConsensusPolicyName.BUY_ONE_SIDE,
+        aggregation,
+    )
+
+    assert agreed.recommendations[0].confidence == expected
+    assert one_sided.recommendations[0].confidence == 0.8

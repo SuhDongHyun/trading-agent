@@ -122,6 +122,7 @@ def test_run_prints_approved_and_rejected_sources(
 
     from trading_agent.domain.models import (
         Action,
+        ConsensusBasis,
         ProposalSource,
         RuleType,
         TradeProposal,
@@ -144,7 +145,13 @@ def test_run_prints_approved_and_rejected_sources(
         rule_type=RuleType.STOP_LOSS,
     )
     consensus = TradeProposal(
-        "000660", Action.SELL, 1, Decimal("200"), 0.9, "합의 매도"
+        "000660",
+        Action.BUY,
+        1,
+        Decimal("200"),
+        0.9,
+        "합의 매수",
+        consensus_basis=ConsensusBasis.CLAUDE_ONLY,
     )
     result = DecisionCycleResult(
         run_id=1,
@@ -168,7 +175,7 @@ def test_run_prints_approved_and_rejected_sources(
 
     output = capsys.readouterr().out
     assert "규칙(stop_loss) 005930 SELL" in output
-    assert "합의(consensus) 000660 SELL" in output
+    assert "합의(claude 단독 buy) 000660 BUY" in output
     assert "리스크 거절:" in output
     assert "중복 제안입니다." in output
 
@@ -187,6 +194,7 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
     from trading_agent.domain.consensus import Disagreement, DisagreementReasonCode
     from trading_agent.domain.models import (
         Action,
+        ConsensusBasis,
         MarketContext,
         ResearchSnapshot,
         StockSnapshot,
@@ -203,6 +211,15 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
         )
         for code, conf in (("000660", 0.9), ("005930", 0.8))
     ]
+    buys[0] = StockRecommendation(
+        "000660",
+        Action.BUY,
+        0.9,
+        Decimal("1200"),
+        Decimal("900"),
+        "r",
+        consensus_basis=ConsensusBasis.CLAUDE_ONLY,
+    )
     sell = StockRecommendation(
         "086520", Action.SELL, 0.5, Decimal("66000"), Decimal("79000"), "r"
     )
@@ -245,7 +262,9 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
     out = capsys.readouterr().out
     assert exit_code == 0
     assert runtime.closed
-    assert "1. 000660 SK하이닉스 확신도 0.90 목표가 1,200원 손절가 900원" in out
+    assert (
+        "1. 000660 SK하이닉스 (claude 단독 buy) 확신도 0.90 목표가 1,200원 손절가 900원"
+    ) in out
     assert "005930 삼성전자 확신도" not in out
     assert "예상 하락가 66,000원, 79,000원 위로 오르면 매도 의견 철회" in out
     assert "불일치: 086520 에코프로 (claude buy / codex 미응답)" in out

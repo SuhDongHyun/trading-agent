@@ -14,7 +14,12 @@ from trading_agent.application.ports import DecisionModel, ModelRun
 from trading_agent.application.recommend_stocks import RecommendStocks
 from trading_agent.application.records import CycleStatus
 from trading_agent.application.snapshot_builder import SnapshotBuilder
-from trading_agent.domain.models import Action
+from trading_agent.domain.models import (
+    Action,
+    ConfidenceAggregation,
+    ConsensusBasis,
+    ConsensusPolicyName,
+)
 from trading_agent.domain.recommendation import (
     ModelRecommendation,
     StockRecommendation,
@@ -69,6 +74,9 @@ def build(
     gateway: FakeGateway | None = None,
     *,
     codex_fail: bool = False,
+    policy: ConsensusPolicyName = ConsensusPolicyName.STRICT,
+    confidence_aggregation: ConfidenceAggregation = ConfidenceAggregation.MIN,
+    codex_005930_rating: Action = Action.BUY,
 ) -> tuple[RecommendStocks, FakeGateway, FakeRecommender]:
     gateway = gateway or FakeGateway()
     claude = FakeRecommender(
@@ -83,7 +91,7 @@ def build(
     codex = FakeRecommender(
         "codex",
         [
-            rec("005930", Action.BUY, 0.7),
+            rec("005930", codex_005930_rating, 0.7),
             rec("000660", Action.BUY, 0.8),
             rec("086520", Action.HOLD),
             rec("999999", Action.HOLD),
@@ -92,7 +100,12 @@ def build(
     )
     use_case = RecommendStocks(
         snapshot_builder=SnapshotBuilder(gateway, [], clock=lambda: FIXED_NOW),
-        consensus_service=RecommendationConsensusService(claude, codex),
+        consensus_service=RecommendationConsensusService(
+            claude,
+            codex,
+            policy=policy,
+            confidence_aggregation=confidence_aggregation,
+        ),
         universe=["005930", "000660", "086520"],
         ledger=SQLiteDecisionLedger(db_path),
         clock=lambda: FIXED_NOW,
@@ -140,6 +153,41 @@ def test_completed_run_ranks_agreed_buys_and_ignores_codes_outside_snapshot(
     assert ranked == [(1, "000660", "buy", "120"), (2, "005930", "buy", "120")]
     assert model_items == 8
     assert disagreements == [("086520",)]
+
+
+def test_recommendation_one_sided_basis_and_policy_are_recorded(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "one-sided.sqlite"
+    use_case, _, _ = build(
+        db_path,
+        policy=ConsensusPolicyName.BUY_ONE_SIDE,
+        confidence_aggregation=ConfidenceAggregation.MEAN,
+        codex_005930_rating=Action.HOLD,
+    )
+
+    result = use_case.run()
+
+    assert result.outcome is not None and result.outcome.consensus is not None
+    adopted = next(
+        item for item in result.recommendations or [] if item.code == "005930"
+    )
+    assert adopted.consensus_basis is ConsensusBasis.CLAUDE_ONLY
+    assert adopted.confidence == 0.6
+    assert adopted.target_price == Decimal("120")
+    assert "[codex:hold] why" in adopted.reason
+    with sqlite3.connect(db_path) as connection:
+        policy, aggregation = connection.execute(
+            "SELECT policy, confidence_aggregation FROM consensus_results "
+            "WHERE run_id = ?",
+            (result.run_id,),
+        ).fetchone()
+        basis = connection.execute(
+            "SELECT consensus_basis FROM consensus_recommendations "
+            "WHERE run_id = ? AND code = '005930'",
+            (result.run_id,),
+        ).fetchone()[0]
+    assert (policy, aggregation, basis) == ("buy_one_side", "mean", "claude_only")
 
 
 def test_model_failure_fails_closed_and_keeps_both_runs(tmp_path: Path) -> None:
@@ -308,7 +356,7 @@ def test_version_1_ledger_is_migrated_in_place(tmp_path: Path) -> None:
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         assert connection.execute(
             "SELECT kind, started_at, status FROM runs"
         ).fetchone() == (
@@ -381,7 +429,7 @@ def test_version_2_ledger_preserves_verdicts_and_defaults_source_to_consensus(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         assert connection.execute(
             "SELECT kind, started_at, status FROM runs WHERE id = 7"
         ).fetchone() == ("decision", "2026-11-01", "completed")
@@ -490,7 +538,7 @@ def test_version_3_recommendation_prices_are_renamed_and_reopen_is_idempotent(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         model_columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(model_recommendations)")
@@ -516,6 +564,97 @@ def test_version_3_recommendation_prices_are_renamed_and_reopen_is_idempotent(
     )
     assert model_row == (9, "claude", "005930", "120", "90", "기존 추천")
     assert consensus_row == (9, 1, "005930", "120", "90", "기존 합의")
+
+
+def test_version_4_migrates_policy_defaults_and_preserves_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v4.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL DEFAULT 'decision',
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                prompt TEXT,
+                snapshot_json TEXT
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO runs(id, started_at, status) VALUES "
+            "(11, '2026-11-02T00:00:00+00:00', 'completed')"
+        )
+        connection.execute(
+            """CREATE TABLE consensus_results (
+                run_id INTEGER PRIMARY KEY,
+                summary TEXT NOT NULL,
+                claude_summary TEXT NOT NULL,
+                codex_summary TEXT NOT NULL,
+                missing_info_json TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO consensus_results VALUES (11, '요약', 'c', 'x', '[]')"
+        )
+        connection.execute(
+            """CREATE TABLE consensus_proposals (
+                run_id INTEGER NOT NULL,
+                proposal_index INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                action TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                limit_price TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                PRIMARY KEY (run_id, proposal_index)
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO consensus_proposals VALUES "
+            "(11, 0, '005930', 'buy', 2, '100', '0.8', '기존 제안')"
+        )
+        connection.execute(
+            """CREATE TABLE consensus_recommendations (
+                run_id INTEGER NOT NULL,
+                rank INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                rating TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                target_price TEXT,
+                invalidation_price TEXT,
+                reason TEXT NOT NULL,
+                PRIMARY KEY (run_id, rank)
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO consensus_recommendations VALUES "
+            "(11, 1, '000660', 'buy', '0.9', '120', '90', '기존 추천')"
+        )
+        connection.execute("PRAGMA user_version = 4")
+
+    SQLiteDecisionLedger(db_path)
+    SQLiteDecisionLedger(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        result = connection.execute(
+            "SELECT summary, policy, confidence_aggregation "
+            "FROM consensus_results WHERE run_id = 11"
+        ).fetchone()
+        proposal_row = connection.execute(
+            "SELECT code, reason, consensus_basis FROM consensus_proposals "
+            "WHERE run_id = 11"
+        ).fetchone()
+        recommendation_row = connection.execute(
+            "SELECT code, reason, consensus_basis FROM consensus_recommendations "
+            "WHERE run_id = 11"
+        ).fetchone()
+    assert result == ("요약", "strict", "min")
+    assert proposal_row == ("005930", "기존 제안", "agreed")
+    assert recommendation_row == ("000660", "기존 추천", "agreed")
 
 
 def test_open_marks_only_running_rows_older_than_configured_threshold_abandoned(

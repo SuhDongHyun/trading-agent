@@ -37,6 +37,12 @@ MARKET_FIELD_GLOSSARY = """- market_context.kospi_change_percent, kosdaq_change_
 - 모든 null 값은 해당 값을 수집하지 못했음을 뜻합니다.
 - missing: 스냅샷 수집 단계에서 누락되거나 실패한 데이터와 원인."""
 
+CONFIDENCE_SCALE_GUIDANCE = """- confidence는 0~1 사이의 판단 자체에 대한 확신도입니다.
+  0.5는 근거가 엇갈려 동전 던지기 수준, 0.6은 약한 우위,
+  0.7은 같은 근거로 10번 중 7번 맞을 수준, 0.8은 여러 근거가 같은 방향,
+  0.9 이상은 거의 확실한 경우로 드물게 사용하세요.
+  hold의 confidence도 매수·매도하지 않기로 한 판단 자체의 확신도입니다."""
+
 
 def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
     """한국어 지침과 손실 없는 JSON 요약을 포함한 프롬프트를 만든다."""
@@ -90,7 +96,11 @@ def build_decision_prompt(snapshot: MarketSnapshot, policy: RiskPolicy) -> str:
 - 확신이 낮으면 buy·sell 대신 hold로 적으세요.
 - 필요한데 제공되지 않은 데이터는 missing_info에 적으세요.
 - snapshot.missing에 이미 있는 항목은 missing_info에 다시 적지 마세요.
+- 각 제안의 confidence는 아래 공통 척도를 따르세요.
 - 응답은 주어진 JSON Schema에 맞는 JSON 하나만 출력하세요.
+
+확신도 척도:
+{CONFIDENCE_SCALE_GUIDANCE}
 
 리스크 정책:
 {json.dumps(risk_policy, ensure_ascii=False, indent=2)}
