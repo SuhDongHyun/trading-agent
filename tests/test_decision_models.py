@@ -400,6 +400,10 @@ def test_adapters_use_the_given_task_schema_and_parser() -> None:
                 "target_price": None,
                 "invalidation_price": None,
                 "reason": "r",
+                "score": 0.5,
+                "expected_excess_return_10d": 1.25,
+                "drivers": ["trend_up"],
+                "key_risk": {"type": "event_risk", "note": "발표 일정"},
             }
         ],
         "missing_info": [],

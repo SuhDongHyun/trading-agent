@@ -28,6 +28,7 @@ from trading_agent.domain.recommendation import (
     ModelRecommendation,
     RecommendationConsensusPolicy,
     StockRecommendation,
+    unique_recommendations_by_code,
 )
 
 DEFAULT_HORIZONS = (5, 10, 20)
@@ -72,6 +73,8 @@ class BacktestScoreOptions:
     bootstrap_iterations: int = 4000
     seed: int = 20261103
     hold_bands: Mapping[int, float] | None = None
+    top_candidates: int | None = None
+    default_top_candidates: int = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +106,10 @@ class _Observation:
     target: Decimal | None
     invalidation: Decimal | None
     disagreement: bool = False
+    score: float | None = None
+    expected_excess_return_10d: float | None = None
+    drivers: tuple[str, ...] = ()
+    key_risk_types: tuple[str, ...] = ()
 
 
 class ScoreBacktest:
@@ -152,6 +159,11 @@ class ScoreBacktest:
         )
         if not horizons:
             raise ValueError("horizons가 비어 있습니다.")
+        top_candidates = _select_top_candidates(
+            self.options.top_candidates,
+            arguments.get("top_candidates"),
+            self.options.default_top_candidates,
+        )
         policy = ConsensusPolicyName(
             self.options.policy
             or _mapping_value(manifest.get("consensus"), "policy", "strict")
@@ -168,18 +180,27 @@ class ScoreBacktest:
             self._load_dates(date_names)
         )
         codes = self._codes(arguments, dates)
+        scoring_horizons = tuple(sorted({*horizons, 10}))
         prices, benchmark_values, market_by_code = self._load_prices(
-            codes, dates, max(horizons)
+            codes, dates, max(scoring_horizons)
         )
         xs_returns, exc_returns, absolute_returns = _returns_by_horizon(
-            dates, codes, horizons, prices, benchmark_values, market_by_code
+            dates, codes, scoring_horizons, prices, benchmark_values, market_by_code
         )
-        self.missing_prices = sum(value is None for value in absolute_returns.values())
-        self.missing_benchmarks = sum(value is None for value in exc_returns.values())
+        self.missing_prices = sum(
+            value is None
+            for (_, _, horizon), value in absolute_returns.items()
+            if horizon in horizons
+        )
+        self.missing_benchmarks = sum(
+            value is None
+            for (_, _, horizon), value in exc_returns.items()
+            if horizon in horizons
+        )
         all_rows = self._observations(
             dates,
             codes,
-            horizons,
+            scoring_horizons,
             xs_returns,
             exc_returns,
             prices,
@@ -200,6 +221,7 @@ class ScoreBacktest:
             self.options.bootstrap_iterations,
             self.options.seed,
             "selected",
+            top_candidates,
         )
         period_results = {
             name: _policy_result(
@@ -211,6 +233,7 @@ class ScoreBacktest:
                 self.options.bootstrap_iterations,
                 self.options.seed,
                 name,
+                top_candidates,
             )
             for name, subset in periods.items()
         }
@@ -225,6 +248,7 @@ class ScoreBacktest:
             policy,
             aggregation,
             absolute_returns,
+            top_candidates,
         )
 
         selected_dates = len(date_names)
@@ -259,6 +283,7 @@ class ScoreBacktest:
             "memory_leak_warning": warning,
             "sources": selected_policy["sources"],
             "base_rates": selected_policy["base_rates"],
+            "relative_metrics": selected_policy["relative_metrics"],
             "price_outcomes": self._price_outcomes(
                 dates, codes, all_rows, prices, max(horizons)
             ),
@@ -411,21 +436,68 @@ class ScoreBacktest:
             consensus = RecommendationConsensusPolicy.reconcile(
                 claude, codex, policy, aggregation
             )
+            # 후보 순위와 driver·key risk 집계 모두 종목별 단일 응답만 쓴다.
+            claude_by_code = unique_recommendations_by_code(claude.recommendations)
+            codex_by_code = unique_recommendations_by_code(codex.recommendations)
+            claude_duplicate_codes = {
+                item.code for item in claude.recommendations
+            } - claude_by_code.keys()
+            codex_duplicate_codes = {
+                item.code for item in codex.recommendations
+            } - codex_by_code.keys()
             recs_by_source: dict[str, dict[str, StockRecommendation]] = {
-                "claude": _first_by_code(claude.recommendations),
-                "codex": _first_by_code(codex.recommendations),
+                "claude": claude_by_code,
+                "codex": codex_by_code,
                 "consensus": _first_by_code(consensus.recommendations),
             }
+            candidates = {item.code: item for item in consensus.candidates}
             disagreement_codes = {item.code for item in consensus.disagreements}
             for source in SOURCE_NAMES:
                 source_recs = recs_by_source[source]
                 for code in codes:
                     rec = source_recs.get(code)
-                    disagreement = source == "consensus" and code in disagreement_codes
+                    duplicate = (
+                        source == "claude" and code in claude_duplicate_codes
+                    ) or (source == "codex" and code in codex_duplicate_codes)
+                    disagreement = (
+                        duplicate
+                        or source == "consensus"
+                        and code in disagreement_codes
+                    )
+                    candidate = candidates.get(code) if source == "consensus" else None
                     action = (
                         None if disagreement else (rec.rating if rec else Action.HOLD)
                     )
                     confidence = rec.confidence if rec else None
+                    if source == "consensus":
+                        driver_items: list[str] = []
+                        if code in claude_by_code:
+                            driver_items.extend(claude_by_code[code].drivers)
+                        if code in codex_by_code:
+                            driver_items.extend(codex_by_code[code].drivers)
+                        drivers = tuple(dict.fromkeys(driver_items))
+                        score = candidate.score if candidate else None
+                        expected = (
+                            candidate.expected_excess_return_10d if candidate else None
+                        )
+                        key_risk_types = tuple(
+                            risk_type
+                            for source_rec in (
+                                claude_by_code.get(code),
+                                codex_by_code.get(code),
+                            )
+                            if source_rec is not None
+                            and (risk_type := source_rec.key_risk_type) is not None
+                        )
+                    else:
+                        drivers = tuple(rec.drivers) if rec else ()
+                        score = rec.score if rec else None
+                        expected = rec.expected_excess_return_10d if rec else None
+                        key_risk_types = (
+                            (rec.key_risk_type,)
+                            if rec is not None and rec.key_risk_type is not None
+                            else ()
+                        )
                     bars = prices.get((code, "all"), [])
                     decision_bar = next(
                         (bar for bar in bars if bar.date == dated.date), None
@@ -448,6 +520,12 @@ class ScoreBacktest:
                                 target=rec.target_price if rec else None,
                                 invalidation=rec.invalidation_price if rec else None,
                                 disagreement=disagreement,
+                                score=None if score is None else float(score),
+                                expected_excess_return_10d=(
+                                    None if expected is None else float(expected)
+                                ),
+                                drivers=drivers,
+                                key_risk_types=key_risk_types,
                             )
                         )
         return rows
@@ -464,6 +542,7 @@ class ScoreBacktest:
         policy: ConsensusPolicyName,
         aggregation: ConfidenceAggregation,
         absolute_returns: Mapping[tuple[str, str, int], float | None],
+        top_candidates: int = 5,
     ) -> list[dict[str, Any]]:
         comparisons: list[dict[str, Any]] = []
         policies = (
@@ -529,6 +608,7 @@ class ScoreBacktest:
                     self.options.bootstrap_iterations,
                     self.options.seed,
                     f"{compare_policy.value}/{compare_aggregation.value}",
+                    top_candidates,
                 )
                 source_data = result["sources"]["consensus"]
                 by_horizon = source_data["horizons"]
@@ -582,7 +662,10 @@ class ScoreBacktest:
                 or row.date not in date_by_name
             ):
                 continue
-            rating = row.action.value
+            action = row.action
+            if action is None:
+                continue
+            rating = action.value
             future_bars = [
                 bar for bar in prices.get((row.code, "all"), []) if bar.date > row.date
             ][:max_horizon]
@@ -590,7 +673,7 @@ class ScoreBacktest:
                 outcome = "no_price"
             else:
                 outcome = price_outcome(
-                    row.action, row.target, row.invalidation, future_bars
+                    action, row.target, row.invalidation, future_bars
                 )
             counts[row.source][rating][outcome] += 1
             if row.close is None or row.close == 0:
@@ -816,6 +899,120 @@ def render_score_markdown(
                     ic.get("dates", 0),
                 )
             )
+    relative = result.get("relative_metrics", {})
+    score_ic = relative.get("score_ic", {})
+    lines.extend(
+        [
+            "",
+            "## 상대 score IC",
+            "",
+            row("출처", "horizon", "날짜 평균 Spearman", "t값", "날짜 수"),
+            row("---", "---:", "---:", "---:", "---:"),
+        ]
+    )
+    if not score_ic.get("available", False):
+        lines.append(row("—", "—", "데이터 없음", "—", "—"))
+    else:
+        for source, metrics in score_ic.get("by_source", {}).items():
+            for horizon in horizons:
+                metric = metrics.get(horizon, {})
+                lines.append(
+                    row(
+                        source,
+                        horizon,
+                        _number(metric.get("mean")),
+                        _number(metric.get("t_value")),
+                        metric.get("dates", 0),
+                    )
+                )
+    expected_ic = relative.get("expected_excess_return_10d_ic", {})
+    lines.extend(
+        [
+            "",
+            "## 10거래일 기대 초과수익 IC",
+            "",
+            row("출처", "날짜 평균 Spearman", "t값", "날짜 수", "표본 수"),
+            row("---", "---:", "---:", "---:", "---:"),
+        ]
+    )
+    if not expected_ic.get("available", False):
+        lines.append(row("—", "데이터 없음", "—", "—", "—"))
+    else:
+        for source, metric in expected_ic.get("by_source", {}).items():
+            lines.append(
+                row(
+                    source,
+                    _number(metric.get("mean")),
+                    _number(metric.get("t_value")),
+                    metric.get("dates", 0),
+                    metric.get("n", 0),
+                )
+            )
+    basket = relative.get("top_n_basket", {})
+    lines.extend(
+        [
+            "",
+            f"## 합의 score 상위 {basket.get('top_n', 5)} 바스켓",
+            "",
+            row("horizon", "표본", "날짜", "평균 xs [95%]"),
+            row("---:", "---:", "---:", "---:"),
+        ]
+    )
+    if not basket.get("available", False):
+        lines.append(row("—", "—", "데이터 없음", "—"))
+    else:
+        for horizon in horizons:
+            metric = basket.get("by_horizon", {}).get(horizon, {})
+            lines.append(
+                row(
+                    horizon,
+                    metric.get("n", 0),
+                    metric.get("date_count", 0),
+                    _interval(metric.get("mean_xs"), metric.get("ci95")),
+                )
+            )
+    driver_rates = relative.get("driver_hit_rates", {})
+    lines.extend(
+        [
+            "",
+            "## Driver별 방향 적중",
+            "",
+            row("출처", "horizon", "driver", "표본", "적중률", "평균 xs"),
+            row("---", "---:", "---", "---:", "---:", "---:"),
+        ]
+    )
+    if not driver_rates.get("available", False):
+        lines.append(row("—", "—", "데이터 없음", "—", "—", "—"))
+    else:
+        for source, source_metrics in driver_rates.get("by_source", {}).items():
+            for horizon in horizons:
+                for driver, metric in source_metrics.get(horizon, {}).items():
+                    lines.append(
+                        row(
+                            source,
+                            horizon,
+                            driver,
+                            metric.get("n", 0),
+                            _rate(metric.get("hit_rate")),
+                            _percentage_points(metric.get("mean_xs")),
+                        )
+                    )
+    risk_counts = relative.get("key_risk_counts", {})
+    lines.extend(
+        [
+            "",
+            "## Key risk 유형별 건수",
+            "",
+            row("출처", "key risk", "건수"),
+            row("---", "---", "---:"),
+        ]
+    )
+    if not risk_counts.get("available", False):
+        lines.append(row("—", "데이터 없음", "—"))
+    else:
+        for source, risks in risk_counts.get("by_source", {}).items():
+            for risk_type, count in risks.items():
+                lines.append(row(source, risk_type, count))
     price = result.get("price_outcomes", {})
     lines.extend(
         [
@@ -1007,6 +1204,7 @@ def _policy_result(
     iterations: int,
     seed: int,
     label: str,
+    top_candidates: int = 5,
 ) -> dict[str, Any]:
     source_rows = {
         source: [row for row in rows if row.source == source] for source in SOURCE_NAMES
@@ -1126,6 +1324,158 @@ def _policy_result(
         "sources": sources,
         "base_rates": base_rates,
         "disagreements": disagreement_summary,
+        "relative_metrics": _relative_metrics(
+            source_rows, dates, horizons, hold_bands, iterations, seed, top_candidates
+        ),
+    }
+
+
+def _relative_metrics(
+    source_rows: Mapping[str, Sequence[_Observation]],
+    dates: Sequence[_LoadedDate],
+    horizons: Sequence[int],
+    hold_bands: Mapping[int, float],
+    iterations: int,
+    seed: int,
+    top_n: int = 5,
+) -> dict[str, Any]:
+    """상대점수 IC, 상위 바스켓, driver 적중률과 위험 건수를 계산한다."""
+
+    score_ic: dict[str, dict[str, Any]] = {}
+    expected_ic: dict[str, Any] = {}
+    driver_hits: dict[str, dict[str, Any]] = {}
+    key_risk_counts: dict[str, dict[str, int]] = {}
+    for source in SOURCE_NAMES:
+        observations = source_rows[source]
+        score_ic[source] = {}
+        driver_hits[source] = {}
+        for horizon in horizons:
+            selected = [row for row in observations if row.horizon == horizon]
+            score_ic[source][str(horizon)] = _date_field_ic(selected, "score")
+            band = hold_bands.get(horizon, DEFAULT_HOLD_BANDS.get(horizon, 0))
+            by_driver: dict[str, list[tuple[float, bool]]] = defaultdict(list)
+            for row in selected:
+                if row.action is None or row.xs is None:
+                    continue
+                hit = _is_hit_value(row.action, row.xs, band)
+                if hit is None:
+                    continue
+                for driver in row.drivers:
+                    by_driver[driver].append((row.xs, hit))
+            driver_hits[source][str(horizon)] = {
+                driver: {
+                    "n": len(values),
+                    "hit_n": sum(hit for _, hit in values),
+                    "hit_rate": _mean([hit for _, hit in values]),
+                    "mean_xs": _mean([value for value, _ in values]),
+                }
+                for driver, values in sorted(by_driver.items())
+            }
+        ten_day_rows = [
+            row
+            for row in observations
+            if row.horizon == 10 and row.expected_excess_return_10d is not None
+        ]
+        expected_ic[source] = _date_field_ic(ten_day_rows, "expected_excess_return_10d")
+        risk_counts: Counter[str] = Counter()
+        unique = {
+            (row.date, row.code): row
+            for row in observations
+            if row.horizon == min(horizons)
+        }
+        for row in unique.values():
+            risk_counts.update(row.key_risk_types)
+        key_risk_counts[source] = dict(sorted(risk_counts.items()))
+
+    consensus_rows = source_rows["consensus"]
+    basket: dict[str, Any] = {}
+    for horizon in horizons:
+        selected = [
+            row
+            for row in consensus_rows
+            if row.horizon == horizon and row.score is not None
+        ]
+        by_date: dict[str, list[_Observation]] = defaultdict(list)
+        for row in selected:
+            by_date[row.date].append(row)
+        top_rows = [
+            row
+            for day_rows in by_date.values()
+            for row in sorted(
+                day_rows,
+                key=lambda item: (
+                    -(item.score if item.score is not None else 0.0),
+                    item.code,
+                ),
+            )[:top_n]
+        ]
+        scored_rows = [row for row in top_rows if row.xs is not None]
+        basket[str(horizon)] = {
+            "candidate_n": len(top_rows),
+            "n": len(scored_rows),
+            "date_count": len({row.date for row in scored_rows}),
+            "mean_xs": _mean([row.xs for row in scored_rows]),
+            "ci95": _cluster_bootstrap(scored_rows, iterations, seed + horizon),
+        }
+    any_drivers = any(
+        metrics
+        for source_metrics in driver_hits.values()
+        for metrics in source_metrics.values()
+    )
+    any_risks = any(key_risk_counts.values())
+    any_scores = any(
+        metric["dates"] > 0
+        for source_metrics in score_ic.values()
+        for metric in source_metrics.values()
+    )
+    any_expected = any(metric["dates"] > 0 for metric in expected_ic.values())
+    return {
+        "score_ic": {"available": any_scores, "by_source": score_ic},
+        "expected_excess_return_10d_ic": {
+            "available": any_expected,
+            "by_source": expected_ic,
+        },
+        "top_n_basket": {
+            "available": any(value["n"] for value in basket.values()),
+            "top_n": top_n,
+            "by_horizon": basket,
+        },
+        "driver_hit_rates": {
+            "available": any_drivers,
+            "by_source": driver_hits,
+        },
+        "key_risk_counts": {
+            "available": any_risks,
+            "by_source": key_risk_counts,
+        },
+    }
+
+
+def _date_field_ic(
+    observations: Sequence[_Observation], field_name: str
+) -> dict[str, Any]:
+    """각 날짜에서 지정한 수치와 xs의 Spearman 상관을 구한다."""
+
+    grouped: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for row in observations:
+        value = getattr(row, field_name)
+        if value is not None and row.xs is not None:
+            grouped[row.date].append((value, row.xs))
+    correlations = [
+        correlation
+        for pairs in grouped.values()
+        if (
+            correlation := _spearman(
+                [left for left, _ in pairs], [right for _, right in pairs]
+            )
+        )
+        is not None
+    ]
+    return {
+        "mean": _mean(correlations),
+        "t_value": _t_value(correlations),
+        "dates": len(correlations),
+        "n": sum(len(pairs) for pairs in grouped.values()),
     }
 
 
@@ -1196,8 +1546,9 @@ def _returns_by_horizon(
                     benchmark_returns[key] = float((end_value / base_value - 1) * 100)
     exc = {
         key: (
-            stock_return - benchmark_returns[key]
-            if stock_return is not None and benchmark_returns.get(key) is not None
+            stock_return - benchmark
+            if stock_return is not None
+            and (benchmark := benchmark_returns.get(key)) is not None
             else None
         )
         for key, stock_return in raw.items()
@@ -1222,6 +1573,25 @@ def _model_recommendation(name: str, value: Any) -> ModelRecommendation:
                 invalidation_price=_decimal_or_none(item.get("invalidation_price")),
                 reason=str(item.get("reason", "")),
                 consensus_basis=item.get("consensus_basis"),
+                score=_decimal_or_none(item.get("score")),
+                expected_excess_return_10d=_decimal_or_none(
+                    item.get("expected_excess_return_10d")
+                ),
+                drivers=[
+                    str(driver)
+                    for driver in item.get("drivers", [])
+                    if isinstance(driver, str)
+                ],
+                key_risk_type=(
+                    str(item["key_risk_type"])
+                    if item.get("key_risk_type") is not None
+                    else None
+                ),
+                key_risk_note=(
+                    str(item["key_risk_note"])
+                    if item.get("key_risk_note") is not None
+                    else None
+                ),
             )
         )
     return ModelRecommendation(
@@ -1462,6 +1832,23 @@ def _positive_horizons(value: Any) -> tuple[int, ...]:
 
 def _mapping_value(value: Any, key: str, default: str) -> str:
     return str(value.get(key, default)) if isinstance(value, Mapping) else default
+
+
+def _select_top_candidates(
+    override: int | None, manifest_value: Any, configured_default: int
+) -> int:
+    """CLI 재정의, 실행 manifest, 현재 설정 순으로 바스켓 크기를 고른다."""
+
+    selected = (
+        override
+        if override is not None
+        else manifest_value
+        if manifest_value is not None
+        else configured_default
+    )
+    if isinstance(selected, bool) or not isinstance(selected, int) or selected <= 0:
+        raise ValueError("top_candidates는 양의 정수여야 합니다.")
+    return selected
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:

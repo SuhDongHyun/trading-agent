@@ -266,6 +266,7 @@ def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRunti
             "policy": settings.consensus.policy.value,
             "confidence_aggregation": settings.consensus.confidence_aggregation.value,
         },
+        top_candidates=settings.recommendation.top_candidates,
         models={
             "claude": {
                 "command": settings.llm.claude.command,
@@ -349,6 +350,7 @@ def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRunti
                 horizon_days=settings.recommendation.horizon_days,
             ),
             price_guard_policy=_price_guard_policy(settings),
+            top_candidates=settings.recommendation.top_candidates,
         )
 
     def progress(
@@ -405,6 +407,8 @@ def create_backtest_score_runtime(
     gateway.client = cache  # type: ignore[assignment]
     options = BacktestScoreOptions(
         horizons=args.horizons,
+        top_candidates=args.top_candidates,
+        default_top_candidates=settings.recommendation.top_candidates,
         primary_horizons=tuple(settings.recommendation.horizon_days),
         policy=ConsensusPolicyName(args.policy) if args.policy else None,
         confidence_aggregation=(
@@ -455,6 +459,7 @@ def create_recommendation_runtime(
             horizon_days=settings.recommendation.horizon_days,
         ),
         price_guard_policy=_price_guard_policy(settings),
+        top_candidates=settings.recommendation.top_candidates,
     )
     return RecommendationRuntime(use_case=use_case, gateway=gateway)
 

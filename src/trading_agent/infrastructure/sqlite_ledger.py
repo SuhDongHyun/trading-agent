@@ -29,7 +29,7 @@ from trading_agent.domain.recommendation import (
     StockRecommendation,
 )
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 _RUN_KIND_DECISION = "decision"
 _RUN_KIND_RECOMMENDATION = "recommendation"
 
@@ -114,12 +114,32 @@ def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
+    """모델 점수·기대수익·근거를 추천 기록에 추가한다."""
+
+    additions = (
+        ("score", "TEXT"),
+        ("expected_excess_return_10d", "TEXT"),
+        ("drivers_json", "TEXT"),
+        ("key_risk_type", "TEXT"),
+        ("key_risk_note", "TEXT"),
+    )
+    for table in ("model_recommendations", "consensus_recommendations"):
+        columns = _table_columns(connection, table)
+        for name, definition in additions:
+            if columns and name not in columns:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                )
+
+
 _MIGRATIONS = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
     4: _migrate_v4_to_v5,
     5: _migrate_v5_to_v6,
+    6: _migrate_v6_to_v7,
 }
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS runs (
@@ -215,6 +235,11 @@ _SCHEMA = (
         target_price TEXT,
         invalidation_price TEXT,
         reason TEXT NOT NULL,
+        score TEXT,
+        expected_excess_return_10d TEXT,
+        drivers_json TEXT,
+        key_risk_type TEXT,
+        key_risk_note TEXT,
         PRIMARY KEY (run_id, model_id, item_index),
         FOREIGN KEY (run_id, model_id)
             REFERENCES model_runs(run_id, model_id) ON DELETE CASCADE
@@ -232,6 +257,11 @@ _SCHEMA = (
         original_invalidation_price TEXT,
         price_adjusted INTEGER NOT NULL DEFAULT 0,
         price_warnings_json TEXT NOT NULL DEFAULT '[]',
+        score TEXT,
+        expected_excess_return_10d TEXT,
+        drivers_json TEXT,
+        key_risk_type TEXT,
+        key_risk_note TEXT,
         PRIMARY KEY (run_id, rank)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_runs_recent ON runs(started_at DESC, id DESC)",
@@ -328,8 +358,9 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                        (run_id, rank, code, rating, confidence, target_price,
                         invalidation_price, reason, consensus_basis,
                         original_invalidation_price, price_adjusted,
-                        price_warnings_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        price_warnings_json, score, expected_excess_return_10d,
+                        drivers_json, key_risk_type, key_risk_note)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         result.run_id,
                         rank,
@@ -344,6 +375,7 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                         ),
                         int(item.price_adjusted),
                         _json(item.price_warnings),
+                        *_recommendation_metadata(item, model_specific=True),
                     ),
                 )
 
@@ -519,13 +551,16 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
             connection.execute(
                 """INSERT INTO model_recommendations
                    (run_id, model_id, item_index, code, rating, confidence,
-                    target_price, invalidation_price, reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    target_price, invalidation_price, reason, score,
+                    expected_excess_return_10d, drivers_json, key_risk_type,
+                    key_risk_note)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     recommendation.model_id,
                     index,
                     *_recommendation_values(item),
+                    *_recommendation_metadata(item),
                 ),
             )
 
@@ -681,6 +716,40 @@ def _recommendation_values(item: StockRecommendation) -> tuple[object, ...]:
         None if item.target_price is None else str(item.target_price),
         None if item.invalidation_price is None else str(item.invalidation_price),
         item.reason,
+    )
+
+
+def _recommendation_metadata(
+    item: StockRecommendation, *, model_specific: bool = False
+) -> tuple[object, ...]:
+    """점수·기대수익과 모델별 근거를 SQL 열 순서로 바꾼다."""
+
+    if model_specific:
+        evidence = item.evidence_by_model
+        drivers = {name: value.drivers for name, value in evidence.items()}
+        risk_types = {name: value.key_risk_type for name, value in evidence.items()}
+        risk_notes = {name: value.key_risk_note for name, value in evidence.items()}
+        if not evidence:
+            drivers = {"consensus": item.drivers} if item.drivers else {}
+            risk_types = {"consensus": item.key_risk_type} if item.key_risk_type else {}
+            risk_notes = {"consensus": item.key_risk_note} if item.key_risk_note else {}
+        drivers_json = _json(drivers) if drivers else None
+        key_risk_type = _json(risk_types) if risk_types else None
+        key_risk_note = _json(risk_notes) if risk_notes else None
+    else:
+        drivers_json = _json(item.drivers)
+        key_risk_type = item.key_risk_type
+        key_risk_note = item.key_risk_note
+    return (
+        None if item.score is None else str(item.score),
+        (
+            None
+            if item.expected_excess_return_10d is None
+            else str(item.expected_excess_return_10d)
+        ),
+        drivers_json,
+        key_risk_type,
+        key_risk_note,
     )
 
 

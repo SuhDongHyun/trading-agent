@@ -115,6 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="채점 거래일 horizon 목록 (기본: manifest)",
     )
     backtest_score.add_argument(
+        "--top-n",
+        dest="top_candidates",
+        type=_positive_int,
+        help=(
+            "합의 score 상위 바스켓 크기 "
+            "(기본: manifest 또는 recommendation.top_candidates)"
+        ),
+    )
+    backtest_score.add_argument(
         "--policy", choices=("strict", "buy_one_side"), help="재채점 합의 정책"
     )
     backtest_score.add_argument(
@@ -327,6 +336,21 @@ def _print_recommendations(result: RecommendationRunResult, top: int) -> None:
         print(
             f"합의 의견: {len(items)}종목, 불일치: {len(consensus.disagreements)}종목"
         )
+        print("상대강도 상위 후보:")
+        if result.top_candidates:
+            for rank, candidate in enumerate(result.top_candidates, start=1):
+                expected = (
+                    "—"
+                    if candidate.expected_excess_return_10d is None
+                    else f"{candidate.expected_excess_return_10d}%p"
+                )
+                print(
+                    f"{rank}. {_label(candidate.code, names)} "
+                    f"score {candidate.score} / 10일 기대 초과수익 {expected} "
+                    f"(claude {candidate.claude_score}, codex {candidate.codex_score})"
+                )
+        else:
+            print("없음")
         print("매수 추천 (확신도 순):" if buys else "매수 추천: 없음")
         for rank, item in enumerate(buys[:top], start=1):
             _print_recommendation(rank, item, names)

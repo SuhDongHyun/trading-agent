@@ -19,6 +19,7 @@ from trading_agent.application.backtest_score import (
     _date_ic,
     _LoadedDate,
     _Observation,
+    _relative_metrics,
     _returns_by_horizon,
     _spearman,
     _t_value,
@@ -32,7 +33,12 @@ from trading_agent.application.ports import (
     MarketIndex,
     StockQuote,
 )
-from trading_agent.domain.models import Action
+from trading_agent.domain.models import (
+    Action,
+    ConfidenceAggregation,
+    ConsensusPolicyName,
+)
+from trading_agent.domain.recommendation import ModelRecommendation, StockRecommendation
 from trading_agent.infrastructure.backtest_result_store import FileBacktestResultStore
 from trading_agent.interface.bootstrap import BacktestScoreRuntime
 from trading_agent.interface.cli import build_parser, main
@@ -223,7 +229,11 @@ def _score_fixture() -> tuple[MemoryScoreStore, FakeScoreGateway]:
         "format_version": BACKTEST_FORMAT_VERSION,
         "mode": "masked",
         "selected_dates": [DECISION_DATE, "20260701", "20260702"],
-        "arguments": {"universe": list(CODES), "horizons": [1]},
+        "arguments": {
+            "universe": list(CODES),
+            "horizons": [1],
+            "top_candidates": 2,
+        },
         "consensus": {"policy": "buy_one_side", "confidence_aggregation": "min"},
     }
     return (
@@ -497,6 +507,221 @@ def test_confidence_bins_include_upper_edges_once() -> None:
     assert [bucket["hit_rate"] for bucket in buckets] == [1, 1, 1, 1]
 
 
+def test_relative_metrics_cover_score_ic_expected_ic_basket_drivers_and_risks() -> None:
+    rows = []
+    for source in ("claude", "codex", "consensus"):
+        rows.extend(
+            [
+                _Observation(
+                    "20260701",
+                    CODES[0],
+                    source,
+                    10,
+                    Action.BUY,
+                    0.8,
+                    2.0,
+                    1.0,
+                    None,
+                    None,
+                    None,
+                    score=0.5,
+                    expected_excess_return_10d=3.0,
+                    drivers=("trend_up",),
+                    key_risk_types=("event_risk",),
+                ),
+                _Observation(
+                    "20260701",
+                    CODES[1],
+                    source,
+                    10,
+                    Action.BUY,
+                    0.7,
+                    0.0,
+                    0.0,
+                    None,
+                    None,
+                    None,
+                    score=1.0,
+                    expected_excess_return_10d=2.0,
+                    drivers=("trend_up",),
+                    key_risk_types=("macro_shock",),
+                ),
+                _Observation(
+                    "20260701",
+                    CODES[2],
+                    source,
+                    10,
+                    Action.SELL,
+                    0.9,
+                    -2.0,
+                    -1.0,
+                    None,
+                    None,
+                    None,
+                    score=2.0,
+                    expected_excess_return_10d=1.0,
+                    drivers=("trend_break",),
+                    key_risk_types=("liquidity",),
+                ),
+            ]
+        )
+    source_rows = {
+        source: [row for row in rows if row.source == source]
+        for source in ("claude", "codex", "consensus")
+    }
+
+    metrics = _relative_metrics(source_rows, [], [10], {10: 0.5}, 20, 7)
+
+    assert metrics["score_ic"]["available"] is True
+    assert metrics["score_ic"]["by_source"]["claude"]["10"]["mean"] == -1
+    assert metrics["expected_excess_return_10d_ic"]["by_source"]["claude"]["mean"] == 1
+    basket = metrics["top_n_basket"]["by_horizon"]["10"]
+    assert basket["candidate_n"] == 3
+    assert basket["mean_xs"] == pytest.approx(0)
+    assert basket["ci95"] == pytest.approx([0, 0])
+    driver = metrics["driver_hit_rates"]["by_source"]["claude"]["10"]["trend_up"]
+    assert driver["n"] == 2
+    assert driver["hit_rate"] == pytest.approx(0.5)
+    assert driver["mean_xs"] == pytest.approx(1)
+    assert metrics["key_risk_counts"]["by_source"]["claude"] == {
+        "event_risk": 1,
+        "liquidity": 1,
+        "macro_shock": 1,
+    }
+
+
+def test_legacy_results_report_new_tables_as_unavailable() -> None:
+    store, gateway = _score_fixture()
+    scored = ScoreBacktest(
+        store,
+        gateway,
+        BacktestScoreOptions(bootstrap_iterations=20, horizons=(1,)),
+        now=datetime.fromisoformat("2026-07-03T10:00:00+09:00"),
+    ).run()
+
+    relative = scored.data["relative_metrics"]
+    assert relative["score_ic"]["available"] is False
+    assert relative["expected_excess_return_10d_ic"]["available"] is False
+    assert relative["driver_hit_rates"]["available"] is False
+    assert relative["key_risk_counts"]["available"] is False
+    assert "데이터 없음" in scored.markdown
+
+
+def test_top_n_uses_cli_override_then_manifest_then_configured_default() -> None:
+    store, gateway = _score_fixture()
+    manifest_value = ScoreBacktest(
+        store,
+        gateway,
+        BacktestScoreOptions(
+            horizons=(1,), bootstrap_iterations=5, default_top_candidates=4
+        ),
+        now=datetime.fromisoformat("2026-07-03T10:00:00+09:00"),
+    ).run()
+    override_value = ScoreBacktest(
+        store,
+        gateway,
+        BacktestScoreOptions(
+            horizons=(1,),
+            bootstrap_iterations=5,
+            top_candidates=1,
+            default_top_candidates=4,
+        ),
+        now=datetime.fromisoformat("2026-07-03T10:00:00+09:00"),
+    ).run()
+    assert manifest_value.data["relative_metrics"]["top_n_basket"]["top_n"] == 2
+    assert "## 합의 score 상위 2 바스켓" in manifest_value.markdown
+    assert override_value.data["relative_metrics"]["top_n_basket"]["top_n"] == 1
+
+
+def test_top_n_uses_configured_default_when_legacy_manifest_has_no_value() -> None:
+    store, gateway = _score_fixture()
+    store.manifest["arguments"].pop("top_candidates")
+
+    scored = ScoreBacktest(
+        store,
+        gateway,
+        BacktestScoreOptions(
+            horizons=(1,), bootstrap_iterations=5, default_top_candidates=3
+        ),
+        now=datetime.fromisoformat("2026-07-03T10:00:00+09:00"),
+    ).run()
+
+    assert scored.data["relative_metrics"]["top_n_basket"]["top_n"] == 3
+
+
+def test_duplicate_model_responses_are_excluded_from_drivers_and_ranking() -> None:
+    duplicate_one = StockRecommendation(
+        CODES[0],
+        Action.BUY,
+        0.8,
+        None,
+        None,
+        "first duplicate",
+        score=0.5,
+        drivers=["trend_up"],
+        key_risk_type="event_risk",
+        key_risk_note="first",
+    )
+    duplicate_two = StockRecommendation(
+        CODES[0],
+        Action.BUY,
+        0.8,
+        None,
+        None,
+        "second duplicate",
+        score=1.0,
+        drivers=["breakout"],
+        key_risk_type="liquidity",
+        key_risk_note="second",
+    )
+    codex_rec = StockRecommendation(
+        CODES[0],
+        Action.BUY,
+        0.8,
+        None,
+        None,
+        "unique response",
+        score=0.75,
+        drivers=["relative_strength"],
+        key_risk_type="macro_shock",
+        key_risk_note="codex risk",
+    )
+    dated = _LoadedDate(
+        "20260701",
+        {},
+        {
+            "claude": ModelRecommendation(
+                "claude", [duplicate_one, duplicate_two], "", []
+            ),
+            "codex": ModelRecommendation("codex", [codex_rec], "", []),
+        },
+    )
+    store, gateway = _score_fixture()
+    scorer = ScoreBacktest(store, gateway, BacktestScoreOptions(horizons=(1,)))
+
+    rows = scorer._observations(
+        [dated],
+        [CODES[0]],
+        [1],
+        {("20260701", CODES[0], 1): 1.0},
+        {("20260701", CODES[0], 1): 1.0},
+        {},
+        {1: 0.5},
+        ConsensusPolicyName.STRICT,
+        ConfidenceAggregation.MEAN,
+    )
+
+    claude = next(row for row in rows if row.source == "claude")
+    codex = next(row for row in rows if row.source == "codex")
+    consensus = next(row for row in rows if row.source == "consensus")
+    assert claude.action is None and claude.drivers == () and claude.score is None
+    assert codex.drivers == ("relative_strength",) and codex.score == 0.75
+    assert consensus.disagreement is True
+    assert consensus.drivers == ("relative_strength",)
+    assert consensus.key_risk_types == ("macro_shock",)
+    assert consensus.score == 0.75
+
+
 def test_markdown_formats_rates_and_percentage_points_separately() -> None:
     markdown = render_score_markdown(
         {
@@ -707,11 +932,16 @@ def test_cli_arguments_output_files_and_offline_dispatch(
             "--compare-policies",
             "--horizons",
             "5,10",
+            "--top-n",
+            "3",
         ]
     )
     assert parsed.policy == "buy_one_side"
     assert parsed.confidence_aggregation == "mean"
     assert parsed.horizons == (5, 10)
+    assert parsed.top_candidates == 3
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["backtest", "score", str(tmp_path), "--top-n", "0"])
     store, gateway = _score_fixture()
     output = tmp_path / "score.json"
     runtime = BacktestScoreRuntime(

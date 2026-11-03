@@ -143,6 +143,13 @@ def test_recommendation_prompt_asks_for_every_stock_without_account() -> None:
     assert serialized["stocks"][0]["high_20d_distance_percent"] == "-4.50"
     assert serialized["stocks"][0]["high_52w_period_trading_days"] == 249
     assert "recommendations 항목을 정확히 하나씩" in prompt
+    assert (
+        "score와 expected_excess_return_10d로 후보끼리 상대 순위를 반드시 매기세요"
+        in prompt
+    )
+    assert "score는 후보 universe 안의 상대 매력도이며 -2~+2" in prompt
+    assert "drivers는 아래 스냅샷 근거로 확인되는 항목만 최대 3개" in prompt
+    assert "key_risk는 주요 위험 하나를 type과 note로 작성하세요" in prompt
     assert "이미 있는 항목은 다시 적지 마세요" in prompt
     assert "market:vkospi" in prompt
     assert "stocks[].industry" in prompt

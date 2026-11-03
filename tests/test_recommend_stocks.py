@@ -60,6 +60,12 @@ class FakeRecommender(DecisionModel[ModelRecommendation]):
 
 def rec(code: str, rating: Action, confidence: float = 0.8) -> StockRecommendation:
     priced = rating is not Action.HOLD
+    score = {
+        "005930": Decimal("1"),
+        "000660": Decimal("1.5"),
+        "086520": Decimal("-1"),
+        "999999": Decimal("0"),
+    }[code]
     return StockRecommendation(
         code=code,
         rating=rating,
@@ -67,6 +73,11 @@ def rec(code: str, rating: Action, confidence: float = 0.8) -> StockRecommendati
         target_price=Decimal("120") if priced else None,
         invalidation_price=Decimal("90") if priced else None,
         reason="why",
+        score=score,
+        expected_excess_return_10d=score * Decimal("2"),
+        drivers=["trend_up" if rating is Action.BUY else "trend_break"],
+        key_risk_type="event_risk",
+        key_risk_note="실적 발표",
     )
 
 
@@ -130,6 +141,11 @@ def test_completed_run_ranks_agreed_buys_and_ignores_codes_outside_snapshot(
     ]
     assert result.outcome is not None and result.outcome.consensus is not None
     assert [d.code for d in result.outcome.consensus.disagreements] == ["086520"]
+    assert [item.code for item in result.top_candidates or []] == [
+        "000660",
+        "005930",
+        "086520",
+    ]
     assert "계좌 잔고나 보유 여부와 무관하게" in claude.prompts[0]
 
     with sqlite3.connect(db_path) as connection:
@@ -145,6 +161,18 @@ def test_completed_run_ranks_agreed_buys_and_ignores_codes_outside_snapshot(
             "SELECT COUNT(*) FROM model_recommendations WHERE run_id = ?",
             (result.run_id,),
         ).fetchone()[0]
+        stored_fields = connection.execute(
+            "SELECT score, expected_excess_return_10d, drivers_json, key_risk_type, "
+            "key_risk_note FROM model_recommendations "
+            "WHERE run_id = ? AND model_id = 'claude' AND code = '005930'",
+            (result.run_id,),
+        ).fetchone()
+        consensus_fields = connection.execute(
+            "SELECT score, expected_excess_return_10d, drivers_json, key_risk_type, "
+            "key_risk_note FROM consensus_recommendations "
+            "WHERE run_id = ? AND code = '005930'",
+            (result.run_id,),
+        ).fetchone()
         disagreements = connection.execute(
             "SELECT code FROM consensus_disagreements WHERE run_id = ? "
             "ORDER BY disagreement_index",
@@ -153,6 +181,11 @@ def test_completed_run_ranks_agreed_buys_and_ignores_codes_outside_snapshot(
     assert (kind, status) == ("recommendation", "completed")
     assert ranked == [(1, "000660", "buy", "120"), (2, "005930", "buy", "120")]
     assert model_items == 8
+    assert stored_fields == ("1", "2", '["trend_up"]', "event_risk", "실적 발표")
+    assert consensus_fields is not None
+    assert consensus_fields[:2] == ("1", "2")
+    assert '"claude"' in consensus_fields[2]
+    assert '"codex"' in consensus_fields[2]
     assert disagreements == [("086520",)]
 
 
@@ -417,7 +450,7 @@ def test_version_1_ledger_is_migrated_in_place(tmp_path: Path) -> None:
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
         assert connection.execute(
             "SELECT kind, started_at, status FROM runs"
         ).fetchone() == (
@@ -438,7 +471,26 @@ def test_version_1_ledger_is_migrated_in_place(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
+        model_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(model_recommendations)")
+        }
+        consensus_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(consensus_recommendations)"
+            )
+        }
     assert {"model_recommendations", "consensus_recommendations"} <= tables
+    relative_columns = {
+        "score",
+        "expected_excess_return_10d",
+        "drivers_json",
+        "key_risk_type",
+        "key_risk_note",
+    }
+    assert relative_columns <= model_columns
+    assert relative_columns <= consensus_columns
 
 
 def test_version_2_ledger_preserves_verdicts_and_defaults_source_to_consensus(
@@ -490,7 +542,7 @@ def test_version_2_ledger_preserves_verdicts_and_defaults_source_to_consensus(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
         assert connection.execute(
             "SELECT kind, started_at, status FROM runs WHERE id = 7"
         ).fetchone() == ("decision", "2026-11-01", "completed")
@@ -599,7 +651,7 @@ def test_version_3_recommendation_prices_are_renamed_and_reopen_is_idempotent(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
         model_columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(model_recommendations)")
@@ -700,7 +752,7 @@ def test_version_4_migrates_policy_defaults_and_preserves_rows(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
         result = connection.execute(
             "SELECT summary, policy, confidence_aggregation "
             "FROM consensus_results WHERE run_id = 11"
@@ -802,5 +854,59 @@ def test_version_5_migrates_price_guard_columns_and_preserves_rows(
             "price_adjusted, price_warnings_json "
             "FROM consensus_recommendations WHERE run_id = 5"
         ).fetchone()
-    assert version == (6,)
+    assert version == (7,)
     assert migrated == ("90", None, 0, "[]")
+
+
+def test_version_6_migrates_relative_fields_as_null_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v6.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TABLE model_recommendations (
+                run_id INTEGER NOT NULL, model_id TEXT NOT NULL,
+                item_index INTEGER NOT NULL, code TEXT NOT NULL, rating TEXT NOT NULL,
+                confidence TEXT NOT NULL, target_price TEXT, invalidation_price TEXT,
+                reason TEXT NOT NULL, PRIMARY KEY (run_id, model_id, item_index)
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO model_recommendations VALUES "
+            "(1, 'claude', 0, '005930', 'buy', '0.8', '120', '90', '기존 모델')"
+        )
+        connection.execute(
+            """CREATE TABLE consensus_recommendations (
+                run_id INTEGER NOT NULL, rank INTEGER NOT NULL, code TEXT NOT NULL,
+                rating TEXT NOT NULL, confidence TEXT NOT NULL, target_price TEXT,
+                invalidation_price TEXT, reason TEXT NOT NULL,
+                consensus_basis TEXT NOT NULL DEFAULT 'agreed',
+                original_invalidation_price TEXT,
+                price_adjusted INTEGER NOT NULL DEFAULT 0,
+                price_warnings_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (run_id, rank)
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO consensus_recommendations VALUES "
+            "(1, 1, '005930', 'buy', '0.8', '120', '90', '기존 합의', "
+            "'agreed', NULL, 0, '[]')"
+        )
+        connection.execute("PRAGMA user_version = 6")
+
+    SQLiteDecisionLedger(db_path)
+    SQLiteDecisionLedger(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()
+        model_row = connection.execute(
+            "SELECT code, reason, score, expected_excess_return_10d, drivers_json, "
+            "key_risk_type, key_risk_note FROM model_recommendations"
+        ).fetchone()
+        consensus_row = connection.execute(
+            "SELECT code, reason, score, expected_excess_return_10d, drivers_json, "
+            "key_risk_type, key_risk_note FROM consensus_recommendations"
+        ).fetchone()
+    assert version == (7,)
+    assert model_row == ("005930", "기존 모델", None, None, None, None, None)
+    assert consensus_row == ("005930", "기존 합의", None, None, None, None, None)

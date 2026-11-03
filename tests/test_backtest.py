@@ -484,6 +484,11 @@ class FakeRecommendationModel(DecisionModel[ModelRecommendation]):
             self.price,
             self.price * Decimal("0.75"),
             f"{self.model_id} 근거",
+            score=Decimal("1.25"),
+            expected_excess_return_10d=Decimal("2.5"),
+            drivers=["trend_up"],
+            key_risk_type="event_risk",
+            key_risk_note="실적 일정",
         )
         return ModelRun(
             self.model_id,
@@ -668,6 +673,11 @@ def test_run_backtest_completed_writes_reusable_plain_and_masked_results(
     assert result["recommendations"][0]["price_adjusted"] is False
     assert "original_invalidation_price" in result["recommendations"][0]
     assert result["recommendations"][0]["price_warnings"] == []
+    assert result["models"][0]["decision"]["recommendations"][0]["score"] == "1.25"
+    assert result["recommendations"][0]["evidence_by_model"]["claude"]["drivers"] == [
+        "trend_up"
+    ]
+    assert result["top_candidates"][0]["score"] == "1.25"
     assert (options.output_dir / "dates" / "20260915.prompt.txt").is_file()
     assert len(calls) == 2
 
@@ -681,6 +691,7 @@ def test_run_backtest_completed_writes_reusable_plain_and_masked_results(
         )
         assert result["consensus"]["recommendations"][0]["code"] == alias
         assert result["consensus"]["restored"]["recommendations"][0]["code"] == "005930"
+        assert result["top_candidates"][0]["code"] == "005930"
         assert alias in prompt
         assert "005930" not in prompt
         assert "2026" not in prompt
@@ -870,6 +881,7 @@ def test_run_backtest_persists_effective_to_reuses_it_and_excludes_intraday_toda
     assert manifest is not None
     effective_to = manifest["effective_to"]
     assert manifest["arguments"]["effective_to"] == effective_to
+    assert manifest["arguments"]["top_candidates"] == 5
     assert effective_to < "20261103"
     assert calls == ["20261102"]
 

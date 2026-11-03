@@ -38,6 +38,22 @@ def build_recommendation_prompt(
   - buy: 지금 신규 진입해도 기대수익이 위험보다 크다.
   - hold: 진입·청산 근거가 약하거나 판단이 엇갈린다. 확신이 낮으면 hold로 적으세요.
   - sell: 보유 중이라면 줄이거나 피해야 한다.
+- rating은 신중하게 판단하되, 근거가 약해 rating을 hold로 두더라도
+  score와 expected_excess_return_10d로 후보끼리 상대 순위를 반드시 매기세요.
+  종목마다 같은 점수나 기대수익률을 남발하지 마세요.
+- score는 후보 universe 안의 상대 매력도이며 -2~+2 숫자입니다.
+  +2는 가장 매력적인 후보, -2는 가장 약한 후보입니다.
+- expected_excess_return_10d는 universe 평균 대비 향후 10거래일 기대 초과수익(%p)이며
+  -50~+50 범위의 숫자입니다.
+- drivers는 아래 스냅샷 근거로 확인되는 항목만 최대 3개 고르세요.
+  가능한 값: trend_up, trend_break, overheated, oversold_rebound,
+  volume_surge, volume_dry, breakout, support_hold, news_positive,
+  news_negative, macro_risk, relative_strength, relative_weakness,
+  volatility_high. 근거가 없으면 빈 배열을 쓰세요.
+- key_risk는 주요 위험 하나를 type과 note로 작성하세요.
+  type은 trend_reversal, overheat_pullback, event_risk, macro_shock,
+  liquidity, data_gap, other 중 하나입니다. note는 스냅샷에서 확인되는
+  구체적 위험을 짧게 설명하세요.
 - confidence는 아래 공통 확신도 척도에 따라 판단 자체의 확신도를 적으세요.
 - buy와 sell이면 target_price와 invalidation_price를 원 단위 숫자로 적으세요.
   - buy: target_price는 목표가, invalidation_price는 손절가입니다.

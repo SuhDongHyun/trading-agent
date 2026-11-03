@@ -165,6 +165,7 @@ class BacktestOptions:
     consensus: Mapping[str, str]
     models: Mapping[str, Any]
     git_sha: str | None = None
+    top_candidates: int = 5
 
 
 def choose_dates(
@@ -624,15 +625,22 @@ class RunBacktest:
         ignored_arguments = {"workers", "out", "cache_dir"}
         existing_arguments = existing.get("arguments")
         expected_arguments = expected["arguments"]
-        arguments_match = isinstance(existing_arguments, Mapping) and {
-            key: value
-            for key, value in existing_arguments.items()
-            if key not in ignored_arguments
-        } == {
-            key: value
-            for key, value in expected_arguments.items()
-            if key not in ignored_arguments
-        }
+        if isinstance(existing_arguments, Mapping):
+            existing_comparable = {
+                key: value
+                for key, value in existing_arguments.items()
+                if key not in ignored_arguments
+            }
+            if "top_candidates" not in existing_comparable:
+                existing_comparable["top_candidates"] = 5
+            expected_comparable = {
+                key: value
+                for key, value in expected_arguments.items()
+                if key not in ignored_arguments
+            }
+            arguments_match = existing_comparable == expected_comparable
+        else:
+            arguments_match = False
         if not arguments_match or any(
             existing.get(key) != expected.get(key)
             for key in (
@@ -669,6 +677,7 @@ class RunBacktest:
                 "seed": options.seed,
                 "universe": list(options.universe),
                 "horizons": list(options.horizons),
+                "top_candidates": options.top_candidates,
                 "mask": options.mask,
                 "workers": options.workers,
                 "decision_time": options.decision_time.strftime("%H:%M"),
@@ -713,9 +722,14 @@ def recommendation_result_json(
     if mapping and consensus is not None:
         consensus_data["restored"] = json_value(_restore_consensus(consensus, mapping))
     recommendations = list(result.recommendations or [])
+    top_candidates = list(result.top_candidates or [])
     if mapping:
         recommendations = [
             restore_recommendation(item, mapping) for item in recommendations
+        ]
+        top_candidates = [
+            replace(item, code=mapping.original_code(item.code))
+            for item in top_candidates
         ]
     snapshot = result.snapshot
     result_data: dict[str, Any] = {
@@ -726,6 +740,7 @@ def recommendation_result_json(
         "models": models,
         "consensus": consensus_data,
         "recommendations": json_value(recommendations),
+        "top_candidates": json_value(top_candidates),
     }
     if mapping is not None:
         result_data["masking"] = mapping.as_json()
@@ -745,4 +760,8 @@ def _restore_consensus(
             restore_recommendation(item, mapping) for item in consensus.recommendations
         ],
         disagreements=disagreements,
+        candidates=[
+            replace(item, code=mapping.original_code(item.code))
+            for item in consensus.candidates
+        ],
     )

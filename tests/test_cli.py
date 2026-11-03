@@ -200,6 +200,7 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
         StockSnapshot,
     )
     from trading_agent.domain.recommendation import (
+        RecommendationCandidate,
         RecommendationConsensusResult,
         StockRecommendation,
     )
@@ -254,6 +255,15 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
         snapshot=snapshot,
         outcome=RecommendationConsensusOutcome(run, run, consensus),
         recommendations=[*buys, sell],
+        top_candidates=[
+            RecommendationCandidate(
+                code="005930",
+                score=Decimal("1.5"),
+                expected_excess_return_10d=Decimal("3.2"),
+                claude_score=Decimal("1"),
+                codex_score=Decimal("2"),
+            )
+        ],
     )
     runtime = FakeRuntime(result)
 
@@ -265,6 +275,8 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
     out = capsys.readouterr().out
     assert exit_code == 0
     assert runtime.closed
+    assert "상대강도 상위 후보:" in out
+    assert "1. 005930 삼성전자 score 1.5 / 10일 기대 초과수익 3.2%p" in out
     assert (
         "1. 000660 SK하이닉스 (claude 단독 buy) 확신도 0.90 목표가 1,200원 "
         "손절가 900원 (ATR 보정, 원래 950원)"
