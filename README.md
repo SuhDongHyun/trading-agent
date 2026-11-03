@@ -200,6 +200,57 @@ BUY 확신도 순, SELL, HOLD,
 조회하지 않으며 Risk Guard도 적용하지 않습니다. 현재가를 읽지 못한 종목은
 `missing`에 적고 제외합니다.
 
+### 과거 시점 백테스트
+
+`backtest run`은 과거 판단일의 입력 스냅샷을 재구성하고 기존 추천 유스케이스와
+두 모델 합의를 실행합니다. 채점은 결과를 저장한 뒤 별도 분석에서 수행합니다.
+먼저 모델을 호출하지 않는 `--snapshot-only`로 누수 차단과 누락 데이터를 확인하세요.
+
+```sh
+uv run trading-agent backtest run --snapshot-only \
+  --date 20260915 --universe 005930 \
+  --out data/backtest/pit-check
+uv run trading-agent backtest run \
+  --from 20260701 --dates 20 --seed 20261103 \
+  --universe 005930,000660 --out data/backtest/sample
+```
+
+날짜를 지정하지 않으면 기본 시작일은 `20260701`이고, 종료일은 기본 horizons
+`5,10,20` 중 가장 긴 horizon의 종가가 확보된 마지막 KOSPI 거래일입니다.
+KST 15:30 전에는 당일 KOSPI 날짜를 달력에서 제외합니다. 계산된 `effective_to`는
+manifest에 저장하고 재개 실행에서 다시 사용하므로 날짜 표본이 바뀌지 않습니다.
+`--date YYYYMMDD`를 반복하거나 콤마로 묶어 날짜를 고를 수 있고, `--dates all`은
+구간의 모든 거래일을 실행합니다. `--dates N`은 seed로 재현 가능한 무작위 표본을
+뽑습니다. 날짜는 기본 순차 실행이며 `--workers 2`까지 허용합니다. 완료된 날짜
+파일은 기본 재개 동작으로 건너뜁니다.
+
+판단 시각은 기본 KST 15:40이며 `--decision-time HH:MM`으로 조정할 수 있습니다.
+과거 데이터는 다음 경계로 자릅니다.
+
+| 데이터 | 백테스트에 허용하는 마지막 날짜 |
+| --- | --- |
+| 종목 일봉, 이동평균, RSI, RSI signal, MACD, MACD signal | 판단일 D 포함 |
+| KOSPI, KOSDAQ, VKOSPI, 국고 3년 | 판단일 D 포함 |
+| S&P 500, VIX, USD/KRW, 미 10년 | D 이전 |
+| 뉴스 | 검색일이 D 이하이고 게시 시각이 판단 시각 이하 |
+| 공포탐욕 지수 | 과거 조회 불가로 missing 처리 |
+
+일봉에서 D 종가와 직전 거래일 종가로 현재가와 등락률을 재구성합니다. `--mask`는
+모델 입력에서 날짜·종목 식별자·종목명·뉴스를 감추고 종목별 가격 배율을 적용합니다.
+결과에는 별도 역변환표와 복구한 추천을 함께 저장합니다.
+
+기본 결과는 `data/backtest/<run-id>/` 아래 `manifest.json`, `dates/<D>.json`,
+프롬프트 파일, `backtest.db`로 저장됩니다. `--out`과 `--db`로 각각 바꿀 수 있고,
+운영 `ledger.db_path`와 같은 DB 경로는 거부합니다. 응답 캐시는
+`data/backtest/cache/`를 사용하며 요청은 직렬화됩니다. `data/` 전체는 gitignore
+대상입니다. `--snapshot-only`는 모델과 ledger를 실행하지 않습니다.
+
+모델의 학습 기억은 제거할 수 없으므로 `20260701` 이전 판단에는 기억 누수 경고가
+표시됩니다. 기본 분석 권장 구간도 이 날짜 이후입니다. trading-api의 수정주가 정책,
+과거 trading-api 정정 데이터, 실제 운영 환경과 다른 15:40 판단 시각은 결과에 남는
+한계입니다. 모델 실행은 날짜마다 Claude와 Codex를 한 번씩 호출하므로 구독 사용량을
+확인하고, 먼저 `--snapshot-only`로 API 데이터와 결과 범위를 점검하세요.
+
 종료 코드는 cron 모니터링에 사용합니다. `run`과 `recommend`에 공통입니다.
 SIGTERM은 `SystemExit(143)`으로 바뀌며 실행 중인 유스케이스가 ERROR 상태 기록을 시도한 뒤 종료합니다.
 
