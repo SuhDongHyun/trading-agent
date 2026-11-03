@@ -134,6 +134,7 @@ class LedgerSettings(BaseModel):
     """결정 기록 저장 위치."""
 
     db_path: Path = Path("data/trading-agent.db")
+    stale_run_after_seconds: int = Field(default=3600, gt=0)
 
 
 class AgentSettings(BaseSettings):

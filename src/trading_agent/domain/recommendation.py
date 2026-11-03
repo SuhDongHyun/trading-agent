@@ -21,26 +21,26 @@ from trading_agent.domain.models import (
 
 @dataclass(frozen=True, slots=True)
 class StockRecommendation:
-    """한 종목에 대한 투자의견, 목표가, 손절가."""
+    """한 종목에 대한 투자의견, 목표가, 의견 무효화 가격."""
 
     code: str
     rating: Action
     confidence: float
     target_price: Decimal | None
-    stop_loss_price: Decimal | None
+    invalidation_price: Decimal | None
     reason: str
 
     def __post_init__(self) -> None:
         require_stock_code(self.code)
         object.__setattr__(self, "rating", require_action(self.rating))
         object.__setattr__(self, "confidence", require_confidence(self.confidence))
-        for field_name in ("target_price", "stop_loss_price"):
+        for field_name in ("target_price", "invalidation_price"):
             value = getattr(self, field_name)
             if value is None:
                 continue
             price = to_decimal(value)
             if price <= 0:
-                raise DomainError("목표가와 손절가는 0보다 커야 합니다.")
+                raise DomainError("목표가와 의견 무효화 가격은 0보다 커야 합니다.")
             object.__setattr__(self, field_name, price)
 
 
@@ -128,22 +128,22 @@ class RecommendationConsensusPolicy:
 def _merge(
     claude: StockRecommendation, codex: StockRecommendation
 ) -> StockRecommendation:
-    """같은 의견을 낮은 확신도와 보수적인 목표가·손절가로 합친다."""
+    """같은 의견을 낮은 확신도와 보수적인 목표가·무효화 가격으로 합친다."""
 
     if claude.rating is Action.BUY:
         target = _both(claude.target_price, codex.target_price, min)
-        stop = _both(claude.stop_loss_price, codex.stop_loss_price, max)
+        invalidation = _both(claude.invalidation_price, codex.invalidation_price, max)
     elif claude.rating is Action.SELL:
         target = _both(claude.target_price, codex.target_price, max)
-        stop = _both(claude.stop_loss_price, codex.stop_loss_price, min)
+        invalidation = _both(claude.invalidation_price, codex.invalidation_price, min)
     else:
-        target = stop = None
+        target = invalidation = None
     return StockRecommendation(
         code=claude.code,
         rating=claude.rating,
         confidence=min(claude.confidence, codex.confidence),
         target_price=target,
-        stop_loss_price=stop,
+        invalidation_price=invalidation,
         reason=f"[claude] {claude.reason} / [codex] {codex.reason}",
     )
 

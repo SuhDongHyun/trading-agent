@@ -57,6 +57,7 @@ def test_default_config_is_loaded_from_current_working_directory(
     assert settings.llm.claude.timeout_seconds == 300
     assert settings.llm.codex.timeout_seconds == 300
     assert settings.ledger.db_path == Path("data/trading-agent.db")
+    assert settings.ledger.stale_run_after_seconds == 3600
 
 
 def test_missing_explicit_config_is_an_error(tmp_path: Path) -> None:

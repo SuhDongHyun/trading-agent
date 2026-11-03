@@ -398,7 +398,7 @@ def test_adapters_use_the_given_task_schema_and_parser() -> None:
                 "rating": "hold",
                 "confidence": 0.5,
                 "target_price": None,
-                "stop_loss_price": None,
+                "invalidation_price": None,
                 "reason": "r",
             }
         ],

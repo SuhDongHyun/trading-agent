@@ -1,9 +1,10 @@
+import signal
 from pathlib import Path
 
 import pytest
 
 from trading_agent.application.records import CycleStatus, DecisionCycleResult
-from trading_agent.interface.cli import main
+from trading_agent.interface.cli import _handle_sigterm, main
 
 
 class FakeRuntime[R]:
@@ -16,6 +17,13 @@ class FakeRuntime[R]:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_sigterm_handler_raises_system_exit_143() -> None:
+    with pytest.raises(SystemExit) as error:
+        _handle_sigterm(signal.SIGTERM, None)
+
+    assert error.value.code == 143
 
 
 @pytest.mark.parametrize(
@@ -95,6 +103,16 @@ def test_run_force_flag_is_forwarded_to_runtime_factory(
     assert main(["run", "--force"], runtime_factory=runtime_factory) == 0
     assert calls == [True]
     assert runtime.closed
+
+
+@pytest.mark.parametrize("top", ["0", "-1"])
+def test_recommend_top_must_be_positive(tmp_path: Path, monkeypatch, top: str) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as error:
+        main(["recommend", "--top", top])
+
+    assert error.value.code == 2
 
 
 def test_run_prints_approved_and_rejected_sources(
@@ -205,6 +223,7 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
         stocks=[
             StockSnapshot("000660", "SK하이닉스"),
             StockSnapshot("005930", "삼성전자"),
+            StockSnapshot("086520", "에코프로"),
         ],
         market_context=MarketContext(),
         missing=[],
@@ -229,4 +248,4 @@ def test_recommend_command_prints_ranked_buys_and_returns_exit_code(
     assert "1. 000660 SK하이닉스 확신도 0.90 목표가 1,200원 손절가 900원" in out
     assert "005930 삼성전자 확신도" not in out
     assert "예상 하락가 66,000원, 79,000원 위로 오르면 매도 의견 철회" in out
-    assert "불일치: 086520 (claude buy / codex 미응답)" in out
+    assert "불일치: 086520 에코프로 (claude buy / codex 미응답)" in out

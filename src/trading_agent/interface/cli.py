@@ -1,10 +1,12 @@
 """명령행 진입점."""
 
 import argparse
+import signal
 import sys
 from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import Path
+from types import FrameType
 from typing import Protocol
 
 from trading_agent.application.records import (
@@ -41,7 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_parser.add_argument("--config", type=Path, help="YAML 설정 파일 경로")
     recommend_parser.add_argument("--db", type=Path, help="SQLite 기록 파일 경로")
     recommend_parser.add_argument(
-        "--top", type=int, help="표시할 BUY 추천 수 (기본: recommendation.max_results)"
+        "--top",
+        type=_positive_int,
+        help="표시할 BUY 추천 수 (기본: recommendation.max_results)",
     )
     return parser
 
@@ -54,6 +58,12 @@ class _Runtime[R](Protocol):
     def close(self) -> None: ...
 
 
+def _handle_sigterm(_signum: int, _frame: FrameType | None) -> None:
+    """SIGTERM을 종료 코드 143인 SystemExit로 바꿔 실행 정리를 허용한다."""
+
+    raise SystemExit(143)
+
+
 def main(
     argv: Sequence[str] | None = None,
     runtime_factory: Callable[..., _Runtime[DecisionCycleResult]] = create_runtime,
@@ -63,6 +73,7 @@ def main(
 ) -> int:
     """CLI를 실행하고 cron에서 확인할 종료 코드를 반환한다."""
 
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     args = build_parser().parse_args(argv)
     if args.command == "run":
         return _execute(
@@ -201,7 +212,7 @@ def _print_recommendation(
     """한 추천 항목과 가격 기준, 근거를 표시한다."""
 
     target = _price(item.target_price)
-    invalidation = _price(item.stop_loss_price)
+    invalidation = _price(item.invalidation_price)
     if item.rating is Action.SELL:
         levels = f"예상 하락가 {target}, {invalidation} 위로 오르면 매도 의견 철회"
     else:
@@ -221,6 +232,18 @@ def _price(value: Decimal | None) -> str:
     """가격을 원 단위 천 단위 구분 문자열로 바꾼다."""
 
     return "-" if value is None else f"{value:,.0f}원"
+
+
+def _positive_int(value: str) -> int:
+    """CLI에서 1 이상의 정수만 받는다."""
+
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("양의 정수여야 합니다.") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("양의 정수여야 합니다.")
+    return parsed
 
 
 def _exit_code(status: CycleStatus) -> int:

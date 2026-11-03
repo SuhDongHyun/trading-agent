@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import fields, is_dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -25,11 +25,57 @@ from trading_agent.domain.recommendation import (
     StockRecommendation,
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _RUN_KIND_DECISION = "decision"
 _RUN_KIND_RECOMMENDATION = "recommendation"
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    """테이블이 있을 때 그 열 이름을 반환한다."""
+
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """run 종류 열을 추가한다."""
+
+    if "kind" not in _table_columns(connection, "runs"):
+        connection.execute(
+            "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'decision'"
+        )
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """기존 리스크 판정에 출처와 규칙 종류 열을 추가한다."""
+
+    columns = _table_columns(connection, "risk_verdicts")
+    if not columns:
+        return
+    if "source" not in columns:
+        connection.execute(
+            "ALTER TABLE risk_verdicts ADD COLUMN source TEXT NOT NULL "
+            "DEFAULT 'consensus'"
+        )
+    if "rule_type" not in columns:
+        connection.execute("ALTER TABLE risk_verdicts ADD COLUMN rule_type TEXT")
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """추천 가격 열을 의견 철회 가격 의미로 이름 변경한다."""
+
+    for table in ("model_recommendations", "consensus_recommendations"):
+        columns = _table_columns(connection, table)
+        if "stop_loss_price" in columns and "invalidation_price" not in columns:
+            connection.execute(
+                f"ALTER TABLE {table} RENAME COLUMN stop_loss_price "
+                "TO invalidation_price"
+            )
+
+
 _MIGRATIONS = {
-    1: ("ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'decision'",),
+    1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
+    3: _migrate_v3_to_v4,
 }
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS runs (
@@ -120,7 +166,7 @@ _SCHEMA = (
         rating TEXT NOT NULL,
         confidence TEXT NOT NULL,
         target_price TEXT,
-        stop_loss_price TEXT,
+        invalidation_price TEXT,
         reason TEXT NOT NULL,
         PRIMARY KEY (run_id, model_id, item_index),
         FOREIGN KEY (run_id, model_id)
@@ -133,7 +179,7 @@ _SCHEMA = (
         rating TEXT NOT NULL,
         confidence TEXT NOT NULL,
         target_price TEXT,
-        stop_loss_price TEXT,
+        invalidation_price TEXT,
         reason TEXT NOT NULL,
         PRIMARY KEY (run_id, rank)
     )""",
@@ -147,8 +193,16 @@ _SCHEMA = (
 class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
     """디렉터리와 버전 스키마를 준비해 매매 사이클과 추천 실행을 기록한다."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        stale_run_after: timedelta = timedelta(hours=1),
+    ) -> None:
+        if stale_run_after <= timedelta(0):
+            raise ValueError("stale_run_after는 0보다 커야 합니다.")
         self.db_path = Path(db_path).expanduser()
+        self.stale_run_after = stale_run_after
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._create_schema()
 
@@ -219,7 +273,7 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                 connection.execute(
                     """INSERT INTO consensus_recommendations
                        (run_id, rank, code, rating, confidence, target_price,
-                        stop_loss_price, reason)
+                        invalidation_price, reason)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (result.run_id, rank, *_recommendation_values(item)),
                 )
@@ -265,7 +319,7 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
             raise ValueError(f"running 사이클을 찾을 수 없습니다: {run_id}")
 
     def _create_schema(self) -> None:
-        """최초 실행 시 테이블을 만들고 지원하지 않는 DB 버전을 거절한다."""
+        """순차 마이그레이션과 스키마 생성 후 오래된 실행을 정리한다."""
 
         with self._connection() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -273,32 +327,33 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                 raise RuntimeError(f"SQLite 기록 버전 {version}은 지원하지 않습니다.")
             try:
                 connection.execute("BEGIN")
-                for statement in _MIGRATIONS.get(version, ()):
-                    connection.execute(statement)
+                while 0 < version < _SCHEMA_VERSION:
+                    migration = _MIGRATIONS.get(version)
+                    if migration is None:
+                        raise RuntimeError(
+                            f"SQLite 기록 버전 {version}의 마이그레이션이 없습니다."
+                        )
+                    migration(connection)
+                    version += 1
                 for statement in _SCHEMA:
                     connection.execute(statement)
-                if version < 3:
-                    self._migrate_risk_verdict_sources(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                now = datetime.now(UTC)
+                cutoff = now - self.stale_run_after
+                connection.execute(
+                    """UPDATE runs
+                       SET finished_at = ?, status = 'abandoned',
+                           error = COALESCE(
+                               error, '오래된 running 실행을 abandoned로 정리했습니다.'
+                           )
+                       WHERE status = 'running'
+                         AND julianday(started_at) <= julianday(?)""",
+                    (_iso_datetime(now), _iso_datetime(cutoff)),
+                )
                 connection.commit()
-            except Exception:
+            except BaseException:
                 connection.rollback()
                 raise
-
-    @staticmethod
-    def _migrate_risk_verdict_sources(connection: sqlite3.Connection) -> None:
-        """기존 리스크 판정에 합의 출처 기본값과 규칙 종류 열을 추가한다."""
-
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(risk_verdicts)")
-        }
-        if "source" not in columns:
-            connection.execute(
-                "ALTER TABLE risk_verdicts ADD COLUMN source TEXT NOT NULL "
-                "DEFAULT 'consensus'"
-            )
-        if "rule_type" not in columns:
-            connection.execute("ALTER TABLE risk_verdicts ADD COLUMN rule_type TEXT")
 
     def _finish_cycle(self, result: DecisionCycleResult, finished_at: datetime) -> None:
         """run 행과 관련 상세 행을 같은 SQLite 트랜잭션으로 갱신한다."""
@@ -395,7 +450,7 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
             connection.execute(
                 """INSERT INTO model_recommendations
                    (run_id, model_id, item_index, code, rating, confidence,
-                    target_price, stop_loss_price, reason)
+                    target_price, invalidation_price, reason)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
@@ -545,7 +600,7 @@ def _recommendation_values(item: StockRecommendation) -> tuple[object, ...]:
         item.rating.value,
         str(item.confidence),
         None if item.target_price is None else str(item.target_price),
-        None if item.stop_loss_price is None else str(item.stop_loss_price),
+        None if item.invalidation_price is None else str(item.invalidation_price),
         item.reason,
     )
 
