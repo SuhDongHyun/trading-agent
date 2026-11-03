@@ -2,9 +2,12 @@ import json
 import os
 import signal
 import subprocess
+import sys
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
+from typing import cast
 
 import pytest
 
@@ -13,6 +16,7 @@ from trading_agent.application.errors import DecisionModelError
 from trading_agent.application.model_tasks import DECISION_TASK, RECOMMENDATION_TASK
 from trading_agent.domain.recommendation import ModelRecommendation
 from trading_agent.infrastructure.command_runner import (
+    CommandExecutionError,
     CommandResult,
     CommandRunner,
     CommandTimeoutError,
@@ -252,6 +256,7 @@ def test_subprocess_runner_removes_api_keys_and_keeps_oauth_token(
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "subscription-token")
 
     class FakeProcess:
+        pid = 123_456
         returncode = 0
 
         def communicate(
@@ -280,13 +285,109 @@ def test_subprocess_runner_removes_api_keys_and_keeps_oauth_token(
         fake_popen,
     )
 
-    result = SubprocessCommandRunner().run(
-        ["fake-cli", "--flag"], "stdin prompt", tmp_path, 10
-    )
+    runner = SubprocessCommandRunner()
+    result = runner.run(["fake-cli", "--flag"], "stdin prompt", tmp_path, 10)
 
     assert result.stdout == "out"
     assert result.stderr == "err"
     assert result.exit_code == 0
+    assert runner._processes == {}
+
+
+@pytest.mark.parametrize(
+    ("ignore_sigterm", "expected_exit_code"),
+    [
+        (False, -signal.SIGTERM),
+        (True, -signal.SIGKILL),
+    ],
+    ids=["term", "kill-after-grace"],
+)
+def test_terminate_all_stops_registered_process_groups(
+    tmp_path: Path, ignore_sigterm: bool, expected_exit_code: int
+) -> None:
+    runner = SubprocessCommandRunner()
+    ready_file = tmp_path / "ready"
+    install_handler = (
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); " if ignore_sigterm else ""
+    )
+    child_code = (
+        f"import signal, time; {install_handler}"
+        f"open({str(ready_file)!r}, 'w').close(); time.sleep(60)"
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            runner.run,
+            [sys.executable, "-c", child_code],
+            "",
+            tmp_path,
+            60,
+        )
+        try:
+            deadline = monotonic() + 3
+            while not ready_file.exists() and monotonic() < deadline:
+                sleep(0.01)
+            assert runner._processes
+            assert ready_file.is_file()
+
+            started = monotonic()
+            runner.terminate_all()
+            result = future.result(timeout=2)
+
+            assert monotonic() - started < 1
+            assert result.exit_code == expected_exit_code
+            assert runner._processes == {}
+        finally:
+            runner.terminate_all()
+            if not future.done():
+                future.result(timeout=2)
+
+
+def test_run_after_terminate_all_is_rejected_without_spawning(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runner = SubprocessCommandRunner()
+    runner.terminate_all()
+    popen_calls = []
+
+    def unexpected_popen(*_args, **_kwargs):
+        popen_calls.append(True)
+        raise AssertionError("종료 중인 runner는 Popen을 호출하면 안 됩니다.")
+
+    monkeypatch.setattr(
+        "trading_agent.infrastructure.command_runner.subprocess.Popen",
+        unexpected_popen,
+    )
+
+    with pytest.raises(CommandExecutionError, match="종료 중"):
+        runner.run(["fake-cli"], "", tmp_path, 10)
+
+    assert popen_calls == []
+
+
+def test_terminate_all_ignores_stale_registry_groups_within_grace(
+    monkeypatch,
+) -> None:
+    process_group_id = 123_456_789
+    runner = SubprocessCommandRunner()
+    runner._processes[process_group_id] = cast(subprocess.Popen[str], object())
+    signals: list[tuple[int, int]] = []
+
+    def missing_group(group_id: int, signal_number: int) -> None:
+        signals.append((group_id, signal_number))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(
+        "trading_agent.infrastructure.command_runner.os.killpg", missing_group
+    )
+
+    started = monotonic()
+    runner.terminate_all()
+
+    assert monotonic() - started < 0.2
+    assert signals == [
+        (process_group_id, signal.SIGTERM),
+        (process_group_id, 0),
+    ]
 
 
 def test_timeout_terminates_child_process_group_and_preserves_output(

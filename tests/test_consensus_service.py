@@ -1,8 +1,14 @@
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from threading import Event
+from time import monotonic
 
 import pytest
 
-from trading_agent.application.consensus_service import ConsensusDecisionService
+from trading_agent.application.consensus_service import (
+    ConsensusDecisionService,
+    run_both,
+)
 from trading_agent.application.errors import DecisionModelError
 from trading_agent.application.ports import DecisionModel, ModelRun
 from trading_agent.domain.models import Action, ModelDecision, TradeProposal
@@ -128,3 +134,45 @@ def test_unexpected_model_exception_is_preserved_as_failure() -> None:
     assert result.failed
     assert result.proposals == []
     assert result.claude_run.error == "RuntimeError: unexpected"
+
+
+def test_interruption_does_not_wait_for_other_model_and_calls_supervisor() -> None:
+    release_model = Event()
+
+    class InterruptingModel:
+        def decide(self, prompt: str) -> ModelRun:
+            raise SystemExit(143)
+
+    class WaitingModel:
+        def decide(self, prompt: str) -> ModelRun:
+            assert release_model.wait(timeout=5)
+            return ModelRun("codex", "", "", 0, 0.1, decision=make_decision())
+
+    class FakeSupervisor:
+        calls = 0
+
+        def terminate_all(self) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt
+            release_model.set()
+
+    supervisor = FakeSupervisor()
+    started = monotonic()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        interrupted = pool.submit(
+            run_both,
+            InterruptingModel(),
+            WaitingModel(),
+            "shared prompt",
+            supervisor,
+        )
+        try:
+            with pytest.raises(SystemExit) as raised:
+                interrupted.result(timeout=2)
+        finally:
+            release_model.set()
+
+    assert raised.value.code == 143
+    assert supervisor.calls == 2
+    assert monotonic() - started < 1

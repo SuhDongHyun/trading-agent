@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 from trading_agent.domain.models import AccountSnapshot
 
@@ -79,6 +79,13 @@ class TreasuryMaturity(StrEnum):
 
     KOREA_3Y = "korea-3y"
     US_10Y = "us-10y"
+
+
+class ProcessSupervisor(Protocol):
+    """중단 시 application이 실행 중인 외부 프로세스를 정리하는 포트."""
+
+    def terminate_all(self) -> None:
+        """이 실행이 시작한 모든 외부 프로세스 그룹을 종료한다."""
 
 
 class MarketDataGateway(ABC):
