@@ -1,5 +1,6 @@
 """CLI 인자와 설정에서 application 유스케이스·외부 어댑터를 조립한다."""
 
+import json
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -16,6 +17,10 @@ from trading_agent.application.backtest import (
     MaskedSnapshotProvider,
     RunBacktest,
 )
+from trading_agent.application.backtest_score import (
+    BacktestScoreOptions,
+    ScoreBacktest,
+)
 from trading_agent.application.consensus_service import (
     ConsensusDecisionService,
     RecommendationConsensusService,
@@ -29,6 +34,7 @@ from trading_agent.application.records import (
 )
 from trading_agent.application.run_decision_cycle import RunDecisionCycle
 from trading_agent.application.snapshot_builder import SnapshotBuilder
+from trading_agent.domain.models import ConfidenceAggregation, ConsensusPolicyName
 from trading_agent.domain.risk import RiskPolicy
 from trading_agent.infrastructure.backtest_result_store import FileBacktestResultStore
 from trading_agent.infrastructure.command_runner import SubprocessCommandRunner
@@ -41,7 +47,7 @@ from trading_agent.infrastructure.point_in_time_gateway import (
     PointInTimeGateway,
     SharedDailyCache,
 )
-from trading_agent.infrastructure.response_cache import ResponseCache
+from trading_agent.infrastructure.response_cache import ResponseCache, atomic_write_text
 from trading_agent.infrastructure.sqlite_ledger import SQLiteDecisionLedger
 from trading_agent.infrastructure.trading_api import TradingApiMarketDataGateway
 
@@ -160,6 +166,46 @@ class BacktestRuntime:
         """응답 캐시와 그 안의 HTTP 클라이언트를 닫는다."""
 
         self.cache.close()
+
+
+@dataclass(slots=True)
+class BacktestScoreRuntime:
+    """채점 유스케이스 실행, 보고서 저장, HTTP 어댑터 정리를 제공한다."""
+
+    use_case: ScoreBacktest
+    gateway: TradingApiMarketDataGateway
+    output_json: Path
+    output_markdown: Path
+
+    def run(self) -> None:
+        """채점 결과를 JSON·Markdown으로 저장하고 핵심 지표를 출력한다."""
+
+        scored = self.use_case.run()
+        atomic_write_text(
+            self.output_json,
+            json.dumps(scored.data, ensure_ascii=False, indent=2, allow_nan=False)
+            + "\n",
+        )
+        atomic_write_text(self.output_markdown, scored.markdown)
+        counts = scored.data["counts"]
+        print(
+            "백테스트 채점 완료: "
+            f"{counts['completed_dates']}일, policy={scored.data['policy']}/"
+            f"{scored.data['confidence_aggregation']}"
+        )
+        for horizon in scored.data["horizons"]:
+            metric = scored.data["sources"]["consensus"]["horizons"][str(horizon)]
+            print(
+                f"합의 {horizon}일: buy {metric['buy_n']}건, "
+                f"buy xs 평균 {metric['buy_mean_xs']}, "
+                f"sell xs 평균 {metric['sell_mean_xs']}"
+            )
+        print(f"보고서: {self.output_json} / {self.output_markdown}")
+
+    def close(self) -> None:
+        """응답 캐시와 trading-api HTTP 연결을 닫는다."""
+
+        self.gateway.close()
 
 
 def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRuntime:
@@ -311,6 +357,43 @@ def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRunti
         warning=warning,
     )
     return BacktestRuntime(use_case, cache)
+
+
+def create_backtest_score_runtime(
+    settings: AgentSettings, args: Any
+) -> BacktestScoreRuntime:
+    """저장 결과, 실제 조회 게이트웨이, cache를 채점 유스케이스에 연결한다."""
+
+    output_dir = Path(args.result_dir)
+    result_store = FileBacktestResultStore(output_dir)
+    manifest = result_store.read_manifest()
+    if manifest is None:
+        raise ValueError("manifest.json을 찾을 수 없습니다.")
+    arguments = manifest.get("arguments", {})
+    cache_from_manifest = (
+        arguments.get("cache_dir") if isinstance(arguments, dict) else None
+    )
+    cache_dir = Path(args.cache_dir or cache_from_manifest or "data/backtest/cache")
+    output_json = Path(args.output or output_dir / "score.json")
+    output_markdown = output_json.with_suffix(".md")
+    gateway = TradingApiMarketDataGateway(settings.trading_api)
+    cache = ResponseCache(gateway.client, cache_dir)
+    gateway.client = cache  # type: ignore[assignment]
+    options = BacktestScoreOptions(
+        horizons=args.horizons,
+        policy=ConsensusPolicyName(args.policy) if args.policy else None,
+        confidence_aggregation=(
+            ConfidenceAggregation(args.confidence_aggregation)
+            if args.confidence_aggregation
+            else None
+        ),
+        compare_policies=args.compare_policies,
+        bootstrap_iterations=args.bootstrap_iterations,
+        seed=args.seed,
+        hold_bands=args.hold_bands,
+    )
+    use_case = ScoreBacktest(result_store, gateway, options)
+    return BacktestScoreRuntime(use_case, gateway, output_json, output_markdown)
 
 
 def create_recommendation_runtime(

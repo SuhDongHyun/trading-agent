@@ -20,6 +20,7 @@ from trading_agent.domain.recommendation import StockRecommendation
 from trading_agent.infrastructure.config import AgentSettings, load_settings
 from trading_agent.interface.bootstrap import (
     create_backtest_runtime,
+    create_backtest_score_runtime,
     create_recommendation_runtime,
     create_runtime,
 )
@@ -99,6 +100,42 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="완료된 날짜 결과를 건너뜀 (기본: 사용)",
     )
+    backtest_score = backtest_commands.add_parser(
+        "score", help="저장된 백테스트를 이후 가격으로 채점·재채점"
+    )
+    backtest_score.add_argument(
+        "result_dir", type=Path, help="backtest run 결과 디렉터리"
+    )
+    backtest_score.add_argument("--config", type=Path, help="YAML 설정 파일 경로")
+    backtest_score.add_argument("--cache-dir", type=Path, help="응답 캐시 디렉터리")
+    backtest_score.add_argument(
+        "--horizons",
+        type=_positive_list,
+        help="채점 거래일 horizon 목록 (기본: manifest)",
+    )
+    backtest_score.add_argument(
+        "--policy", choices=("strict", "buy_one_side"), help="재채점 합의 정책"
+    )
+    backtest_score.add_argument(
+        "--confidence-aggregation", choices=("min", "mean"), help="합의 확신도 집계"
+    )
+    backtest_score.add_argument(
+        "--compare-policies",
+        action="store_true",
+        help="전체 정책·확신도 조합 비교표 생성",
+    )
+    backtest_score.add_argument(
+        "--bootstrap-iterations", type=_positive_int, default=4000
+    )
+    backtest_score.add_argument("--seed", type=int, default=20261103)
+    backtest_score.add_argument(
+        "--hold-bands",
+        type=_hold_bands,
+        help="hold 적중 밴드 예: 5:2.5,10:3.5,20:5.0 (xs percentage points)",
+    )
+    backtest_score.add_argument(
+        "--output", type=Path, help="출력 JSON 파일 (기본: <out-dir>/score.json)"
+    )
     return parser
 
 
@@ -123,6 +160,9 @@ def main(
         ..., _Runtime[RecommendationRunResult]
     ] = create_recommendation_runtime,
     backtest_runtime_factory: Callable[..., _Runtime[int]] = create_backtest_runtime,
+    backtest_score_runtime_factory: Callable[
+        ..., _Runtime[None]
+    ] = create_backtest_score_runtime,
 ) -> int:
     """CLI를 실행하고 cron에서 확인할 종료 코드를 반환한다."""
 
@@ -145,7 +185,28 @@ def main(
         )
     if args.command == "backtest" and args.backtest_command == "run":
         return _execute_backtest(args, backtest_runtime_factory)
+    if args.command == "backtest" and args.backtest_command == "score":
+        return _execute_backtest_score(args, backtest_score_runtime_factory)
     return 0
+
+
+def _execute_backtest_score(
+    args: argparse.Namespace, factory: Callable[..., _Runtime[None]]
+) -> int:
+    """채점 설정과 런타임을 만들고 저장된 결과를 평가한다."""
+
+    runtime: _Runtime[None] | None = None
+    try:
+        settings = load_settings(args.config)
+        runtime = factory(settings, args)
+        runtime.run()
+        return 0
+    except Exception as error:
+        print(f"백테스트 채점 실패: {type(error).__name__}", file=sys.stderr)
+        return 1
+    finally:
+        if runtime is not None:
+            runtime.close()
 
 
 def _execute_backtest(
@@ -344,6 +405,37 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("양의 정수여야 합니다.")
     return parsed
+
+
+def _positive_list(value: str) -> tuple[int, ...]:
+    """콤마로 구분한 양수 horizon 목록을 읽는다."""
+
+    try:
+        values = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "horizons는 양의 정수 목록이어야 합니다."
+        ) from error
+    if not values or any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError("horizons는 양의 정수 목록이어야 합니다.")
+    return tuple(dict.fromkeys(values))
+
+
+def _hold_bands(value: str) -> dict[int, float]:
+    """horizon:percentage 쌍을 콤마로 구분해 읽는다."""
+
+    try:
+        result = {
+            int(pair.split(":", 1)[0].strip()): float(pair.split(":", 1)[1].strip())
+            for pair in value.split(",")
+        }
+    except (IndexError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "hold-bands 형식은 5:2.5,10:3.5 입니다."
+        ) from error
+    if not result or any(horizon <= 0 or band < 0 for horizon, band in result.items()):
+        raise argparse.ArgumentTypeError("horizon과 hold 밴드는 음수가 될 수 없습니다.")
+    return result
 
 
 def _worker_count(value: str) -> int:
