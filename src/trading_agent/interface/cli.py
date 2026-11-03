@@ -4,6 +4,7 @@ import argparse
 import signal
 import sys
 from collections.abc import Callable, Sequence
+from datetime import datetime, time
 from decimal import Decimal
 from pathlib import Path
 from types import FrameType
@@ -18,6 +19,7 @@ from trading_agent.domain.models import Action, ConsensusBasis, TradeProposal
 from trading_agent.domain.recommendation import StockRecommendation
 from trading_agent.infrastructure.config import AgentSettings, load_settings
 from trading_agent.interface.bootstrap import (
+    create_backtest_runtime,
     create_recommendation_runtime,
     create_runtime,
 )
@@ -47,6 +49,56 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         help="표시할 BUY 추천 수 (기본: recommendation.max_results)",
     )
+    backtest_parser = commands.add_parser("backtest", help="과거 시점 추천을 재현")
+    backtest_commands = backtest_parser.add_subparsers(dest="backtest_command")
+    backtest_parser.set_defaults(_print_backtest_help=backtest_parser.print_help)
+    backtest_run = backtest_commands.add_parser(
+        "run", help="과거 시점 스냅샷과 추천을 저장"
+    )
+    backtest_run.add_argument("--config", type=Path, help="YAML 설정 파일 경로")
+    backtest_run.add_argument(
+        "--from",
+        dest="start_date",
+        type=_date_arg,
+        default="20260701",
+        help="시작일 YYYYMMDD",
+    )
+    backtest_run.add_argument(
+        "--to", dest="end_date", type=_date_arg, help="종료일 YYYYMMDD"
+    )
+    backtest_run.add_argument(
+        "--dates", help="all 또는 무작위로 뽑을 거래일 수 (기본: all)"
+    )
+    backtest_run.add_argument(
+        "--date", action="append", help="명시 날짜 YYYYMMDD (반복·콤마 목록 가능)"
+    )
+    backtest_run.add_argument("--seed", type=int, default=20261103)
+    backtest_run.add_argument(
+        "--universe", type=_comma_values, help="추천 종목 코드 콤마 목록"
+    )
+    backtest_run.add_argument("--mask", action="store_true", help="모델 입력을 마스킹")
+    backtest_run.add_argument(
+        "--horizons", default="5,10,20", help="미래 거래일 horizon (기본: 5,10,20)"
+    )
+    backtest_run.add_argument("--db", type=Path, help="백테스트 전용 SQLite 경로")
+    backtest_run.add_argument("--out", type=Path, help="결과 디렉터리")
+    backtest_run.add_argument("--cache-dir", type=Path, help="응답 캐시 디렉터리")
+    backtest_run.add_argument(
+        "--snapshot-only", action="store_true", help="모델·ledger 없이 스냅샷만 저장"
+    )
+    backtest_run.add_argument("--workers", type=_worker_count, default=1)
+    backtest_run.add_argument(
+        "--decision-time",
+        type=_decision_time,
+        default=time(15, 40),
+        help="판단 시각 KST HH:MM",
+    )
+    backtest_run.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="완료된 날짜 결과를 건너뜀 (기본: 사용)",
+    )
     return parser
 
 
@@ -70,11 +122,15 @@ def main(
     recommendation_runtime_factory: Callable[
         ..., _Runtime[RecommendationRunResult]
     ] = create_recommendation_runtime,
+    backtest_runtime_factory: Callable[..., _Runtime[int]] = create_backtest_runtime,
 ) -> int:
     """CLI를 실행하고 cron에서 확인할 종료 코드를 반환한다."""
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     args = build_parser().parse_args(argv)
+    if args.command == "backtest" and args.backtest_command is None:
+        args._print_backtest_help()
+        return 2
     if args.command == "run":
         return _execute(
             args, runtime_factory, lambda result, _settings: _print_result(result)
@@ -87,7 +143,33 @@ def main(
                 result, args.top or settings.recommendation.max_results
             ),
         )
+    if args.command == "backtest" and args.backtest_command == "run":
+        return _execute_backtest(args, backtest_runtime_factory)
     return 0
+
+
+def _execute_backtest(
+    args: argparse.Namespace, factory: Callable[..., _Runtime[int]]
+) -> int:
+    """설정과 런타임을 만들고 백테스트 종료 코드를 반환한다."""
+
+    try:
+        settings = load_settings(args.config)
+    except Exception as error:
+        print(f"백테스트 준비 실패: {type(error).__name__}", file=sys.stderr)
+        return 1
+    try:
+        runtime = factory(settings, args)
+    except Exception as error:
+        print(f"백테스트 준비 실패: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    try:
+        return runtime.run()
+    except Exception as error:
+        print(f"백테스트 실패: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    finally:
+        runtime.close()
 
 
 def _execute[R: (DecisionCycleResult, RecommendationRunResult)](
@@ -262,6 +344,50 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("양의 정수여야 합니다.")
     return parsed
+
+
+def _worker_count(value: str) -> int:
+    """백테스트 동시 실행 수를 최대 2로 제한한다."""
+
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("workers는 1 또는 2여야 합니다.") from error
+    if parsed not in (1, 2):
+        raise argparse.ArgumentTypeError("workers는 1 또는 2여야 합니다.")
+    return parsed
+
+
+def _date_arg(value: str) -> str:
+    """YYYYMMDD 날짜 형식을 확인한다."""
+
+    if len(value) != 8 or not value.isdigit():
+        raise argparse.ArgumentTypeError("날짜는 YYYYMMDD 형식이어야 합니다.")
+    try:
+        datetime.strptime(value, "%Y%m%d")
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("유효한 날짜가 아닙니다.") from error
+    return value
+
+
+def _comma_values(value: str) -> list[str]:
+    """콤마로 구분한 6자리 종목 코드를 확인한다."""
+
+    values = [item.strip() for item in value.split(",") if item.strip()]
+    if not values or any(len(item) != 6 or not item.isdigit() for item in values):
+        raise argparse.ArgumentTypeError("universe는 6자리 코드 목록이어야 합니다.")
+    return values
+
+
+def _decision_time(value: str) -> time:
+    """시각 인자를 HH:MM 형식으로 읽는다."""
+
+    if len(value) != 5 or value[2] != ":":
+        raise argparse.ArgumentTypeError("시각은 HH:MM 형식이어야 합니다.")
+    try:
+        return time.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("시각은 HH:MM 형식이어야 합니다.") from error
 
 
 def _exit_code(status: CycleStatus) -> int:

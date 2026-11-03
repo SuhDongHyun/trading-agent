@@ -1,16 +1,27 @@
-"""실행 설정에서 외부 어댑터와 사이클 유스케이스를 조립한다."""
+"""CLI 인자와 설정에서 application 유스케이스·외부 어댑터를 조립한다."""
 
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from threading import Lock
+from typing import Any
 from zoneinfo import ZoneInfo
 
+from trading_agent.application.backtest import (
+    BacktestGateway,
+    BacktestOptions,
+    MaskedSnapshotProvider,
+    RunBacktest,
+)
 from trading_agent.application.consensus_service import (
     ConsensusDecisionService,
     RecommendationConsensusService,
 )
 from trading_agent.application.model_tasks import DECISION_TASK, RECOMMENDATION_TASK
+from trading_agent.application.ports import MarketIndex
 from trading_agent.application.recommend_stocks import RecommendStocks
 from trading_agent.application.records import (
     DecisionCycleResult,
@@ -19,12 +30,18 @@ from trading_agent.application.records import (
 from trading_agent.application.run_decision_cycle import RunDecisionCycle
 from trading_agent.application.snapshot_builder import SnapshotBuilder
 from trading_agent.domain.risk import RiskPolicy
+from trading_agent.infrastructure.backtest_result_store import FileBacktestResultStore
 from trading_agent.infrastructure.command_runner import SubprocessCommandRunner
 from trading_agent.infrastructure.config import AgentSettings
 from trading_agent.infrastructure.decision_models import (
     ClaudeCliDecisionModel,
     CodexCliDecisionModel,
 )
+from trading_agent.infrastructure.point_in_time_gateway import (
+    PointInTimeGateway,
+    SharedDailyCache,
+)
+from trading_agent.infrastructure.response_cache import ResponseCache
 from trading_agent.infrastructure.sqlite_ledger import SQLiteDecisionLedger
 from trading_agent.infrastructure.trading_api import TradingApiMarketDataGateway
 
@@ -127,6 +144,175 @@ class RecommendationRuntime:
         self.gateway.close()
 
 
+@dataclass(slots=True)
+class BacktestRuntime:
+    """application 백테스트 유스케이스와 HTTP 어댑터의 수명주기."""
+
+    use_case: RunBacktest
+    cache: ResponseCache
+
+    def run(self) -> int:
+        """조립된 application 유스케이스를 실행한다."""
+
+        return self.use_case.run()
+
+    def close(self) -> None:
+        """응답 캐시와 그 안의 HTTP 클라이언트를 닫는다."""
+
+        self.cache.close()
+
+
+def create_backtest_runtime(settings: AgentSettings, args: Any) -> BacktestRuntime:
+    """CLI 값을 application 옵션으로 바꾸고 백테스트 포트 구현을 조립한다."""
+
+    output_dir = Path(
+        args.out or Path("data/backtest") / korea_now().strftime("%Y%m%dT%H%M%S%f")
+    )
+    cache_dir = Path(args.cache_dir or "data/backtest/cache")
+    database = (
+        Path(args.db).expanduser().resolve()
+        if args.db is not None
+        else (output_dir / "backtest.db").resolve()
+    )
+    configured_db = settings.ledger.db_path.expanduser().resolve()
+    if database == configured_db:
+        raise ValueError("--db는 설정의 ledger.db_path와 같은 파일일 수 없습니다.")
+
+    universe = list(
+        args.universe if args.universe is not None else settings.recommendation_universe
+    )
+    options = BacktestOptions(
+        start_date=args.start_date,
+        requested_to=args.end_date,
+        dates=_parse_dates_count(args.dates),
+        explicit_dates=_explicit_dates(args.date),
+        seed=args.seed,
+        universe=universe,
+        mask=args.mask,
+        horizons=_parse_positive_list(args.horizons),
+        snapshot_only=args.snapshot_only,
+        workers=args.workers,
+        decision_time=args.decision_time,
+        resume=args.resume,
+        output_dir=output_dir,
+        database=database,
+        cache_dir=cache_dir,
+        consensus={
+            "policy": settings.consensus.policy.value,
+            "confidence_aggregation": settings.consensus.confidence_aggregation.value,
+        },
+        models={
+            "claude": {
+                "command": settings.llm.claude.command,
+                "model": settings.llm.claude.model,
+                "effort": settings.llm.claude.effort,
+            },
+            "codex": {
+                "command": settings.llm.codex.command,
+                "model": settings.llm.codex.model,
+                "effort": settings.llm.codex.reasoning_effort,
+            },
+        },
+        git_sha=_git_sha(),
+    )
+
+    gateway = TradingApiMarketDataGateway(settings.trading_api)
+    cache = ResponseCache(gateway.client, cache_dir)
+    gateway.client = cache  # type: ignore[assignment]
+    result_store = FileBacktestResultStore(output_dir)
+    daily_cache = SharedDailyCache()
+    ledger_lock = Lock()
+    shared_ledger: SQLiteDecisionLedger | None = None
+    runner = SubprocessCommandRunner()
+
+    def calendar_provider(start_date: str, end_date: str) -> list[str]:
+        points = gateway.get_market_index(MarketIndex.KOSPI, start_date, end_date)
+        return [point.date for point in points]
+
+    def gateway_factory(
+        decision_date: str, range_start: str, range_end: str, decision_time: Any
+    ) -> BacktestGateway:
+        return PointInTimeGateway(
+            gateway,
+            decision_date,
+            range_start,
+            range_end,
+            decision_time=decision_time,
+            daily_cache=daily_cache,
+        )
+
+    def snapshot_factory(
+        point_gateway: BacktestGateway,
+        codes: list[str] | tuple[str, ...],
+        clock: Any,
+        mapping: Any,
+    ) -> Any:
+        builder = SnapshotBuilder(point_gateway, codes, clock=clock)
+        return MaskedSnapshotProvider(builder, mapping) if mapping else builder
+
+    def recommendation_factory(
+        point_gateway: BacktestGateway,
+        codes: list[str] | tuple[str, ...],
+        clock: Any,
+        mapping: Any,
+    ) -> RecommendStocks:
+        nonlocal shared_ledger
+        snapshot_builder = snapshot_factory(point_gateway, codes, clock, mapping)
+        with ledger_lock:
+            if shared_ledger is None:
+                shared_ledger = SQLiteDecisionLedger(
+                    database,
+                    stale_run_after=timedelta(
+                        seconds=settings.ledger.stale_run_after_seconds
+                    ),
+                )
+        service = RecommendationConsensusService(
+            ClaudeCliDecisionModel(settings.llm.claude, runner, RECOMMENDATION_TASK),
+            CodexCliDecisionModel(settings.llm.codex, runner, RECOMMENDATION_TASK),
+            policy=settings.consensus.policy,
+            confidence_aggregation=settings.consensus.confidence_aggregation,
+        )
+        assert shared_ledger is not None
+        return RecommendStocks(
+            snapshot_builder=snapshot_builder,  # type: ignore[arg-type]
+            consensus_service=service,
+            universe=codes,
+            ledger=shared_ledger,
+            clock=clock,
+        )
+
+    def progress(
+        date: str,
+        status: str,
+        missing: int,
+        leakage: int,
+        skipped: bool,
+        error: str | None,
+    ) -> None:
+        if skipped:
+            print(f"{date}: resume skip")
+        else:
+            suffix = f" 오류: {error}" if error else ""
+            print(f"{date}: {status} 누락 {missing}건, 누수 차단 {leakage}건{suffix}")
+
+    def warning(message: str) -> None:
+        print(message, file=sys.stderr)
+
+    use_case = RunBacktest(
+        options=options,
+        result_store=result_store,
+        calendar_provider=calendar_provider,
+        gateway_factory=gateway_factory,
+        snapshot_factory=snapshot_factory,
+        recommendation_factory=recommendation_factory,
+        now=korea_now,
+        cache_stats=cache.stats_for_current_thread,
+        progress=progress,
+        warning=warning,
+    )
+    return BacktestRuntime(use_case, cache)
+
+
 def create_recommendation_runtime(
     settings: AgentSettings,
     db_path: str | Path | None = None,
@@ -153,3 +339,53 @@ def create_recommendation_runtime(
         clock=clock,
     )
     return RecommendationRuntime(use_case=use_case, gateway=gateway)
+
+
+def _parse_dates_count(value: str | None) -> str | int:
+    if value is None or value == "all":
+        return "all"
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise ValueError("--dates는 all 또는 양의 정수여야 합니다.") from error
+    if count <= 0:
+        raise ValueError("--dates는 all 또는 양의 정수여야 합니다.")
+    return count
+
+
+def _parse_positive_list(value: str) -> list[int]:
+    try:
+        parsed = [int(item.strip()) for item in value.split(",")]
+    except ValueError as error:
+        raise ValueError("--horizons는 양의 정수 목록이어야 합니다.") from error
+    if not parsed or any(item <= 0 for item in parsed):
+        raise ValueError("--horizons는 양의 정수 목록이어야 합니다.")
+    return parsed
+
+
+def _explicit_dates(values: list[str] | None) -> list[str] | None:
+    if not values:
+        return None
+    dates = [item.strip() for value in values for item in value.split(",")]
+    try:
+        if any(len(item) != 8 or not item.isdigit() for item in dates):
+            raise ValueError("--date 형식 오류")
+        for item in dates:
+            datetime.strptime(item, "%Y%m%d")
+    except ValueError as error:
+        raise ValueError("--date는 유효한 YYYYMMDD 날짜여야 합니다.") from error
+    return dates
+
+
+def _git_sha() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip()
