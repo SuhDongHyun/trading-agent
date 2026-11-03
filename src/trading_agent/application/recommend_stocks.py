@@ -38,6 +38,7 @@ class RecommendStocks:
             build_recommendation_prompt
         ),
         price_guard_policy: PriceGuardPolicy = DEFAULT_PRICE_GUARD_POLICY,
+        top_candidates: int = 5,
     ) -> None:
         if not universe:
             raise ValueError("추천 후보 종목이 비어 있습니다.")
@@ -48,6 +49,9 @@ class RecommendStocks:
         self.clock = clock
         self.prompt_builder = prompt_builder
         self.price_guard_policy = price_guard_policy
+        if top_candidates <= 0:
+            raise ValueError("top_candidates는 0보다 커야 합니다.")
+        self.top_candidates_count = top_candidates
 
     def run(self) -> RecommendationRunResult:
         """추천 결과를 반환하고 성공·실패와 무관하게 기록을 남긴다."""
@@ -61,7 +65,12 @@ class RecommendStocks:
             prompt = self.prompt_builder(snapshot)
             outcome = self.consensus_service.recommend(prompt)
             result = _result_from_outcome(
-                run_id, prompt, snapshot, outcome, self.price_guard_policy
+                run_id,
+                prompt,
+                snapshot,
+                outcome,
+                self.price_guard_policy,
+                self.top_candidates_count,
             )
         except MarketDataUnavailable as error:
             result = RecommendationRunResult(
@@ -117,6 +126,7 @@ def _result_from_outcome(
     snapshot: ResearchSnapshot,
     outcome: RecommendationConsensusOutcome,
     price_guard_policy: PriceGuardPolicy = DEFAULT_PRICE_GUARD_POLICY,
+    top_candidates: int = 5,
 ) -> RecommendationRunResult:
     """모델 실패는 model_failed로, 성공은 스냅샷 종목만 순위대로 담는다."""
 
@@ -146,6 +156,9 @@ def _result_from_outcome(
             for item in outcome.consensus.disagreements
             if item.code in snapshot_codes
         ],
+        candidates=[
+            item for item in outcome.consensus.candidates if item.code in snapshot_codes
+        ],
     )
     outcome = replace(outcome, consensus=consensus)
     return RecommendationRunResult(
@@ -155,6 +168,7 @@ def _result_from_outcome(
         snapshot=snapshot,
         outcome=outcome,
         recommendations=consensus.ranked(),
+        top_candidates=consensus.top_candidates(top_candidates),
     )
 
 

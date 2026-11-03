@@ -11,6 +11,8 @@ from trading_agent.application.schema_support import (
     require_string_list,
 )
 from trading_agent.domain.recommendation import (
+    KEY_RISK_TYPES,
+    RECOMMENDATION_DRIVERS,
     ModelRecommendation,
     StockRecommendation,
 )
@@ -23,6 +25,10 @@ _ITEM_FIELDS = {
     "target_price",
     "invalidation_price",
     "reason",
+    "score",
+    "expected_excess_return_10d",
+    "drivers",
+    "key_risk",
 }
 
 RECOMMENDATION_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -40,6 +46,31 @@ RECOMMENDATION_RESPONSE_SCHEMA: dict[str, Any] = {
                     "target_price": _NULLABLE_NUMBER,
                     "invalidation_price": _NULLABLE_NUMBER,
                     "reason": {"type": "string"},
+                    "score": {"type": "number", "minimum": -2, "maximum": 2},
+                    "expected_excess_return_10d": {
+                        "type": "number",
+                        "minimum": -50,
+                        "maximum": 50,
+                    },
+                    "drivers": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": sorted(RECOMMENDATION_DRIVERS),
+                        },
+                    },
+                    "key_risk": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": sorted(KEY_RISK_TYPES),
+                            },
+                            "note": {"type": "string"},
+                        },
+                        "required": ["type", "note"],
+                        "additionalProperties": False,
+                    },
                 },
                 "required": sorted(_ITEM_FIELDS),
                 "additionalProperties": False,
@@ -87,4 +118,22 @@ def _parse_item(value: object, index: int) -> StockRecommendation:
             item["invalidation_price"], f"{label}.invalidation_price"
         ),  # type: ignore[arg-type]
         reason=require_string(item["reason"], f"{label}.reason"),
+        score=require_number(item["score"], f"{label}.score"),  # type: ignore[arg-type]
+        expected_excess_return_10d=require_number(
+            item["expected_excess_return_10d"],
+            f"{label}.expected_excess_return_10d",
+        ),  # type: ignore[arg-type]
+        drivers=require_string_list(item["drivers"], f"{label}.drivers"),
+        key_risk_type=require_string(
+            require_object(item["key_risk"], {"type", "note"}, f"{label}.key_risk")[
+                "type"
+            ],
+            f"{label}.key_risk.type",
+        ),
+        key_risk_note=require_string(
+            require_object(item["key_risk"], {"type", "note"}, f"{label}.key_risk")[
+                "note"
+            ],
+            f"{label}.key_risk.note",
+        ),
     )

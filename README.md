@@ -62,6 +62,7 @@ risk:
 recommendation:
   universe: []        # 비우면 watchlist를 추천 후보로 사용
   max_results: 5      # recommend 출력에 표시할 BUY 수
+  top_candidates: 5   # score 기준 상대강도 후보 수
   horizon_days: [10, 20]  # 판단 기간: 오름차순의 양의 거래일 목록
 consensus:
   policy: buy_one_side       # strict 또는 buy_one_side
@@ -249,16 +250,25 @@ uv run trading-agent recommend --top 3 --db ./data/paper.sqlite
 
 계좌 잔고·보유 여부와 무관하게 `recommendation.universe`(비어 있으면 watchlist)
 종목마다 두 모델이 투자의견(`buy`/`hold`/`sell`), 확신도, 목표가,
-`invalidation_price`를 냅니다. buy의 `invalidation_price`는 손절가이고, sell에서는
-그 위로 오르면 매도 의견을 철회할 가격입니다. 기본 `buy_one_side` 정책에서는 한
+`invalidation_price`를 냅니다. 응답에는 universe 안 상대 매력도 `score`(-2~+2),
+universe 평균 대비 10거래일 기대 초과수익 `expected_excess_return_10d`(-50~+50%p),
+최대 3개 `drivers`, 주요 위험 객체 `key_risk`도 포함됩니다. 점수와 기대수익은
+유한한 숫자여야 하고 driver와 key risk 종류는 정해진 enum만 허용합니다. buy의
+`invalidation_price`는 손절가이고, sell에서는 그 위로 오르면 매도 의견을 철회할
+가격입니다. 기본 `buy_one_side` 정책에서는 한
 모델의 buy와 다른 모델의 hold/미응답도 채택합니다. 동의한 의견의 확신도는 기본적으로
 평균, 가격은 보수적인 쪽을 씁니다(buy: 낮은 목표가·높은 손절가). 한쪽 buy는 그
 모델의 값과 확신도를 그대로 씁니다.
-sell의 목표가는 예상 하락 가격입니다. 출력 문구도 의견에 맞춰 표시합니다. 결과는
-BUY 확신도 순, SELL, HOLD,
-불일치 순서로 출력하고 `runs.kind = 'recommendation'`으로 기록합니다. 계좌를
+sell의 목표가는 예상 하락 가격입니다. 출력에는 rating과 무관하게 합의 score가 높은
+`recommendation.top_candidates`(기본 5개) 상대강도 후보를 먼저 표시합니다. 이 목록은
+두 모델이 의견을 달리한 종목의 모델별 점수도 보여줍니다. 그 뒤 BUY 확신도 순, SELL,
+HOLD, 불일치 순으로 표시하고 `runs.kind = 'recommendation'`으로 기록합니다. 계좌를
 조회하지 않으며 Risk Guard도 적용하지 않습니다. 현재가를 읽지 못한 종목은
 `missing`에 적고 제외합니다.
+
+상위 후보는 모델별 점수에서 다시 계산할 수 있어 별도 DB 행으로 저장하지 않습니다.
+합의 추천의 `drivers_json`, `key_risk_type`, `key_risk_note`에는 claude와 codex의 근거를
+각각 보존합니다.
 
 buy 손절가는 현재가 − `2 × ATR` 또는 최근 20거래일 최저 저가 아래 중 더 낮은
 가격을 기본으로 고려하고, sell 철회 가격은 현재가 + `2 × ATR` 또는 20거래일 최고
@@ -347,6 +357,16 @@ hold를 분리하고 `[lo, hi)` 구간(마지막 구간은 1.0 포함)을 사용
 중앙 변화율은 buy/sell별로 부호를 유지합니다. 종목 시장에 맞춰 KOSPI 또는 KOSDAQ
 수익률을 차감한 `exc`와 절대 수익률 기준율도 함께 저장합니다.
 
+점수 결과에는 모델별·합의 score의 날짜별 Spearman IC와 10거래일 기대 초과수익의
+10일 xs IC를 추가합니다. 합의 score 상위 N 바스켓의 horizon별 평균 xs와 bootstrap
+95% 구간, 출처·horizon·driver별 방향 적중률과 평균 xs, key risk 유형별 건수도
+기록합니다. 이전 백테스트 결과처럼 신규 필드가 없으면 관련 표에 `데이터 없음`을
+표시합니다.
+
+상위 바스켓 크기는 `backtest score --top-n N`으로 바꿀 수 있습니다. 지정하지 않으면
+run manifest의 `recommendation.top_candidates` 값을 사용하고, 해당 값이 없는 구형
+manifest에서는 현재 설정을 사용합니다. 기본값은 5입니다.
+
 가격·지수 조회 종료일은 계산한 horizon 여유 날짜와 KST 전날 중 이른 날로 제한합니다.
 이를 통해 아직 끝나지 않은 오늘 응답을 영구 응답 캐시에 저장하지 않습니다.
 
@@ -425,7 +445,8 @@ WHERE c.run_id = (
 ORDER BY c.rank;
 ```
 
-기존 v1~v5 DB는 처음 열 때 v6으로 자동 이전됩니다. v5에서 이전할 때 기존 합의
+기존 v1~v6 DB는 처음 열 때 v7으로 자동 이전됩니다. 기존 행의 새 점수와 근거 열은
+`NULL`로 유지됩니다. v5에서 이전할 때 기존 합의
 추천 행에는 보정 전 가격 `NULL`, 보정 여부 `0`, 경고 `[]`를 채웁니다. 기존 합의 결과에는 당시
 동작인 `policy = 'strict'`, `confidence_aggregation = 'min'`, 항목 basis는
 `agreed`가 채워집니다. 기존 리스크 판정에는

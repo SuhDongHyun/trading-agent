@@ -130,6 +130,7 @@ class RecommendationSettings(BaseModel):
 
     universe: list[str] = Field(default_factory=list)
     max_results: int = Field(default=5, gt=0)
+    top_candidates: int = Field(default=5, gt=0)
     horizon_days: list[StrictInt] = Field(default_factory=lambda: [10, 20])
 
     @field_validator("horizon_days")

@@ -28,6 +28,11 @@ def item(
     confidence: float = 0.8,
     target: str | None = "120",
     stop: str | None = "90",
+    score: str | None = None,
+    expected: str | None = None,
+    drivers: list[str] | None = None,
+    risk_type: str | None = None,
+    risk_note: str | None = None,
 ) -> StockRecommendation:
     return StockRecommendation(
         code=code,
@@ -36,6 +41,11 @@ def item(
         target_price=None if target is None else Decimal(target),
         invalidation_price=None if stop is None else Decimal(stop),
         reason=f"{rating.value} reason",
+        score=None if score is None else Decimal(score),
+        expected_excess_return_10d=None if expected is None else Decimal(expected),
+        drivers=drivers or [],
+        key_risk_type=risk_type,
+        key_risk_note=risk_note,
     )
 
 
@@ -45,8 +55,34 @@ def opinion(items: list[StockRecommendation]) -> ModelRecommendation:
 
 def test_matching_buy_keeps_lower_target_higher_stop_and_lower_confidence() -> None:
     result = RecommendationConsensusPolicy.reconcile(
-        opinion([item(confidence=0.9, target="130", stop="88")]),
-        opinion([item(confidence=0.7, target="120", stop="92")]),
+        opinion(
+            [
+                item(
+                    confidence=0.9,
+                    target="130",
+                    stop="88",
+                    score="1.4",
+                    expected="2",
+                    drivers=["trend_up"],
+                    risk_type="event_risk",
+                    risk_note="실적 발표",
+                )
+            ]
+        ),
+        opinion(
+            [
+                item(
+                    confidence=0.7,
+                    target="120",
+                    stop="92",
+                    score="0.6",
+                    expected="4",
+                    drivers=["relative_strength"],
+                    risk_type="macro_shock",
+                    risk_note="환율 변동",
+                )
+            ]
+        ),
     )
 
     merged = result.recommendations[0]
@@ -54,6 +90,10 @@ def test_matching_buy_keeps_lower_target_higher_stop_and_lower_confidence() -> N
     assert merged.confidence == 0.7
     assert merged.target_price == Decimal("120")
     assert merged.invalidation_price == Decimal("92")
+    assert merged.score == Decimal("1.0")
+    assert merged.expected_excess_return_10d == Decimal("3")
+    assert merged.evidence_by_model["claude"].drivers == ["trend_up"]
+    assert merged.evidence_by_model["codex"].key_risk_type == "macro_shock"
     assert result.disagreements == []
     assert result.missing_info == ["info"]
 
@@ -131,9 +171,91 @@ def test_ranked_orders_buy_hold_sell_then_confidence() -> None:
     ]
 
 
+def test_one_sided_recommendation_averages_both_available_scores() -> None:
+    result = RecommendationConsensusPolicy.reconcile(
+        opinion([item(score="1.5", expected="5")]),
+        opinion(
+            [
+                item(
+                    rating=Action.HOLD,
+                    target=None,
+                    stop=None,
+                    score="0.5",
+                    expected="-1",
+                )
+            ]
+        ),
+        ConsensusPolicyName.BUY_ONE_SIDE,
+    )
+
+    merged = result.recommendations[0]
+    assert merged.consensus_basis is ConsensusBasis.CLAUDE_ONLY
+    assert merged.score == Decimal("1.0")
+    assert merged.expected_excess_return_10d == Decimal("2")
+
+
+def test_disagreement_retains_model_scores_and_candidates_sort_stably() -> None:
+    result = RecommendationConsensusPolicy.reconcile(
+        opinion(
+            [
+                item("000002", score="1.5"),
+                item("000001", score="1.0"),
+            ]
+        ),
+        opinion(
+            [
+                item("000002", rating=Action.SELL, score="0.5"),
+                item("000001", rating=Action.SELL, score="1.0"),
+            ]
+        ),
+    )
+
+    assert result.recommendations == []
+    assert result.candidates[0].code == "000001"  # 동점이면 종목 코드 순
+    assert result.candidates[0].score == Decimal("1.0")
+    assert result.candidates[1].claude_score == Decimal("1.5")
+    assert result.candidates[1].codex_score == Decimal("0.5")
+    assert [item.code for item in result.top_candidates(5)] == ["000001", "000002"]
+
+
+def test_candidates_average_present_values_and_include_single_model_scores() -> None:
+    result = RecommendationConsensusPolicy.reconcile(
+        opinion(
+            [
+                item("000001", score="0.5"),
+                item("000002", score="2"),
+            ]
+        ),
+        opinion(
+            [
+                item("000001", rating=Action.HOLD, target=None, stop=None, score="1"),
+                item("000003", score="1"),
+            ]
+        ),
+    )
+
+    assert [(item.code, item.score) for item in result.top_candidates(5)] == [
+        ("000002", Decimal("2")),
+        ("000003", Decimal("1")),
+        ("000001", Decimal("0.75")),
+    ]
+    assert result.candidates[0].claude_score == Decimal("2")
+    assert result.candidates[0].codex_score is None
+
+
 @pytest.mark.parametrize(
     "overrides",
-    [{"code": "ABC"}, {"rating": "strong_buy"}, {"confidence": 1.5}],
+    [
+        {"code": "ABC"},
+        {"rating": "strong_buy"},
+        {"confidence": 1.5},
+        {"score": Decimal("2.1")},
+        {"expected_excess_return_10d": Decimal("-50.1")},
+        {"drivers": ["bad_driver"]},
+        {"drivers": ["trend_up", "trend_up"]},
+        {"key_risk_type": "bad_risk", "key_risk_note": "note"},
+        {"key_risk_type": "event_risk"},
+    ],
 )
 def test_domain_rejects_invalid_recommendation(overrides: dict[str, object]) -> None:
     values: dict[str, object] = {
@@ -157,6 +279,10 @@ def response(**overrides: object) -> str:
         "target_price": 120000,
         "invalidation_price": 95000.5,
         "reason": "trend",
+        "score": 1.25,
+        "expected_excess_return_10d": 4.5,
+        "drivers": ["trend_up", "relative_strength"],
+        "key_risk": {"type": "event_risk", "note": "실적 발표"},
     }
     entry.update(overrides)
     return json.dumps(
@@ -172,12 +298,35 @@ def test_parser_converts_nullable_prices() -> None:
     assert parsed.model_id == "codex"
     assert parsed.recommendations[0].rating is Action.HOLD
     assert parsed.recommendations[0].target_price is None
+    assert parsed.recommendations[0].score == Decimal("1.25")
 
 
 def test_parser_keeps_decimal_prices() -> None:
     parsed = parse_model_recommendation(response(), "claude")
 
     assert parsed.recommendations[0].invalidation_price == Decimal("95000.5")
+    assert parsed.recommendations[0].expected_excess_return_10d == Decimal("4.5")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"score": 2.01},
+        {"score": -2.1},
+        {"expected_excess_return_10d": 50.1},
+        {"drivers": ["not_a_driver"]},
+        {"drivers": ["trend_up", "trend_up"]},
+        {"drivers": ["trend_up", "trend_break", "overheated", "breakout"]},
+        {"key_risk": {"type": "unknown", "note": "risk"}},
+        {"key_risk": {"type": "event_risk"}},
+        {"key_risk": "event_risk"},
+    ],
+)
+def test_parser_fails_closed_for_invalid_relative_fields(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        parse_model_recommendation(response(**overrides), "claude")
 
 
 @pytest.mark.parametrize(
@@ -196,6 +345,30 @@ def test_schema_requires_every_property_and_forbids_extra() -> None:
     ):
         assert schema["additionalProperties"] is False
         assert set(schema["required"]) == set(schema["properties"])
+
+    item_schema = RECOMMENDATION_RESPONSE_SCHEMA["properties"]["recommendations"][
+        "items"
+    ]
+    drivers_schema = item_schema["properties"]["drivers"]
+    assert "uniqueItems" not in drivers_schema
+    assert "maxItems" not in drivers_schema
+    key_risk_schema = item_schema["properties"]["key_risk"]
+    assert key_risk_schema["additionalProperties"] is False
+    assert set(key_risk_schema["required"]) == set(key_risk_schema["properties"])
+
+
+@pytest.mark.parametrize(
+    "drivers",
+    [
+        ["trend_up", "trend_up"],
+        ["trend_up", "trend_break", "overheated", "breakout"],
+    ],
+)
+def test_parser_rejects_duplicate_or_excess_drivers_without_schema_limits(
+    drivers: list[str],
+) -> None:
+    with pytest.raises(ValueError):
+        parse_model_recommendation(response(drivers=drivers), "claude")
 
 
 @pytest.mark.parametrize("policy", list(ConsensusPolicyName))

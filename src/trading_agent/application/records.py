@@ -8,7 +8,10 @@ from trading_agent.application.consensus_service import (
     RecommendationConsensusOutcome,
 )
 from trading_agent.domain.models import MarketSnapshot, ResearchSnapshot
-from trading_agent.domain.recommendation import StockRecommendation
+from trading_agent.domain.recommendation import (
+    RecommendationCandidate,
+    StockRecommendation,
+)
 from trading_agent.domain.risk import RiskVerdict
 
 
@@ -49,6 +52,8 @@ class RecommendationRunResult:
     snapshot: ResearchSnapshot | None = None
     outcome: RecommendationConsensusOutcome | None = None
     recommendations: list[StockRecommendation] | None = None
+    top_candidates: list[RecommendationCandidate] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "recommendations", list(self.recommendations or []))
+        object.__setattr__(self, "top_candidates", list(self.top_candidates or []))

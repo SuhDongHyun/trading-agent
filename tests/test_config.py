@@ -97,6 +97,7 @@ def test_recommendation_horizon_defaults_and_environment_override(
 
     settings = load_settings(config_file)
     assert settings.recommendation.horizon_days == [10, 20]
+    assert settings.recommendation.top_candidates == 5
 
     monkeypatch.setenv("TRADING_AGENT__RECOMMENDATION__HORIZON_DAYS", "[5, 15]")
     settings = load_settings(config_file)
@@ -114,6 +115,14 @@ def test_recommendation_horizon_rejects_invalid_values(
 
     with pytest.raises(ValidationError):
         RecommendationSettings(horizon_days=horizon_days)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_recommendation_top_candidates_must_be_positive(value: int) -> None:
+    from trading_agent.infrastructure.config import RecommendationSettings
+
+    with pytest.raises(ValidationError):
+        RecommendationSettings(top_candidates=value)
 
 
 def test_market_indicator_timeout_override_uses_default_when_missing() -> None:
