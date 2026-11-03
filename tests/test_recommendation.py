@@ -29,7 +29,7 @@ def item(
         rating=rating,
         confidence=confidence,
         target_price=None if target is None else Decimal(target),
-        stop_loss_price=None if stop is None else Decimal(stop),
+        invalidation_price=None if stop is None else Decimal(stop),
         reason=f"{rating.value} reason",
     )
 
@@ -48,7 +48,7 @@ def test_matching_buy_keeps_lower_target_higher_stop_and_lower_confidence() -> N
     assert merged.rating is Action.BUY
     assert merged.confidence == 0.7
     assert merged.target_price == Decimal("120")
-    assert merged.stop_loss_price == Decimal("92")
+    assert merged.invalidation_price == Decimal("92")
     assert result.disagreements == []
     assert result.missing_info == ["info"]
 
@@ -61,7 +61,7 @@ def test_matching_sell_keeps_higher_target_and_lower_stop() -> None:
 
     merged = result.recommendations[0]
     assert merged.target_price == Decimal("85")
-    assert merged.stop_loss_price == Decimal("110")
+    assert merged.invalidation_price == Decimal("110")
 
 
 def test_missing_price_on_either_side_is_not_invented() -> None:
@@ -136,7 +136,7 @@ def test_domain_rejects_invalid_recommendation(overrides: dict[str, object]) -> 
         "rating": "buy",
         "confidence": 0.5,
         "target_price": None,
-        "stop_loss_price": None,
+        "invalidation_price": None,
         "reason": "r",
     }
     values.update(overrides)
@@ -150,7 +150,7 @@ def response(**overrides: object) -> str:
         "rating": "buy",
         "confidence": 0.75,
         "target_price": 120000,
-        "stop_loss_price": 95000.5,
+        "invalidation_price": 95000.5,
         "reason": "trend",
     }
     entry.update(overrides)
@@ -161,7 +161,7 @@ def response(**overrides: object) -> str:
 
 def test_parser_converts_nullable_prices() -> None:
     parsed = parse_model_recommendation(
-        response(rating="hold", target_price=None, stop_loss_price=None), "codex"
+        response(rating="hold", target_price=None, invalidation_price=None), "codex"
     )
 
     assert parsed.model_id == "codex"
@@ -172,7 +172,7 @@ def test_parser_converts_nullable_prices() -> None:
 def test_parser_keeps_decimal_prices() -> None:
     parsed = parse_model_recommendation(response(), "claude")
 
-    assert parsed.recommendations[0].stop_loss_price == Decimal("95000.5")
+    assert parsed.recommendations[0].invalidation_price == Decimal("95000.5")
 
 
 @pytest.mark.parametrize(

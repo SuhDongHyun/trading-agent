@@ -21,7 +21,7 @@ _ITEM_FIELDS = {
     "rating",
     "confidence",
     "target_price",
-    "stop_loss_price",
+    "invalidation_price",
     "reason",
 }
 
@@ -38,7 +38,7 @@ RECOMMENDATION_RESPONSE_SCHEMA: dict[str, Any] = {
                     "rating": {"type": "string", "enum": ["buy", "sell", "hold"]},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                     "target_price": _NULLABLE_NUMBER,
-                    "stop_loss_price": _NULLABLE_NUMBER,
+                    "invalidation_price": _NULLABLE_NUMBER,
                     "reason": {"type": "string"},
                 },
                 "required": sorted(_ITEM_FIELDS),
@@ -83,8 +83,8 @@ def _parse_item(value: object, index: int) -> StockRecommendation:
         target_price=require_optional_number(
             item["target_price"], f"{label}.target_price"
         ),  # type: ignore[arg-type]
-        stop_loss_price=require_optional_number(
-            item["stop_loss_price"], f"{label}.stop_loss_price"
+        invalidation_price=require_optional_number(
+            item["invalidation_price"], f"{label}.invalidation_price"
         ),  # type: ignore[arg-type]
         reason=require_string(item["reason"], f"{label}.reason"),
     )

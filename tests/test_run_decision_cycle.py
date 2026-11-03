@@ -216,6 +216,67 @@ def test_cycle_records_completed_model_failed_and_data_failed(
             )
 
 
+def test_unexpected_exception_is_recorded_as_error(tmp_path: Path) -> None:
+    db_path = tmp_path / "error.sqlite"
+    cycle = build_cycle(db_path)
+
+    def fail_prompt(snapshot, policy) -> str:
+        raise RuntimeError("prompt failed")
+
+    cycle.prompt_builder = fail_prompt
+    result = cycle.run()
+
+    assert result.status is CycleStatus.ERROR
+    assert "RuntimeError: prompt failed" in (result.error or "")
+    with sqlite3.connect(db_path) as connection:
+        status, error = connection.execute(
+            "SELECT status, error FROM runs WHERE id = ?", (result.run_id,)
+        ).fetchone()
+    assert status == "error"
+    assert "RuntimeError: prompt failed" in error
+
+
+def test_interruption_closes_run_as_error_then_reraises(tmp_path: Path) -> None:
+    db_path = tmp_path / "interrupted.sqlite"
+    cycle = build_cycle(db_path)
+
+    class SimulatedInterrupt(BaseException):
+        pass
+
+    def interrupt(snapshot, policy) -> str:
+        raise SimulatedInterrupt("stopped")
+
+    cycle.prompt_builder = interrupt
+    with pytest.raises(SimulatedInterrupt, match="stopped"):
+        cycle.run()
+
+    with sqlite3.connect(db_path) as connection:
+        status, error = connection.execute("SELECT status, error FROM runs").fetchone()
+    assert status == "error"
+    assert "SimulatedInterrupt: stopped" in error
+
+
+def test_recording_failure_falls_back_to_error_run(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "recording-error.sqlite"
+    cycle = build_cycle(db_path)
+    ledger = cycle.ledger
+
+    def fail_first_complete(result, finished_at) -> None:
+        raise RuntimeError("cycle write failed")
+
+    monkeypatch.setattr(ledger, "complete_cycle", fail_first_complete)
+    result = cycle.run()
+
+    assert result.status is CycleStatus.ERROR
+    assert "cycle write failed" in (result.error or "")
+    with sqlite3.connect(db_path) as connection:
+        status, error = connection.execute(
+            "SELECT status, error FROM runs WHERE id = ?", (result.run_id,)
+        ).fetchone()
+    assert status == "error"
+    assert "cycle write failed" in error
+
+
 @pytest.mark.parametrize(
     ("now", "daily_date", "force", "expected_status", "expected_session"),
     [

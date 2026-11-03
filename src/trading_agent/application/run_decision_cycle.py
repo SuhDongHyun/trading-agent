@@ -132,12 +132,37 @@ class RunDecisionCycle:
                 decision=decision,
                 verdicts=verdicts,
             )
+        except BaseException as error:
+            interrupted = DecisionCycleResult(
+                run_id=run_id,
+                status=CycleStatus.ERROR,
+                error=f"{type(error).__name__}: {error}",
+            )
+            try:
+                self.ledger.fail_cycle(interrupted, self.clock())
+            except BaseException:
+                pass
+            raise error
 
         finished_at = self.clock()
-        if result.status in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
-            self.ledger.complete_cycle(result, finished_at)
-        else:
-            self.ledger.fail_cycle(result, finished_at)
+        try:
+            if result.status in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
+                self.ledger.complete_cycle(result, finished_at)
+            else:
+                self.ledger.fail_cycle(result, finished_at)
+        except BaseException as error:
+            fallback = DecisionCycleResult(
+                run_id=run_id,
+                status=CycleStatus.ERROR,
+                error=f"{type(error).__name__}: {error}",
+            )
+            try:
+                self.ledger.fail_cycle(fallback, self.clock())
+            except BaseException as fallback_error:
+                raise error from fallback_error
+            if isinstance(error, Exception):
+                return fallback
+            raise error
         return result
 
 

@@ -1,6 +1,7 @@
 """계좌와 무관하게 후보 종목의 합의 투자의견을 만든다."""
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import datetime
 
 from trading_agent.application.consensus_service import (
@@ -71,8 +72,33 @@ class RecommendStocks:
                 snapshot=snapshot,
                 outcome=outcome,
             )
+        except BaseException as error:
+            interrupted = RecommendationRunResult(
+                run_id=run_id,
+                status=CycleStatus.ERROR,
+                error=f"{type(error).__name__}: {error}",
+            )
+            try:
+                self.ledger.finish_recommendation(interrupted, self.clock())
+            except BaseException:
+                pass
+            raise error
 
-        self.ledger.finish_recommendation(result, self.clock())
+        try:
+            self.ledger.finish_recommendation(result, self.clock())
+        except BaseException as error:
+            fallback = RecommendationRunResult(
+                run_id=run_id,
+                status=CycleStatus.ERROR,
+                error=f"{type(error).__name__}: {error}",
+            )
+            try:
+                self.ledger.finish_recommendation(fallback, self.clock())
+            except BaseException as fallback_error:
+                raise error from fallback_error
+            if isinstance(error, Exception):
+                return fallback
+            raise error
         return result
 
 
@@ -98,13 +124,24 @@ def _result_from_outcome(
             snapshot=snapshot,
             outcome=outcome,
         )
+    snapshot_codes = {stock.code for stock in snapshot.stocks}
+    consensus = replace(
+        outcome.consensus,
+        recommendations=_within_snapshot(outcome.consensus.recommendations, snapshot),
+        disagreements=[
+            item
+            for item in outcome.consensus.disagreements
+            if item.code in snapshot_codes
+        ],
+    )
+    outcome = replace(outcome, consensus=consensus)
     return RecommendationRunResult(
         run_id=run_id,
         status=CycleStatus.COMPLETED,
         prompt=prompt,
         snapshot=snapshot,
         outcome=outcome,
-        recommendations=_within_snapshot(outcome.consensus.ranked(), snapshot),
+        recommendations=consensus.ranked(),
     )
 
 

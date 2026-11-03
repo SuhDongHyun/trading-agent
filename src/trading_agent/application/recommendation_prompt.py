@@ -28,10 +28,10 @@ def build_recommendation_prompt(snapshot: ResearchSnapshot) -> str:
   - hold: 진입·청산 근거가 약하거나 판단이 엇갈린다. 확신이 낮으면 hold로 적으세요.
   - sell: 보유 중이라면 줄이거나 피해야 한다.
 - confidence는 0~1 사이의 확신도입니다.
-- buy와 sell이면 target_price와 stop_loss_price를 원 단위 숫자로 적으세요.
-  - buy: target_price는 목표가, stop_loss_price는 손절가입니다.
+- buy와 sell이면 target_price와 invalidation_price를 원 단위 숫자로 적으세요.
+  - buy: target_price는 목표가, invalidation_price는 손절가입니다.
     (손절가 < 현재가 < 목표가)
-  - sell: target_price는 예상 하락 가격, stop_loss_price는 그 위로 오르면
+  - sell: target_price는 예상 하락 가격, invalidation_price는 그 위로 오르면
     매도 의견이 틀렸다고 볼 가격입니다. (예상 하락 가격 < 현재가 < 철회 가격)
   - hold는 둘 다 null로 적으세요.
 - reason에는 근거가 된 지표와 위험 요인을 한두 문장으로 적으세요.

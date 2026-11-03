@@ -1,7 +1,7 @@
 """실행 설정에서 외부 어댑터와 사이클 유스케이스를 조립한다."""
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -97,7 +97,10 @@ def create_runtime(
         consensus_service=consensus_service,
         risk_policy=risk_policy,
         watchlist=settings.watchlist,
-        ledger=SQLiteDecisionLedger(db_path or settings.ledger.db_path),
+        ledger=SQLiteDecisionLedger(
+            db_path or settings.ledger.db_path,
+            stale_run_after=timedelta(seconds=settings.ledger.stale_run_after_seconds),
+        ),
         clock=clock,
         force=force,
     )
@@ -139,7 +142,10 @@ def create_recommendation_runtime(
         snapshot_builder=SnapshotBuilder(gateway, settings.watchlist, clock=clock),
         consensus_service=service,
         universe=settings.recommendation_universe,
-        ledger=SQLiteDecisionLedger(db_path or settings.ledger.db_path),
+        ledger=SQLiteDecisionLedger(
+            db_path or settings.ledger.db_path,
+            stale_run_after=timedelta(seconds=settings.ledger.stale_run_after_seconds),
+        ),
         clock=clock,
     )
     return RecommendationRuntime(use_case=use_case, gateway=gateway)

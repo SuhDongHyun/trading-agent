@@ -162,16 +162,18 @@ uv run trading-agent recommend --top 3 --db ./data/paper.sqlite
 ```
 
 계좌 잔고·보유 여부와 무관하게 `recommendation.universe`(비어 있으면 watchlist)
-종목마다 두 모델이 투자의견(`buy`/`hold`/`sell`), 확신도, 목표가, 손절가를
-냅니다. 의견이 같은 종목만 채택하고, 확신도는 낮은 쪽, 목표가와 손절가는 보수적인
-쪽을 씁니다(buy: 낮은 목표가·높은 손절가). sell 의견에서는 같은 두 값이 예상
-하락 가격과 의견 철회 가격(이 위로 오르면 매도 판단이 틀린 것)을 뜻하며, 출력도
-그렇게 표시합니다. 결과는 BUY 확신도 순, SELL, HOLD,
+종목마다 두 모델이 투자의견(`buy`/`hold`/`sell`), 확신도, 목표가,
+`invalidation_price`를 냅니다. buy의 `invalidation_price`는 손절가이고, sell에서는
+그 위로 오르면 매도 의견을 철회할 가격입니다. 의견이 같은 종목만 채택하고,
+확신도는 낮은 쪽, 가격은 보수적인 쪽을 씁니다(buy: 낮은 목표가·높은 손절가).
+sell의 목표가는 예상 하락 가격입니다. 출력 문구도 의견에 맞춰 표시합니다. 결과는
+BUY 확신도 순, SELL, HOLD,
 불일치 순서로 출력하고 `runs.kind = 'recommendation'`으로 기록합니다. 계좌를
 조회하지 않으며 Risk Guard도 적용하지 않습니다. 현재가를 읽지 못한 종목은
 `missing`에 적고 제외합니다.
 
 종료 코드는 cron 모니터링에 사용합니다. `run`과 `recommend`에 공통입니다.
+SIGTERM은 `SystemExit(143)`으로 바뀌며 실행 중인 유스케이스가 ERROR 상태 기록을 시도한 뒤 종료합니다.
 
 - `0`: `completed` (합의 제안이 0건이어도 정상 완료)
 - `2`: `model_failed`
@@ -191,26 +193,30 @@ CRON_TZ=Asia/Seoul
 최근 사이클의 리스크 승인 제안:
 
 ```sql
-SELECT code, action, quantity, limit_price, reason
+SELECT source, code, action, quantity, limit_price, reason
 FROM risk_verdicts
 WHERE approved = 1
-  AND run_id = (SELECT id FROM runs ORDER BY started_at DESC, id DESC LIMIT 1);
+  AND run_id = (
+    SELECT id FROM runs WHERE kind = 'decision'
+    ORDER BY started_at DESC, id DESC LIMIT 1
+  );
 ```
 
 종목별 모델 불일치 이력:
 
 ```sql
-SELECT r.started_at, d.code, d.reason_code,
+SELECT r.started_at, r.kind, d.code, d.reason_code,
        d.claude_actions_json, d.codex_actions_json
 FROM consensus_disagreements AS d
 JOIN runs AS r ON r.id = d.run_id
+WHERE r.kind = 'decision'
 ORDER BY r.started_at DESC, d.disagreement_index;
 ```
 
 최근 추천 순위:
 
 ```sql
-SELECT c.rank, c.code, c.rating, c.confidence, c.target_price, c.stop_loss_price
+SELECT c.rank, c.code, c.rating, c.confidence, c.target_price, c.invalidation_price
 FROM consensus_recommendations AS c
 WHERE c.run_id = (
   SELECT id FROM runs WHERE kind = 'recommendation'
@@ -219,9 +225,10 @@ WHERE c.run_id = (
 ORDER BY c.rank;
 ```
 
-기존 v1·v2 DB는 처음 열 때 v3으로 자동 이전됩니다. 기존 리스크 판정에는
+기존 v1·v2·v3 DB는 처음 열 때 v4로 자동 이전됩니다. 기존 리스크 판정에는
 `source = 'consensus'`가 채워지고, 새 규칙 제안은 `source = 'rule'`과 규칙 종류를
-함께 기록합니다.
+함께 기록합니다. 오래된 `running` 행은 DB를 열 때 `stale_run_after_seconds`
+(기본 3600초)보다 오래된 경우 `abandoned`로 정리합니다.
 
 ## 안전
 

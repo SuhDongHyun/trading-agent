@@ -252,6 +252,39 @@ def test_market_index_uses_its_configured_timeout() -> None:
     assert timeouts[0]["read"] == 2.5
 
 
+@pytest.mark.parametrize(
+    ("index", "path"),
+    [
+        (MarketIndex.SP500, "/market-index/sp500-index"),
+        (MarketIndex.USD_KRW, "/market-index/usd-krw-exchange-rate"),
+    ],
+)
+def test_market_indices_without_change_field_parse_optional_change(
+    index: MarketIndex, path: str
+) -> None:
+    requests: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(
+            200,
+            json=[{"date": "20261029", "close_price": 145.25}],
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    gateway = TradingApiMarketDataGateway(
+        TradingApiSettings(base_url="http://trading-api"), client=client
+    )
+    try:
+        points = gateway.get_market_index(index, "20261015", "20261029")
+    finally:
+        client.close()
+
+    assert requests == [path]
+    assert points[0].value == Decimal("145.25")
+    assert points[0].change_percent is None
+
+
 def test_gateway_classifies_timeout_and_http_errors() -> None:
     def timeout(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)

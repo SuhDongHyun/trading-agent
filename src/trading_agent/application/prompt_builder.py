@@ -127,7 +127,7 @@ def to_json_value(value: Any, field_name: str | None = None) -> Any:
             "market_value",
             "limit_price",
             "target_price",
-            "stop_loss_price",
+            "invalidation_price",
         } or (field_name is not None and field_name.endswith("_amount")):
             return format(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP), "f")
         return format(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
