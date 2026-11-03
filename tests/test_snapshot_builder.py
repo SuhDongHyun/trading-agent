@@ -16,7 +16,11 @@ from trading_agent.application.ports import (
 )
 from trading_agent.application.snapshot_builder import (
     SnapshotBuilder,
+    calculate_20d_price_distances,
+    calculate_52w_position,
+    calculate_atr14_percent,
     calculate_deviation_percent,
+    calculate_realized_volatility_20d_percent,
     calculate_return_percent,
     calculate_volume_change_percent,
 )
@@ -63,7 +67,16 @@ class FakeMarketDataGateway(MarketDataGateway):
     ) -> list[DailyBar]:
         self._check("daily")
         self._range(start_date, end_date)
-        return [DailyBar(f"202610{i:02d}", Decimal(i), 99 + i) for i in range(1, 26)]
+        return [
+            DailyBar(
+                f"202610{i:02d}",
+                Decimal(i),
+                99 + i,
+                high_price=Decimal(i + 2),
+                low_price=Decimal(i),
+            )
+            for i in range(1, 26)
+        ]
 
     def get_moving_average(
         self, code: str, start_date: str, end_date: str, window: int
@@ -189,6 +202,18 @@ def test_snapshot_builder_merges_watchlist_and_holdings_and_summarizes_data() ->
     assert snapshot.stocks[0].macd == Decimal("1.25")
     assert snapshot.stocks[0].macd_signal_value == Decimal("1")
     assert snapshot.stocks[0].macd_signal == "neutral"
+    assert snapshot.stocks[0].atr14_percent == Decimal("3")
+    assert snapshot.stocks[0].realized_volatility_20d_percent is not None
+    assert snapshot.stocks[0].high_20d_distance_percent == (
+        Decimal(100) - Decimal(27)
+    ) / Decimal(27) * Decimal(100)
+    assert snapshot.stocks[0].low_20d_distance_percent == (
+        Decimal(100) - Decimal(6)
+    ) / Decimal(6) * Decimal(100)
+    assert snapshot.stocks[0].high_52w_position_percent == (
+        Decimal(100) - Decimal(1)
+    ) / Decimal(26) * Decimal(100)
+    assert snapshot.stocks[0].high_52w_period_trading_days == 25
     assert snapshot.stocks[0].news_headlines == [
         "뉴스 0",
         "뉴스 1",
@@ -210,6 +235,7 @@ def test_snapshot_builder_merges_watchlist_and_holdings_and_summarizes_data() ->
     assert snapshot.missing == []
     assert snapshot.market_session == "holiday"
     assert set(gateway.request_ranges) == {
+        ("20251014", "20261029"),
         ("20260701", "20261029"),
         ("20261015", "20261029"),
     }
@@ -262,6 +288,7 @@ def test_snapshot_builder_uses_kst_date_when_utc_clock_crosses_day_boundary() ->
 
     assert snapshot.created_at == now
     assert set(gateway.request_ranges) == {
+        ("20251015", "20261030"),
         ("20260702", "20261030"),
         ("20261016", "20261030"),
     }
@@ -387,6 +414,166 @@ def test_research_queries_news_once_when_latest_bar_is_today() -> None:
     ).build_research(["005930"])
 
     assert gateway.news_calls == [("005930", "20261029")]
+
+
+def test_ohlc_volatility_and_range_calculations() -> None:
+    bars = [
+        DailyBar(
+            f"202601{day:02d}",
+            Decimal("100"),
+            1,
+            high_price=Decimal("102"),
+            low_price=Decimal("98"),
+        )
+        for day in range(1, 17)
+    ]
+
+    assert calculate_atr14_percent(bars, Decimal("200")) == Decimal("2")
+    assert calculate_20d_price_distances(bars * 2, Decimal("100")) == (
+        (Decimal("100") - Decimal("102")) / Decimal("102") * Decimal(100),
+        (Decimal("100") - Decimal("98")) / Decimal("98") * Decimal(100),
+    )
+    position, days = calculate_52w_position(bars, Decimal("100"))
+    assert position == Decimal("50")
+    assert days == 16
+
+    closes = [Decimal("100")]
+    for _ in range(10):
+        closes.extend((Decimal("101"), Decimal("100")))
+    returns = [
+        Decimal("1"),
+        (Decimal("100") - Decimal("101")) / Decimal("101") * 100,
+    ] * 10
+    mean = sum(returns, Decimal(0)) / Decimal(20)
+    expected = (
+        sum(((item - mean) ** 2 for item in returns), Decimal(0)) / Decimal(20)
+    ).sqrt()
+    assert calculate_realized_volatility_20d_percent(closes) == expected
+
+
+def test_wilder_atr_smooths_distinct_true_ranges_and_gap_candle() -> None:
+    bars = [
+        DailyBar(
+            "20260101",
+            Decimal("100"),
+            1,
+            high_price=Decimal("101"),
+            low_price=Decimal("99"),
+        )
+    ]
+    for day, true_range in enumerate(range(1, 15), start=2):
+        half_range = Decimal(true_range) / Decimal(2)
+        bars.append(
+            DailyBar(
+                f"202601{day:02d}",
+                Decimal("100"),
+                1,
+                high_price=Decimal("100") + half_range,
+                low_price=Decimal("100") - half_range,
+            )
+        )
+    # 이 봉의 고저폭은 1이지만 전일 종가 대비 갭으로 TR은 20이다.
+    bars.append(
+        DailyBar(
+            "20260116",
+            Decimal("120"),
+            1,
+            high_price=Decimal("120"),
+            low_price=Decimal("119"),
+        )
+    )
+    bars.append(
+        DailyBar(
+            "20260117",
+            Decimal("120"),
+            1,
+            high_price=Decimal("122"),
+            low_price=Decimal("118"),
+        )
+    )
+
+    # TR 1..14의 seed ATR은 7.5; 다음 TR 20과 4를 Wilder 식으로 갱신한다.
+    seed_atr = sum((Decimal(value) for value in range(1, 15)), Decimal(0)) / 14
+    after_gap = (seed_atr * 13 + Decimal("20")) / 14
+    expected_atr = (after_gap * 13 + Decimal("4")) / 14
+    expected_percent = expected_atr / Decimal("200") * Decimal(100)
+
+    assert calculate_atr14_percent(bars, Decimal("200")) == expected_percent
+
+
+def test_volatility_and_ohlc_calculations_report_missing_inputs() -> None:
+    short_bars = [
+        DailyBar("20260101", Decimal("100"), 1, high_price=None, low_price=None)
+        for _ in range(14)
+    ]
+    closes = [Decimal(value) for value in range(1, 22)]
+
+    assert calculate_atr14_percent(short_bars, Decimal("100")) is None
+    assert calculate_realized_volatility_20d_percent(closes[:20]) is None
+    assert calculate_20d_price_distances(short_bars, Decimal("100")) == (None, None)
+    assert calculate_52w_position(short_bars, Decimal("100")) == (None, None)
+
+    enough_bars = [
+        DailyBar(
+            f"202601{day:02d}",
+            Decimal("100"),
+            1,
+            high_price=Decimal("101"),
+            low_price=Decimal("99"),
+        )
+        for day in range(1, 22)
+    ]
+    missing_ohlc = enough_bars[:-1] + [
+        DailyBar("20260121", Decimal("100"), 1, high_price=None, low_price=None)
+    ]
+    assert calculate_atr14_percent(missing_ohlc, Decimal("100")) is None
+    assert calculate_20d_price_distances(missing_ohlc, Decimal("100")) == (None, None)
+    assert calculate_52w_position(missing_ohlc, Decimal("100")) == (None, None)
+    assert calculate_realized_volatility_20d_percent(closes) is not None
+
+
+def test_zero_current_price_does_not_produce_normalized_metrics() -> None:
+    bars = [
+        DailyBar(
+            f"202601{day:02d}",
+            Decimal("100"),
+            1,
+            high_price=Decimal("101"),
+            low_price=Decimal("99"),
+        )
+        for day in range(1, 22)
+    ]
+
+    assert calculate_atr14_percent(bars, Decimal("0")) is None
+    assert calculate_20d_price_distances(bars, Decimal("0")) == (None, None)
+    assert calculate_52w_position(bars, Decimal("0")) == (None, None)
+
+
+def test_snapshot_builder_records_missing_reason_for_unavailable_ohlc() -> None:
+    class MissingOhlcGateway(FakeMarketDataGateway):
+        def get_daily_bars(
+            self, code: str, start_date: str, end_date: str
+        ) -> list[DailyBar]:
+            return [
+                DailyBar(f"202610{day:02d}", Decimal(day), 10) for day in range(1, 26)
+            ]
+
+    snapshot = SnapshotBuilder(
+        MissingOhlcGateway(),
+        ["005930"],
+        clock=lambda: datetime(2026, 10, 29, tzinfo=UTC),
+    ).build_research(["005930"])
+
+    stock = snapshot.stocks[0]
+    assert stock.atr14_percent is None
+    assert stock.high_20d_distance_percent is None
+    assert stock.low_20d_distance_percent is None
+    assert stock.high_52w_position_percent is None
+    assert stock.high_52w_period_trading_days is None
+    assert "005930:atr14(OHLC unavailable)" in snapshot.missing
+    assert "005930:high_20d_distance(OHLC unavailable)" in snapshot.missing
+    assert "005930:low_20d_distance(OHLC unavailable)" in snapshot.missing
+    assert "005930:high_52w_position(OHLC unavailable)" in snapshot.missing
 
 
 def test_news_failure_on_one_date_does_not_discard_other_date_results() -> None:

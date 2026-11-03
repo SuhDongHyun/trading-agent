@@ -1,4 +1,5 @@
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -10,7 +11,7 @@ from trading_agent.application.consensus_service import (
     RecommendationConsensusService,
 )
 from trading_agent.application.errors import DecisionModelError
-from trading_agent.application.ports import DecisionModel, ModelRun
+from trading_agent.application.ports import DailyBar, DecisionModel, ModelRun
 from trading_agent.application.recommend_stocks import RecommendStocks
 from trading_agent.application.records import CycleStatus
 from trading_agent.application.snapshot_builder import SnapshotBuilder
@@ -190,6 +191,66 @@ def test_recommendation_one_sided_basis_and_policy_are_recorded(
     assert (policy, aggregation, basis) == ("buy_one_side", "mean", "claude_only")
 
 
+def test_consensus_price_guard_records_adjustment_and_preserves_model_prices(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "price-guard.sqlite"
+    use_case, gateway, claude = build(db_path)
+    claude.items = [
+        replace(item, invalidation_price=Decimal("95"))
+        if item.code == "005930"
+        else item
+        for item in claude.items
+    ]
+    codex = use_case.consensus_service._codex
+    codex.items = [
+        replace(item, invalidation_price=Decimal("95"))
+        if item.code == "005930"
+        else item
+        for item in codex.items
+    ]
+    gateway.get_daily_bars = lambda code, start, end: [
+        DailyBar(
+            f"202610{day:02d}",
+            Decimal("100"),
+            1,
+            high_price=Decimal("102"),
+            low_price=Decimal("98"),
+        )
+        for day in range(1, 22)
+    ]
+
+    result = use_case.run()
+
+    adjusted = next(item for item in result.recommendations if item.code == "005930")
+    assert adjusted.invalidation_price == Decimal("92")
+    assert adjusted.original_invalidation_price == Decimal("95")
+    assert adjusted.price_adjusted is True
+    assert adjusted.price_warnings == []
+    assert result.outcome is not None and result.outcome.consensus is not None
+    assert result.outcome.consensus.recommendations[0].invalidation_price == Decimal(
+        "92"
+    )
+    assert result.outcome.claude_run.decision is not None
+    assert result.outcome.claude_run.decision.recommendations[
+        0
+    ].invalidation_price == Decimal("95")
+    with sqlite3.connect(db_path) as connection:
+        stored = connection.execute(
+            "SELECT invalidation_price, original_invalidation_price, price_adjusted, "
+            "price_warnings_json FROM consensus_recommendations "
+            "WHERE run_id = ? AND code = '005930'",
+            (result.run_id,),
+        ).fetchone()
+        model_price = connection.execute(
+            "SELECT invalidation_price FROM model_recommendations "
+            "WHERE run_id = ? AND model_id = 'claude' AND code = '005930'",
+            (result.run_id,),
+        ).fetchone()[0]
+    assert stored == ("92", "95", 1, "[]")
+    assert model_price == "95"
+
+
 def test_model_failure_fails_closed_and_keeps_both_runs(tmp_path: Path) -> None:
     db_path = tmp_path / "ledger.sqlite"
     use_case, _, _ = build(db_path, codex_fail=True)
@@ -356,7 +417,7 @@ def test_version_1_ledger_is_migrated_in_place(tmp_path: Path) -> None:
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
         assert connection.execute(
             "SELECT kind, started_at, status FROM runs"
         ).fetchone() == (
@@ -429,7 +490,7 @@ def test_version_2_ledger_preserves_verdicts_and_defaults_source_to_consensus(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
         assert connection.execute(
             "SELECT kind, started_at, status FROM runs WHERE id = 7"
         ).fetchone() == ("decision", "2026-11-01", "completed")
@@ -538,7 +599,7 @@ def test_version_3_recommendation_prices_are_renamed_and_reopen_is_idempotent(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
         model_columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(model_recommendations)")
@@ -639,7 +700,7 @@ def test_version_4_migrates_policy_defaults_and_preserves_rows(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
         result = connection.execute(
             "SELECT summary, policy, confidence_aggregation "
             "FROM consensus_results WHERE run_id = 11"
@@ -688,3 +749,58 @@ def test_open_marks_only_running_rows_older_than_configured_threshold_abandoned(
 def test_stale_run_threshold_must_be_positive(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="stale_run_after"):
         SQLiteDecisionLedger(tmp_path / "invalid.sqlite", stale_run_after=timedelta(0))
+
+
+def test_version_5_migrates_price_guard_columns_and_preserves_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v5.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL DEFAULT 'decision',
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                prompt TEXT,
+                snapshot_json TEXT
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO runs(id, kind, started_at, status) VALUES "
+            "(5, 'recommendation', '2026-11-02T00:00:00+00:00', 'completed')"
+        )
+        connection.execute(
+            """CREATE TABLE consensus_recommendations (
+                run_id INTEGER NOT NULL,
+                rank INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                rating TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                target_price TEXT,
+                invalidation_price TEXT,
+                reason TEXT NOT NULL,
+                consensus_basis TEXT NOT NULL DEFAULT 'agreed',
+                PRIMARY KEY (run_id, rank)
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO consensus_recommendations VALUES "
+            "(5, 1, '005930', 'buy', '0.8', '120', '90', '기존 추천', 'agreed')"
+        )
+        connection.execute("PRAGMA user_version = 5")
+
+    SQLiteDecisionLedger(db_path)
+    SQLiteDecisionLedger(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()
+        migrated = connection.execute(
+            "SELECT invalidation_price, original_invalidation_price, "
+            "price_adjusted, price_warnings_json "
+            "FROM consensus_recommendations WHERE run_id = 5"
+        ).fetchone()
+    assert version == (6,)
+    assert migrated == ("90", None, 0, "[]")

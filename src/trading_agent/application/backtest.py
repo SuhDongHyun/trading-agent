@@ -41,9 +41,7 @@ STATUS_ERROR = "error"
 STATUS_COMPLETED = "completed"
 STATUS_MODEL_FAILED = "model_failed"
 STATUS_DATA_FAILED = "data_failed"
-RESUMABLE_STATUSES = frozenset(
-    (STATUS_SNAPSHOT_ONLY, STATUS_COMPLETED, STATUS_MODEL_FAILED)
-)
+RESUMABLE_STATUSES = frozenset((STATUS_SNAPSHOT_ONLY, STATUS_COMPLETED))
 EXIT_CODE_BY_STATUS = {
     STATUS_SNAPSHOT_ONLY: 0,
     STATUS_COMPLETED: 0,
@@ -151,6 +149,7 @@ class BacktestOptions:
     start_date: str
     requested_to: str | None
     dates: str | int
+    dates_explicit: bool
     explicit_dates: list[str] | None
     seed: int
     universe: list[str]
@@ -345,6 +344,9 @@ def restore_recommendation(
         invalidation_price=mapping.unscale(
             recommendation.code, recommendation.invalidation_price
         ),
+        original_invalidation_price=mapping.unscale(
+            recommendation.code, recommendation.original_invalidation_price
+        ),
     )
 
 
@@ -444,7 +446,17 @@ class RunBacktest:
             calendar_dates,
             options.start_date,
             effective_to,
-            options.dates,
+            (
+                min(
+                    10,
+                    sum(
+                        options.start_date <= date <= effective_to
+                        for date in set(calendar_dates)
+                    ),
+                )
+                if not options.dates_explicit
+                else options.dates
+            ),
             options.seed,
             options.explicit_dates,
         )

@@ -2,7 +2,7 @@
 
 import math
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -139,6 +139,14 @@ class ConsensusSettings(BaseModel):
     confidence_aggregation: ConfidenceAggregation = ConfidenceAggregation.MEAN
 
 
+class PriceGuardSettings(BaseModel):
+    """추천 손절 폭과 목표/손절 손익비 정책."""
+
+    mode: Literal["adjust", "warn", "off"] = "adjust"
+    min_stop_atr_multiple: float = Field(default=2.0, gt=0)
+    min_reward_risk: float = Field(default=1.5, gt=0)
+
+
 class LedgerSettings(BaseModel):
     """결정 기록 저장 위치."""
 
@@ -159,6 +167,7 @@ class AgentSettings(BaseSettings):
         default_factory=RecommendationSettings
     )
     consensus: ConsensusSettings = Field(default_factory=ConsensusSettings)
+    price_guard: PriceGuardSettings = Field(default_factory=PriceGuardSettings)
     ledger: LedgerSettings = Field(default_factory=LedgerSettings)
 
     model_config = SettingsConfigDict(

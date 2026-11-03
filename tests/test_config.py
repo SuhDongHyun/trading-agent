@@ -64,6 +64,9 @@ def test_default_config_is_loaded_from_current_working_directory(
     assert settings.consensus.policy is ConsensusPolicyName.BUY_ONE_SIDE
     assert settings.consensus.confidence_aggregation is ConfidenceAggregation.MEAN
     assert settings.risk.min_confidence == 0.6
+    assert settings.price_guard.mode == "adjust"
+    assert settings.price_guard.min_stop_atr_multiple == 2.0
+    assert settings.price_guard.min_reward_risk == 1.5
 
 
 def test_missing_explicit_config_is_an_error(tmp_path: Path) -> None:
@@ -135,3 +138,33 @@ def test_consensus_settings_reject_invalid_values(
 
     with pytest.raises(ValidationError):
         load_settings(config_file)
+
+
+def test_price_guard_yaml_settings_are_loaded(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "price_guard:\n  mode: warn\n"
+        "  min_stop_atr_multiple: 2.5\n  min_reward_risk: 1.8\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_file)
+
+    assert settings.price_guard.mode == "warn"
+    assert settings.price_guard.min_stop_atr_multiple == 2.5
+    assert settings.price_guard.min_reward_risk == 1.8
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"mode": "modify"},
+        {"min_stop_atr_multiple": 0},
+        {"min_reward_risk": 0},
+    ],
+)
+def test_price_guard_settings_reject_invalid_values(values: dict[str, object]) -> None:
+    from trading_agent.infrastructure.config import PriceGuardSettings
+
+    with pytest.raises(ValidationError):
+        PriceGuardSettings(**values)

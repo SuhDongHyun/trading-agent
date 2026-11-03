@@ -29,7 +29,7 @@ from trading_agent.domain.recommendation import (
     StockRecommendation,
 )
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _RUN_KIND_DECISION = "decision"
 _RUN_KIND_RECOMMENDATION = "recommendation"
 
@@ -98,11 +98,28 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
                 )
 
 
+def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+    """추천 합의 항목에 가격 보정 결과와 경고를 추가한다."""
+
+    columns = _table_columns(connection, "consensus_recommendations")
+    additions = (
+        ("original_invalidation_price", "TEXT"),
+        ("price_adjusted", "INTEGER NOT NULL DEFAULT 0"),
+        ("price_warnings_json", "TEXT NOT NULL DEFAULT '[]'"),
+    )
+    for name, definition in additions:
+        if columns and name not in columns:
+            connection.execute(
+                f"ALTER TABLE consensus_recommendations ADD COLUMN {name} {definition}"
+            )
+
+
 _MIGRATIONS = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
     4: _migrate_v4_to_v5,
+    5: _migrate_v5_to_v6,
 }
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS runs (
@@ -212,6 +229,9 @@ _SCHEMA = (
         invalidation_price TEXT,
         reason TEXT NOT NULL,
         consensus_basis TEXT NOT NULL DEFAULT 'agreed',
+        original_invalidation_price TEXT,
+        price_adjusted INTEGER NOT NULL DEFAULT 0,
+        price_warnings_json TEXT NOT NULL DEFAULT '[]',
         PRIMARY KEY (run_id, rank)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_runs_recent ON runs(started_at DESC, id DESC)",
@@ -306,8 +326,10 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                 connection.execute(
                     """INSERT INTO consensus_recommendations
                        (run_id, rank, code, rating, confidence, target_price,
-                        invalidation_price, reason, consensus_basis)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        invalidation_price, reason, consensus_basis,
+                        original_invalidation_price, price_adjusted,
+                        price_warnings_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         result.run_id,
                         rank,
@@ -315,6 +337,13 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                         item.consensus_basis.value
                         if item.consensus_basis is not None
                         else "agreed",
+                        (
+                            None
+                            if item.original_invalidation_price is None
+                            else str(item.original_invalidation_price)
+                        ),
+                        int(item.price_adjusted),
+                        _json(item.price_warnings),
                     ),
                 )
 

@@ -65,6 +65,10 @@ recommendation:
 consensus:
   policy: buy_one_side       # strict 또는 buy_one_side
   confidence_aggregation: mean  # min 또는 mean
+price_guard:
+  mode: adjust               # adjust, warn 또는 off
+  min_stop_atr_multiple: 2.0
+  min_reward_risk: 1.5
 llm:
   claude:
     command: claude
@@ -87,6 +91,21 @@ ledger:
 대신합니다. `TRADING_AGENT__CONSENSUS__POLICY`와
 `TRADING_AGENT__CONSENSUS__CONFIDENCE_AGGREGATION` 환경변수로 합의 설정을
 덮어쓸 수도 있습니다.
+
+### 추천 가격 가드 설정
+
+| 설정 | 기본값 | 동작 |
+| --- | --- | --- |
+| `price_guard.mode` | `adjust` | `adjust`, `warn`, `off` 중 적용 모드 |
+| `price_guard.min_stop_atr_multiple` | `2.0` | buy 손절·sell 철회 가격의 최소 ATR 배수 (`> 0`) |
+| `price_guard.min_reward_risk` | `1.5` | 목표 폭 ÷ 손절 폭이 이 값보다 낮으면 경고 (`> 0`) |
+
+`adjust`는 buy 손절가를 현재가에서 최소 `min_stop_atr_multiple × ATR` 아래로 낮추고
+sell 철회 가격은 그만큼 높입니다. buy는 내림, sell은 올림해 원 단위로 보정합니다.
+`warn`은 가격을 유지하면서 손절 폭이나 목표/손절 손익비 경고를 기록하고, `off`는
+검사를 끕니다. 손익비가 `min_reward_risk`보다 낮으면 가격을 바꾸지 않습니다.
+ATR이나 가격을 구할 수 없는 추천은 보정하지 않습니다. 합의 추천에는 보정 여부, 원래
+손절가, 경고를 저장하고 모델별 원 의견은 그대로 보존합니다.
 
 ## 합의 정책
 
@@ -173,12 +192,25 @@ uv run trading-agent run --force
 
 스냅샷에는 가장 최근 일봉 날짜인 `as_of_trading_date`와 KST 기준
 `market_session`(open, closed, pre_open, holiday)이 포함됩니다. 시장 지표는 최근
-14 calendar days, 수익률·이동평균 계산용 종목 데이터는 기존 120 calendar days를
-조회합니다. `run`은 주말에는 스냅샷 수집 없이, 평일 09:00 이후에는 실제로 받은
+14 calendar days, 일봉은 380 calendar days, 이동평균·RSI·MACD 지표는 기존 120
+calendar days를 조회합니다. 일봉 조회 기간을 늘려도 지표 API 요청 기간은 늘지
+않습니다. `run`은 주말에는 스냅샷 수집 없이, 평일 09:00 이후에는 실제로 받은
 최신 일봉 날짜가 오늘보다 이전일 때 `skipped` 상태로 기록하고 LLM 판단 없이 종료
 코드 0으로 끝납니다. 일봉을 받지 못했거나 조회가 실패해 날짜를 확인하지 못하면
 휴장으로 단정하지 않고 누락 원인을 기록한 뒤 판단을 진행합니다. `--force`는 휴장
 skip을 건너뜁니다. `recommend`는 휴장일에도 실행합니다.
+
+스냅샷에는 다음 변동성·가격 범위 필드도 포함됩니다.
+
+| 필드 | 정의 |
+| --- | --- |
+| `atr14_percent` | Wilder ATR(14) ÷ 현재가 × 100. 고가·저가·전일 종가 OHLC가 필요합니다. |
+| `realized_volatility_20d_percent` | 최근 20개 단순 일간 수익률의 모집단 표준편차(%). 일간 값이며 연율화하지 않습니다. |
+| `high_20d_distance_percent` | (현재가 − 최근 20거래일 최고 고가) ÷ 최고 고가 × 100. 최고가 아래면 음수입니다. |
+| `low_20d_distance_percent` | (현재가 − 최근 20거래일 최저 저가) ÷ 최저 저가 × 100. 최저가 위면 양수입니다. |
+| `high_52w_position_percent` | 최근 최대 252거래일 저가~고가 범위에서 현재가 위치. 저가가 0%, 고가가 100%이며 계산한 거래일 수는 `high_52w_period_trading_days`에 표시합니다. |
+
+`market_session = open`이면 최신 일봉에 당일 미완성 봉이 포함될 수 있습니다.
 
 ### 종목 추천
 
@@ -200,6 +232,13 @@ BUY 확신도 순, SELL, HOLD,
 조회하지 않으며 Risk Guard도 적용하지 않습니다. 현재가를 읽지 못한 종목은
 `missing`에 적고 제외합니다.
 
+buy 손절가는 현재가 − `2 × ATR` 또는 최근 20거래일 최저 저가 아래 중 더 낮은
+가격을 기본으로 고려하고, sell 철회 가격은 현재가 + `2 × ATR` 또는 20거래일 최고
+고가 위 중 더 높은 가격을 고려합니다. ATR 금액은 현재가 × `atr14_percent` ÷ 100으로
+계산합니다. 목표 폭 ÷ 손절 폭 손익비는 1.5 이상을
+요구합니다. `run` 프롬프트에는 ATR 등 스냅샷 필드 설명만 제공하며 매매 판단 응답에는
+손절 가격을 추가하지 않습니다.
+
 ### 과거 시점 백테스트
 
 `backtest run`은 과거 판단일의 입력 스냅샷을 재구성하고 기존 추천 유스케이스와
@@ -219,10 +258,13 @@ uv run trading-agent backtest run \
 `5,10,20` 중 가장 긴 horizon의 종가가 확보된 마지막 KOSPI 거래일입니다.
 KST 15:30 전에는 당일 KOSPI 날짜를 달력에서 제외합니다. 계산된 `effective_to`는
 manifest에 저장하고 재개 실행에서 다시 사용하므로 날짜 표본이 바뀌지 않습니다.
-`--date YYYYMMDD`를 반복하거나 콤마로 묶어 날짜를 고를 수 있고, `--dates all`은
-구간의 모든 거래일을 실행합니다. `--dates N`은 seed로 재현 가능한 무작위 표본을
-뽑습니다. 날짜는 기본 순차 실행이며 `--workers 2`까지 허용합니다. 완료된 날짜
-파일은 기본 재개 동작으로 건너뜁니다.
+`--date YYYYMMDD`를 반복하거나 콤마로 묶어 날짜를 고를 수 있습니다. `--dates`는
+기본 10이며 seed로 재현 가능한 무작위 표본을 뽑습니다. `--dates all`은 명시한 경우에만
+구간의 모든 거래일을 실행합니다. 날짜는 기본 순차 실행이며 `--workers 2`까지
+허용합니다. `completed`와 `snapshot_only` 결과는 재개 시 건너뛰고,
+`model_failed`·`data_failed`·`error`는 다시 실행합니다.
+기존 run을 재개할 때는 생성 당시 사용한 `--dates` 값을 그대로 넘기세요. 이전 기본값
+`all`로 만든 run은 `--dates all`을 지정해야 설정 비교를 통과합니다.
 
 판단 시각은 기본 KST 15:40이며 `--decision-time HH:MM`으로 조정할 수 있습니다.
 과거 데이터는 다음 경계로 자릅니다.
@@ -343,7 +385,8 @@ ORDER BY r.started_at DESC, d.disagreement_index;
 
 ```sql
 SELECT c.rank, c.code, c.rating, c.confidence, c.consensus_basis,
-       c.target_price, c.invalidation_price, r.policy, r.confidence_aggregation
+       c.target_price, c.invalidation_price, c.original_invalidation_price,
+       c.price_adjusted, c.price_warnings_json, r.policy, r.confidence_aggregation
 FROM consensus_recommendations AS c
 JOIN consensus_results AS r ON r.run_id = c.run_id
 WHERE c.run_id = (
@@ -353,7 +396,8 @@ WHERE c.run_id = (
 ORDER BY c.rank;
 ```
 
-기존 v1·v2·v3·v4 DB는 처음 열 때 v5로 자동 이전됩니다. 기존 합의 결과에는 당시
+기존 v1~v5 DB는 처음 열 때 v6으로 자동 이전됩니다. v5에서 이전할 때 기존 합의
+추천 행에는 보정 전 가격 `NULL`, 보정 여부 `0`, 경고 `[]`를 채웁니다. 기존 합의 결과에는 당시
 동작인 `policy = 'strict'`, `confidence_aggregation = 'min'`, 항목 basis는
 `agreed`가 채워집니다. 기존 리스크 판정에는
 `source = 'consensus'`가 채워지고, 새 규칙 제안은 `source = 'rule'`과 규칙 종류를

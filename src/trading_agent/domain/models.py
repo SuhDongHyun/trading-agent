@@ -139,6 +139,12 @@ class StockSnapshot:
     macd_signal_value: Decimal | None = None
     macd_signal: str | None = None
     volume_change_percent: Decimal | None = None
+    atr14_percent: Decimal | None = None
+    realized_volatility_20d_percent: Decimal | None = None
+    high_20d_distance_percent: Decimal | None = None
+    low_20d_distance_percent: Decimal | None = None
+    high_52w_position_percent: Decimal | None = None
+    high_52w_period_trading_days: int | None = None
     news_headlines: list[str] | None = None
 
     def __post_init__(self) -> None:
@@ -153,10 +159,21 @@ class StockSnapshot:
             "macd",
             "macd_signal_value",
             "volume_change_percent",
+            "atr14_percent",
+            "realized_volatility_20d_percent",
+            "high_20d_distance_percent",
+            "low_20d_distance_percent",
+            "high_52w_position_percent",
         ):
             value = getattr(self, field_name)
             if value is not None:
                 object.__setattr__(self, field_name, to_decimal(value))
+        if self.high_52w_period_trading_days is not None and (
+            not isinstance(self.high_52w_period_trading_days, int)
+            or isinstance(self.high_52w_period_trading_days, bool)
+            or self.high_52w_period_trading_days <= 0
+        ):
+            raise DomainError("52주 위치 계산 거래일 수는 양의 정수여야 합니다.")
         if self.news_headlines is not None:
             object.__setattr__(self, "news_headlines", list(self.news_headlines))
 

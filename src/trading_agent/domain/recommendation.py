@@ -1,7 +1,7 @@
 """계좌와 무관한 종목 투자의견과 두 모델 합의 로직."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 from trading_agent.domain.consensus import (
@@ -35,6 +35,9 @@ class StockRecommendation:
     invalidation_price: Decimal | None
     reason: str
     consensus_basis: ConsensusBasis | None = None
+    original_invalidation_price: Decimal | None = None
+    price_adjusted: bool = False
+    price_warnings: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         require_stock_code(self.code)
@@ -46,7 +49,11 @@ class StockRecommendation:
             except (TypeError, ValueError) as error:
                 raise DomainError("합의 근거가 올바르지 않습니다.") from error
             object.__setattr__(self, "consensus_basis", basis)
-        for field_name in ("target_price", "invalidation_price"):
+        for field_name in (
+            "target_price",
+            "invalidation_price",
+            "original_invalidation_price",
+        ):
             value = getattr(self, field_name)
             if value is None:
                 continue
@@ -54,6 +61,7 @@ class StockRecommendation:
             if price <= 0:
                 raise DomainError("목표가와 의견 무효화 가격은 0보다 커야 합니다.")
             object.__setattr__(self, field_name, price)
+        object.__setattr__(self, "price_warnings", list(self.price_warnings))
 
 
 @dataclass(frozen=True, slots=True)

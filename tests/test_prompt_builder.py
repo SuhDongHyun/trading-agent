@@ -28,6 +28,8 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
                 "삼성전자",
                 current_price=Decimal("70000.25"),
                 volume_change_percent=Decimal("-12.5"),
+                atr14_percent=Decimal("1.234"),
+                realized_volatility_20d_percent=Decimal("2.345"),
             )
         ],
         market_context=MarketContext(volatility_index=None),
@@ -56,6 +58,10 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
     assert snapshot.account.cash == Decimal("1234.50")
     assert snapshot.stocks[0].current_price == Decimal("70000.25")
     assert serialized["stocks"][0]["volume_change_percent"] == "-12.50"
+    assert serialized["stocks"][0]["atr14_percent"] == "1.23"
+    assert serialized["stocks"][0]["realized_volatility_20d_percent"] == "2.35"
+    assert "Wilder ATR(14)" in prompt
+    assert "연율화하지 않았습니다" in prompt
     assert "장중에는 당일 미완성 누적 거래량" in prompt
     assert "직전 20일 평균" in prompt
     assert "news:005930" in prompt
@@ -84,9 +90,19 @@ def test_recommendation_prompt_asks_for_every_stock_without_account() -> None:
 
     snapshot = ResearchSnapshot(
         created_at=datetime(2026, 11, 2, tzinfo=UTC),
-        stocks=[StockSnapshot(code="086520", name="에코프로")],
+        stocks=[
+            StockSnapshot(
+                code="086520",
+                name="에코프로",
+                atr14_percent=Decimal("3.456"),
+                high_20d_distance_percent=Decimal("-4.5"),
+                high_52w_position_percent=Decimal("75"),
+                high_52w_period_trading_days=249,
+            )
+        ],
         market_context=MarketContext(),
         missing=["market:vkospi"],
+        market_session="open",
     )
 
     prompt = build_recommendation_prompt(snapshot)
@@ -94,9 +110,19 @@ def test_recommendation_prompt_asks_for_every_stock_without_account() -> None:
 
     assert "account" not in serialized
     assert serialized["stocks"][0]["code"] == "086520"
+    assert serialized["stocks"][0]["atr14_percent"] == "3.46"
+    assert serialized["stocks"][0]["high_20d_distance_percent"] == "-4.50"
+    assert serialized["stocks"][0]["high_52w_period_trading_days"] == 249
     assert "recommendations 항목을 정확히 하나씩" in prompt
     assert "이미 있는 항목은 다시 적지 마세요" in prompt
     assert "market:vkospi" in prompt
+    assert "현재가 × atr14_percent ÷ 100" in prompt
+    assert "현재가 ÷ (1 + low_20d_distance_percent ÷ 100)" in prompt
+    assert "현재가 ÷ (1 + high_20d_distance_percent ÷ 100)" in prompt
+    assert "2×ATR" in prompt
+    assert "최근 20거래일 최저 저가" in prompt
+    assert "손익비는 최소 1.5" in prompt
+    assert "market_session이 open이면 최신 일봉에 당일 미완성 봉" in prompt
     assert "as_of_trading_date" in prompt
     assert "0.5는 근거가 엇갈려 동전 던지기 수준" in prompt
     assert "hold의 confidence도 매수·매도하지 않기로 한 판단 자체" in prompt

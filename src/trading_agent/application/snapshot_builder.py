@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from trading_agent.application.errors import MarketDataUnavailable
 from trading_agent.application.ports import (
+    DailyBar,
     IndexPoint,
     IndicatorPoint,
     MarketDataGateway,
@@ -26,7 +27,8 @@ from trading_agent.domain.models import (
     StockSnapshot,
 )
 
-LOOKBACK_CALENDAR_DAYS = 120
+LOOKBACK_CALENDAR_DAYS = 380
+INDICATOR_LOOKBACK_CALENDAR_DAYS = 120
 MARKET_LOOKBACK_CALENDAR_DAYS = 14
 MA_SHORT_WINDOW = 20
 MA_LONG_WINDOW = 60
@@ -36,6 +38,10 @@ MACD_SHORT_WINDOW = 12
 MACD_LONG_WINDOW = 26
 MACD_SIGNAL_WINDOW = 9
 VOLUME_BASELINE_WINDOW = 20
+ATR_WINDOW = 14
+REALIZED_VOLATILITY_WINDOW = 20
+PRICE_RANGE_WINDOW = 20
+WEEK_52_TRADING_DAYS = 252
 DEFAULT_NEWS_LIMIT = 5
 MARKET_TIMEZONE = ZoneInfo("Asia/Seoul")
 
@@ -79,6 +85,133 @@ def calculate_volume_change_percent(
     return (Decimal(volumes[-1]) - average_volume) / average_volume * Decimal(100)
 
 
+def calculate_atr14_percent(
+    bars: Sequence[DailyBar], current_price: Decimal
+) -> Decimal | None:
+    """Wilder 방식 ATR(14)을 현재가 대비 백분율로 계산한다."""
+
+    if current_price <= 0 or len(bars) <= ATR_WINDOW:
+        return None
+    if any(bar.high_price is None or bar.low_price is None for bar in bars):
+        return None
+    true_ranges: list[Decimal] = []
+    for previous, bar in zip(bars, bars[1:], strict=False):
+        assert bar.high_price is not None and bar.low_price is not None
+        true_ranges.append(
+            max(
+                bar.high_price - bar.low_price,
+                abs(bar.high_price - previous.close_price),
+                abs(bar.low_price - previous.close_price),
+            )
+        )
+    if len(true_ranges) < ATR_WINDOW:
+        return None
+    atr = sum(true_ranges[:ATR_WINDOW], Decimal(0)) / Decimal(ATR_WINDOW)
+    for true_range in true_ranges[ATR_WINDOW:]:
+        atr = (atr * Decimal(ATR_WINDOW - 1) + true_range) / Decimal(ATR_WINDOW)
+    return atr / current_price * Decimal(100)
+
+
+def calculate_realized_volatility_20d_percent(
+    closes: Sequence[Decimal],
+) -> Decimal | None:
+    """최근 20개 단순 일간 수익률의 모집단 표준편차를 계산한다."""
+
+    if len(closes) <= REALIZED_VOLATILITY_WINDOW:
+        return None
+    recent = closes[-(REALIZED_VOLATILITY_WINDOW + 1) :]
+    previous_closes = recent[:-1]
+    if any(close == 0 for close in previous_closes):
+        return None
+    returns = [
+        (current - previous) / previous * Decimal(100)
+        for previous, current in zip(recent, recent[1:], strict=False)
+    ]
+    mean = sum(returns, Decimal(0)) / Decimal(REALIZED_VOLATILITY_WINDOW)
+    variance = sum(((value - mean) ** 2 for value in returns), Decimal(0)) / Decimal(
+        REALIZED_VOLATILITY_WINDOW
+    )
+    return variance.sqrt()
+
+
+def calculate_20d_price_distances(
+    bars: Sequence[DailyBar], current_price: Decimal
+) -> tuple[Decimal | None, Decimal | None]:
+    """현재가에서 최근 20일 고가·저가까지의 부호 있는 거리를 계산한다."""
+
+    if current_price <= 0 or len(bars) < PRICE_RANGE_WINDOW:
+        return None, None
+    recent = bars[-PRICE_RANGE_WINDOW:]
+    if any(bar.high_price is None or bar.low_price is None for bar in recent):
+        return None, None
+    highs = [bar.high_price for bar in recent]
+    lows = [bar.low_price for bar in recent]
+    assert all(value is not None for value in highs + lows)
+    highest = max(value for value in highs if value is not None)
+    lowest = min(value for value in lows if value is not None)
+    if highest <= 0 or lowest <= 0:
+        return None, None
+    high_distance = (current_price - highest) / highest * Decimal(100)
+    low_distance = (current_price - lowest) / lowest * Decimal(100)
+    return high_distance, low_distance
+
+
+def calculate_52w_position(
+    bars: Sequence[DailyBar], current_price: Decimal
+) -> tuple[Decimal | None, int | None]:
+    """가용한 최대 252거래일 고저 범위에서 현재가 위치를 계산한다."""
+
+    if current_price <= 0 or not bars:
+        return None, None
+    recent = bars[-WEEK_52_TRADING_DAYS:]
+    if any(bar.high_price is None or bar.low_price is None for bar in recent):
+        return None, None
+    highs = [bar.high_price for bar in recent]
+    lows = [bar.low_price for bar in recent]
+    assert all(value is not None for value in highs + lows)
+    highest = max(value for value in highs if value is not None)
+    lowest = min(value for value in lows if value is not None)
+    if highest <= 0 or lowest <= 0 or highest == lowest:
+        return None, None
+    position = (current_price - lowest) / (highest - lowest) * Decimal(100)
+    return position, len(recent)
+
+
+def _atr_missing_reason(bars: Sequence[DailyBar], current_price: Decimal) -> str:
+    if current_price <= 0:
+        return "current price is zero"
+    if len(bars) <= ATR_WINDOW:
+        return "insufficient daily bars"
+    if any(bar.high_price is None or bar.low_price is None for bar in bars):
+        return "OHLC unavailable"
+    return "invalid OHLC"
+
+
+def _volatility_missing_reason(closes: Sequence[Decimal]) -> str:
+    if len(closes) <= REALIZED_VOLATILITY_WINDOW:
+        return "insufficient daily returns"
+    return "zero previous close"
+
+
+def _range_missing_reason(
+    bars: Sequence[DailyBar],
+    current_price: Decimal,
+    window: int,
+    *,
+    allow_partial: bool = False,
+) -> str:
+    if current_price <= 0:
+        return "current price is zero"
+    if not bars:
+        return "no daily bars"
+    if not allow_partial and len(bars) < window:
+        return "insufficient daily bars"
+    recent = bars[-window:]
+    if any(bar.high_price is None or bar.low_price is None for bar in recent):
+        return "OHLC unavailable"
+    return "invalid OHLC"
+
+
 def _seoul_now() -> datetime:
     """trading-api와 같은 한국 날짜의 현재 시각을 반환한다."""
 
@@ -105,7 +238,9 @@ class SnapshotBuilder:
     def build(self) -> MarketSnapshot:
         """필수 데이터가 있으면 스냅샷을 만들고 보조 실패는 기록한다."""
 
-        now, start_date, end_date, market_start_date = self._lookback_window()
+        now, daily_start_date, indicator_start_date, end_date, market_start_date = (
+            self._lookback_window()
+        )
         account = self.gateway.get_account()
         codes = _unique_codes(
             [*self.watchlist, *(position.code for position in account.positions)]
@@ -115,7 +250,14 @@ class SnapshotBuilder:
         missing: list[str] = []
 
         stock_results = [
-            self._build_stock(code, quotes[code], start_date, end_date, missing)
+            self._build_stock(
+                code,
+                quotes[code],
+                daily_start_date,
+                indicator_start_date,
+                end_date,
+                missing,
+            )
             for code in codes
         ]
         stocks = [stock for stock, _ in stock_results]
@@ -139,7 +281,9 @@ class SnapshotBuilder:
         현재가를 못 읽은 종목은 missing에 적고 제외한다. 한 종목도 읽지 못하면 실패한다.
         """
 
-        now, start_date, end_date, market_start_date = self._lookback_window()
+        now, daily_start_date, indicator_start_date, end_date, market_start_date = (
+            self._lookback_window()
+        )
         missing: list[str] = []
         quotes: dict[str, StockQuote] = {}
         for code in _unique_codes(codes):
@@ -152,7 +296,14 @@ class SnapshotBuilder:
             raise MarketDataUnavailable("후보 종목 현재가를 하나도 읽지 못했습니다.")
 
         stock_results = [
-            self._build_stock(code, quote, start_date, end_date, missing)
+            self._build_stock(
+                code,
+                quote,
+                daily_start_date,
+                indicator_start_date,
+                end_date,
+                missing,
+            )
             for code, quote in quotes.items()
         ]
         stocks = [stock for stock, _ in stock_results]
@@ -169,7 +320,7 @@ class SnapshotBuilder:
             market_session=_market_session(now, as_of_trading_date, missing),
         )
 
-    def _lookback_window(self) -> tuple[datetime, str, str, str]:
+    def _lookback_window(self) -> tuple[datetime, str, str, str, str]:
         """현재 시각과 한국 날짜 기준 조회 시작일·종료일을 반환한다."""
 
         now = self.clock()
@@ -177,17 +328,23 @@ class SnapshotBuilder:
             raise ValueError("clock는 timezone-aware datetime을 반환해야 합니다.")
         today = now.astimezone(MARKET_TIMEZONE).date()
         end_date = today.strftime("%Y%m%d")
-        start_date = (today - timedelta(days=LOOKBACK_CALENDAR_DAYS)).strftime("%Y%m%d")
+        daily_start_date = (today - timedelta(days=LOOKBACK_CALENDAR_DAYS)).strftime(
+            "%Y%m%d"
+        )
+        indicator_start_date = (
+            today - timedelta(days=INDICATOR_LOOKBACK_CALENDAR_DAYS)
+        ).strftime("%Y%m%d")
         market_start_date = (
             today - timedelta(days=MARKET_LOOKBACK_CALENDAR_DAYS)
         ).strftime("%Y%m%d")
-        return now, start_date, end_date, market_start_date
+        return now, daily_start_date, indicator_start_date, end_date, market_start_date
 
     def _build_stock(
         self,
         code: str,
         quote: StockQuote,
-        start_date: str,
+        daily_start_date: str,
+        indicator_start_date: str,
         end_date: str,
         missing: list[str],
     ) -> tuple[StockSnapshot, str | None]:
@@ -195,33 +352,35 @@ class SnapshotBuilder:
 
         daily = self._read_optional(
             f"{code}:daily",
-            lambda: self.gateway.get_daily_bars(code, start_date, end_date),
+            lambda: self.gateway.get_daily_bars(code, daily_start_date, end_date),
             missing,
         )
         ma20 = self._latest_optional(
             f"{code}:ma20",
             lambda: self.gateway.get_moving_average(
-                code, start_date, end_date, MA_SHORT_WINDOW
+                code, indicator_start_date, end_date, MA_SHORT_WINDOW
             ),
             missing,
         )
         ma60 = self._latest_optional(
             f"{code}:ma60",
             lambda: self.gateway.get_moving_average(
-                code, start_date, end_date, MA_LONG_WINDOW
+                code, indicator_start_date, end_date, MA_LONG_WINDOW
             ),
             missing,
         )
         rsi = self._latest_optional(
             f"{code}:rsi",
-            lambda: self.gateway.get_rsi(code, start_date, end_date, RSI_WINDOW),
+            lambda: self.gateway.get_rsi(
+                code, indicator_start_date, end_date, RSI_WINDOW
+            ),
             missing,
         )
         rsi_signal = self._latest_optional(
             f"{code}:rsi_signal",
             lambda: self.gateway.get_rsi_signal(
                 code,
-                start_date,
+                indicator_start_date,
                 end_date,
                 RSI_WINDOW,
                 RSI_SIGNAL_WINDOW,
@@ -232,7 +391,7 @@ class SnapshotBuilder:
             f"{code}:macd",
             lambda: self.gateway.get_macd(
                 code,
-                start_date,
+                indicator_start_date,
                 end_date,
                 MACD_SHORT_WINDOW,
                 MACD_LONG_WINDOW,
@@ -243,7 +402,7 @@ class SnapshotBuilder:
             f"{code}:macd_signal",
             lambda: self.gateway.get_macd_signal(
                 code,
-                start_date,
+                indicator_start_date,
                 end_date,
                 MACD_SHORT_WINDOW,
                 MACD_LONG_WINDOW,
@@ -274,6 +433,50 @@ class SnapshotBuilder:
             _mark_missing(f"{code}:news", missing, "empty")
         sorted_closes = [bar.close_price for bar in sorted_daily]
         sorted_volumes = [bar.volume for bar in sorted_daily]
+        current_price = quote.current_price
+        atr14_percent = calculate_atr14_percent(sorted_daily, current_price)
+        if atr14_percent is None:
+            _mark_missing(
+                f"{code}:atr14",
+                missing,
+                _atr_missing_reason(sorted_daily, current_price),
+            )
+        realized_volatility = calculate_realized_volatility_20d_percent(sorted_closes)
+        if realized_volatility is None:
+            _mark_missing(
+                f"{code}:realized_volatility_20d",
+                missing,
+                _volatility_missing_reason(sorted_closes),
+            )
+        high_20d_distance, low_20d_distance = calculate_20d_price_distances(
+            sorted_daily, current_price
+        )
+        if high_20d_distance is None:
+            _mark_missing(
+                f"{code}:high_20d_distance",
+                missing,
+                _range_missing_reason(sorted_daily, current_price, PRICE_RANGE_WINDOW),
+            )
+        if low_20d_distance is None:
+            _mark_missing(
+                f"{code}:low_20d_distance",
+                missing,
+                _range_missing_reason(sorted_daily, current_price, PRICE_RANGE_WINDOW),
+            )
+        high_52w_position, high_52w_days = calculate_52w_position(
+            sorted_daily, current_price
+        )
+        if high_52w_position is None:
+            _mark_missing(
+                f"{code}:high_52w_position",
+                missing,
+                _range_missing_reason(
+                    sorted_daily,
+                    current_price,
+                    WEEK_52_TRADING_DAYS,
+                    allow_partial=True,
+                ),
+            )
         latest_ma20 = ma20.value if ma20 else None
         latest_ma60 = ma60.value if ma60 else None
         headlines = None
@@ -304,6 +507,12 @@ class SnapshotBuilder:
             macd_signal_value=macd_signal.value if macd_signal else None,
             macd_signal=macd_signal.signal if macd_signal else None,
             volume_change_percent=calculate_volume_change_percent(sorted_volumes),
+            atr14_percent=atr14_percent,
+            realized_volatility_20d_percent=realized_volatility,
+            high_20d_distance_percent=high_20d_distance,
+            low_20d_distance_percent=low_20d_distance,
+            high_52w_position_percent=high_52w_position,
+            high_52w_period_trading_days=high_52w_days,
             news_headlines=headlines,
         )
         return stock, latest_daily_date
