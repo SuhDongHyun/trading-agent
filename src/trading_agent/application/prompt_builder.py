@@ -144,7 +144,10 @@ def build_decision_prompt(
     """한국어 지침과 손실 없는 JSON 요약을 포함한 프롬프트를 만든다."""
 
     snapshot_json = json.dumps(
-        to_json_value(snapshot), ensure_ascii=False, indent=2, allow_nan=False
+        to_json_value(snapshot),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
     )
     risk_policy = {
         "max_position_weight": str(policy.max_position_weight),
@@ -205,7 +208,7 @@ def build_decision_prompt(
 {TRADE_DECISION_GUIDANCE}
 
 리스크 정책:
-{json.dumps(risk_policy, ensure_ascii=False, indent=2)}
+{json.dumps(risk_policy, ensure_ascii=False, separators=(",", ":"), allow_nan=False)}
 
 필드 설명:
 - created_at: 스냅샷을 만든 시각.
