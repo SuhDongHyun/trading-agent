@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from trading_agent.application.records import CycleStatus, DecisionCycleResult
-from trading_agent.interface.cli import _handle_sigterm, main
+from trading_agent.interface.cli import _handle_sigterm, build_parser, main
 
 
 class FakeRuntime[R]:
@@ -26,10 +26,17 @@ def test_sigterm_handler_raises_system_exit_143() -> None:
     assert error.value.code == 143
 
 
+def test_paper_run_parses_no_reuse_option() -> None:
+    args = build_parser().parse_args(["paper", "run", "--no-reuse"])
+
+    assert args.no_reuse
+
+
 @pytest.mark.parametrize(
     ("status", "expected_exit"),
     [
         (CycleStatus.COMPLETED, 0),
+        (CycleStatus.REUSED, 0),
         (CycleStatus.SKIPPED, 0),
         (CycleStatus.MODEL_FAILED, 2),
         (CycleStatus.DATA_FAILED, 1),

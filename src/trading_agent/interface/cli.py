@@ -169,6 +169,11 @@ def build_parser() -> argparse.ArgumentParser:
     paper_run.add_argument(
         "--force", action="store_true", help="휴장일 skip 판정을 생략"
     )
+    paper_run.add_argument(
+        "--no-reuse",
+        action="store_true",
+        help="직전 판단을 재사용하지 않고 모델을 호출",
+    )
     paper_run.add_argument("--ledger-db", type=Path, help="모의투자 판단 기록 DB")
     paper_mark = paper_commands.add_parser(
         "mark", help="매매 없이 현재가로 가상 계좌를 평가해 기록"
@@ -379,7 +384,9 @@ def _print_paper_report(report: PaperReport) -> None:
     print(f"비교: {comparison}")
     counts = ", ".join(f"{k} {v}" for k, v in sorted(report.status_counts.items()))
     print(
-        f"사이클: {counts or '없음'} | 주문: 체결 {report.filled_count}건, "
+        f"사이클: {counts or '없음'} "
+        f"(모델 호출 {report.model_call_count}회, 재사용 {report.reused_count}회) | "
+        f"주문: 체결 {report.filled_count}건, "
         f"미체결 {report.unfilled_count}건"
     )
     if report.stale_codes:
@@ -498,7 +505,10 @@ def _print_result(result: DecisionCycleResult) -> None:
     """사람이 확인할 사이클 요약을 stdout에 표시한다."""
 
     consensus = result.decision.consensus if result.decision is not None else None
-    proposal_count = len(consensus.proposals) if consensus is not None else 0
+    proposals = (
+        consensus.proposals if consensus is not None else result.reused_proposals or []
+    )
+    proposal_count = len(proposals)
     disagreement_count = len(consensus.disagreements) if consensus is not None else 0
     verdicts = result.verdicts or []
     approved = [verdict for verdict in verdicts if verdict.approved]
@@ -506,6 +516,14 @@ def _print_result(result: DecisionCycleResult) -> None:
     missing_info = consensus.missing_info if consensus is not None else []
     print(f"상태: {result.status.value}")
     print(f"합의 채택: {proposal_count}건, 불일치: {disagreement_count}건")
+    if result.status is CycleStatus.REUSED:
+        print(
+            f"모델 판단 재사용: run_id {result.reuse_source_run_id} "
+            f"({result.reuse_reason or '사유 없음'})"
+        )
+    elif result.reuse_reason is not None:
+        call_label = "호출" if result.model_called else "미호출"
+        print(f"모델 판단 {call_label}: {result.reuse_reason}")
     if approved:
         approved_summary = ", ".join(
             f"{_proposal_origin(item.proposal)} {item.proposal.code} "
@@ -736,7 +754,7 @@ def _decision_time(value: str) -> time:
 def _exit_code(status: CycleStatus) -> int:
     """요구된 성공·모델 실패·기타 실패 종료 코드를 반환한다."""
 
-    if status in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
+    if status in (CycleStatus.COMPLETED, CycleStatus.REUSED, CycleStatus.SKIPPED):
         return 0
     if status is CycleStatus.MODEL_FAILED:
         return 2

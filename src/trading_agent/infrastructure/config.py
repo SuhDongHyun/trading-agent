@@ -188,6 +188,13 @@ class LedgerSettings(BaseModel):
     stale_run_after_seconds: int = Field(default=3600, gt=0)
 
 
+class PaperReuseDecisionSettings(BaseModel):
+    """가상투자에서 직전 모델 판단을 재사용하는 정책."""
+
+    enabled: bool = True
+    price_move_atr_multiple: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+
+
 class PaperSettings(BaseModel):
     """가상 계좌 모의투자 설정."""
 
@@ -197,6 +204,9 @@ class PaperSettings(BaseModel):
     slippage_rate: float = Field(default=0.0, ge=0, lt=1)
     db_path: Path = Path("data/paper/portfolio.db")
     ledger_db_path: Path = Path("data/paper/decisions.db")
+    reuse_decision: PaperReuseDecisionSettings = Field(
+        default_factory=PaperReuseDecisionSettings
+    )
 
 
 class AgentSettings(BaseSettings):

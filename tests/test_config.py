@@ -91,6 +91,39 @@ def test_missing_default_config_uses_builtin_defaults(
     assert settings.risk.stop_loss_percent is None
     assert settings.risk.take_profit_percent is None
     assert settings.risk.take_profit_sell_fraction == 0.5
+    assert settings.paper.reuse_decision.enabled is True
+    assert settings.paper.reuse_decision.price_move_atr_multiple == 1.0
+
+
+def test_paper_reuse_settings_yaml_and_environment_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "paper:\n  reuse_decision:\n    enabled: false\n"
+        "    price_move_atr_multiple: 1.5\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_file)
+    assert settings.paper.reuse_decision.enabled is False
+    assert settings.paper.reuse_decision.price_move_atr_multiple == 1.5
+
+    monkeypatch.setenv("TRADING_AGENT__PAPER__REUSE_DECISION__ENABLED", "true")
+    monkeypatch.setenv(
+        "TRADING_AGENT__PAPER__REUSE_DECISION__PRICE_MOVE_ATR_MULTIPLE", "2.0"
+    )
+    settings = load_settings(config_file)
+    assert settings.paper.reuse_decision.enabled is True
+    assert settings.paper.reuse_decision.price_move_atr_multiple == 2.0
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_paper_reuse_atr_multiple_must_be_finite_and_positive(value: float) -> None:
+    from trading_agent.infrastructure.config import PaperReuseDecisionSettings
+
+    with pytest.raises(ValidationError):
+        PaperReuseDecisionSettings(price_move_atr_multiple=value)
 
 
 def test_recommendation_horizon_defaults_and_environment_override(

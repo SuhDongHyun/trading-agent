@@ -18,8 +18,12 @@ from trading_agent.application.ports import (
     StockQuote,
     TreasuryMaturity,
 )
-from trading_agent.application.records import CycleStatus, DecisionCycleResult
-from trading_agent.domain.models import AccountSnapshot
+from trading_agent.application.records import (
+    CycleStatus,
+    DecisionCycleResult,
+    DecisionReuse,
+)
+from trading_agent.domain.models import AccountSnapshot, MarketSnapshot, TradeProposal
 from trading_agent.domain.paper import (
     FeeSchedule,
     FillStatus,
@@ -28,7 +32,11 @@ from trading_agent.domain.paper import (
 )
 
 MARKET_TIMEZONE = ZoneInfo("Asia/Seoul")
-_EXECUTABLE_STATUSES = (CycleStatus.COMPLETED, CycleStatus.MODEL_FAILED)
+_EXECUTABLE_STATUSES = (
+    CycleStatus.COMPLETED,
+    CycleStatus.MODEL_FAILED,
+    CycleStatus.REUSED,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +69,24 @@ class PaperRecord:
     error: str | None = None
     valuation: PaperValuation | None = None
     fills: tuple[PaperFill, ...] = ()
+    model_called: bool = False
+    reuse_source_run_id: int | None = None
+    reuse_reason: str | None = None
+    decision_evidence: "PaperDecisionEvidence | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class PaperDecisionEvidence:
+    """직전 성공 모델 판단을 재검토할 때 필요한 최소 정보."""
+
+    paper_run_id: int | None
+    run_id: int
+    judged_at: datetime
+    prices: dict[str, Decimal | None]
+    atr14_percent: dict[str, Decimal | None]
+    news_ids: frozenset[str]
+    universe_codes: frozenset[str]
+    proposals: tuple[TradeProposal, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +131,8 @@ class PaperHistory:
     valuations: list[PaperValuationRow]
     fills: list[PaperFillRow]
     status_counts: dict[str, int]
+    model_call_count: int = 0
+    reused_count: int = 0
 
 
 class PaperPortfolioStore(ABC):
@@ -125,6 +153,21 @@ class PaperPortfolioStore(ABC):
     @abstractmethod
     def history(self) -> PaperHistory:
         """리포트용 이력을 읽는다."""
+
+    def latest_decision_evidence(self) -> PaperDecisionEvidence | None:
+        """마지막으로 완료한 모델 판단의 paper 근거를 반환한다."""
+
+        return None
+
+    def latest_model_attempt(self) -> tuple[str, int] | None:
+        """재사용 회차를 제외한 마지막 판단 시도 상태와 run id를 반환한다."""
+
+        return None
+
+    def has_filled_since(self, paper_run_id: int) -> bool:
+        """지정한 모델 판단 이후 모의 체결이 있었는지 반환한다."""
+
+        return False
 
 
 class PaperAccountGateway(MarketDataGateway):
@@ -298,15 +341,30 @@ class RunPaperCycle(_PaperBase):
         watchlist: Sequence[str],
         initial_cash: Decimal,
         clock: Callable[[], datetime],
+        reuse_enabled: bool = True,
+        price_move_atr_multiple: Decimal = Decimal(1),
+        force_no_reuse: bool = False,
     ) -> None:
         super().__init__(store, gateway, watchlist, initial_cash, clock)
         self.cycle_factory = cycle_factory
         self.fees = fees
+        self.reuse_enabled = reuse_enabled
+        self.price_move_atr_multiple = Decimal(str(price_move_atr_multiple))
+        if (
+            not self.price_move_atr_multiple.is_finite()
+            or self.price_move_atr_multiple <= 0
+        ):
+            raise ValueError("price_move_atr_multiple는 0보다 커야 합니다.")
+        self.force_no_reuse = force_no_reuse
 
     def run(self) -> PaperCycleOutcome:
         started_at = self.clock()
         portfolio = self._portfolio(started_at)
-        result = self.cycle_factory(PaperAccountGateway(self.gateway, portfolio)).run()
+        cycle = self.cycle_factory(PaperAccountGateway(self.gateway, portfolio))
+        set_reuse_provider = getattr(cycle, "set_reuse_decision_provider", None)
+        if callable(set_reuse_provider):
+            set_reuse_provider(self._reuse_decision)
+        result = cycle.run()
 
         quotes: dict[str, Decimal] = {}
         fills: list[PaperFill] = []
@@ -314,7 +372,7 @@ class RunPaperCycle(_PaperBase):
         market_open = snapshot is not None and snapshot.market_session == "open"
         stocks = snapshot.stocks if snapshot is not None else []
         names = {stock.code: stock.name for stock in stocks}
-        approved = [verdict for verdict in result.verdicts if verdict.approved]
+        approved = [verdict for verdict in result.verdicts or [] if verdict.approved]
         if result.status in _EXECUTABLE_STATUSES:
             for verdict in approved:
                 proposal = verdict.proposal
@@ -332,14 +390,17 @@ class RunPaperCycle(_PaperBase):
                     continue
                 try:
                     quote = self.gateway.get_stock_quote(proposal.code)
-                except Exception as error:
+                except Exception as quote_error:
                     fills.append(
                         PaperFill(
                             proposal,
                             name,
                             FillStatus.UNFILLED,
                             None,
-                            note=f"체결 시점 현재가 조회 실패: {type(error).__name__}",
+                            note=(
+                                "체결 시점 현재가 조회 실패: "
+                                f"{type(quote_error).__name__}"
+                            ),
                         )
                     )
                     continue
@@ -367,9 +428,82 @@ class RunPaperCycle(_PaperBase):
                 error=error,
                 valuation=valuation,
                 fills=tuple(fills),
+                model_called=result.model_called,
+                reuse_source_run_id=result.reuse_source_run_id,
+                reuse_reason=result.reuse_reason,
+                decision_evidence=_decision_evidence(result),
             ),
         )
         return PaperCycleOutcome(result, tuple(fills), valuation, portfolio)
+
+    def _reuse_decision(self, snapshot: MarketSnapshot) -> DecisionReuse:
+        """직전 모델 판단을 현재 snapshot에 재사용할 수 있는지 확인한다."""
+
+        if self.force_no_reuse:
+            return DecisionReuse(False, "사용자가 --no-reuse로 강제 호출")
+        if not self.reuse_enabled:
+            return DecisionReuse(False, "설정에서 판단 재사용이 비활성화됨")
+
+        evidence = self.store.latest_decision_evidence()
+        today = snapshot.created_at.astimezone(MARKET_TIMEZONE).date()
+        if (
+            evidence is None
+            or evidence.judged_at.astimezone(MARKET_TIMEZONE).date() != today
+        ):
+            return DecisionReuse(False, "오늘 완료된 모델 판단이 없음")
+
+        latest_attempt = self.store.latest_model_attempt()
+        if (
+            latest_attempt is not None
+            and latest_attempt[0] != CycleStatus.COMPLETED.value
+        ):
+            return DecisionReuse(
+                False,
+                f"최근 판단 시도가 {latest_attempt[0]} 상태임",
+            )
+
+        if evidence.paper_run_id is not None and self.store.has_filled_since(
+            evidence.paper_run_id
+        ):
+            return DecisionReuse(False, "직전 판단 이후 모의 체결이 발생함")
+
+        current_codes = frozenset(stock.code for stock in snapshot.stocks)
+        if current_codes != evidence.universe_codes:
+            return DecisionReuse(False, "관심종목·보유 종목 구성이 바뀜")
+
+        for stock in snapshot.stocks:
+            previous_price = evidence.prices.get(stock.code)
+            atr_percent = evidence.atr14_percent.get(stock.code)
+            if (
+                previous_price is None
+                or previous_price <= 0
+                or atr_percent is None
+                or stock.current_price is None
+            ):
+                return DecisionReuse(
+                    False,
+                    f"{stock.code}의 직전 가격·ATR 또는 현재가를 알 수 없음",
+                )
+            move_percent = (
+                abs(stock.current_price - previous_price) / previous_price * 100
+            )
+            threshold = atr_percent * self.price_move_atr_multiple
+            if move_percent >= threshold:
+                return DecisionReuse(
+                    False,
+                    f"{stock.code} 가격 변동이 ATR 기준({threshold:.2f}%) 이상",
+                )
+
+        current_news = _snapshot_news_ids(snapshot)
+        if current_news - evidence.news_ids:
+            return DecisionReuse(False, "새 뉴스가 있음")
+
+        return DecisionReuse(
+            True,
+            "호출 조건 변화 없음",
+            source_run_id=evidence.run_id,
+            proposals=evidence.proposals,
+        )
 
 
 class MarkPaperPortfolio(_PaperBase):
@@ -390,6 +524,40 @@ class MarkPaperPortfolio(_PaperBase):
             ),
         )
         return valuation
+
+
+def _decision_evidence(result: DecisionCycleResult) -> PaperDecisionEvidence | None:
+    """성공한 실제 모델 판단에서 paper 재사용 근거를 만든다."""
+
+    snapshot = result.snapshot
+    consensus = result.decision.consensus if result.decision is not None else None
+    if (
+        result.status is not CycleStatus.COMPLETED
+        or not result.model_called
+        or snapshot is None
+        or consensus is None
+    ):
+        return None
+    return PaperDecisionEvidence(
+        paper_run_id=None,
+        run_id=result.run_id,
+        judged_at=snapshot.created_at,
+        prices={stock.code: stock.current_price for stock in snapshot.stocks},
+        atr14_percent={stock.code: stock.atr14_percent for stock in snapshot.stocks},
+        news_ids=frozenset(_snapshot_news_ids(snapshot)),
+        universe_codes=frozenset(stock.code for stock in snapshot.stocks),
+        proposals=tuple(consensus.proposals),
+    )
+
+
+def _snapshot_news_ids(snapshot: MarketSnapshot) -> set[str]:
+    """뉴스 key가 있으면 key로, 없으면 제목으로 식별한다."""
+
+    return {
+        f"key:{item.key}" if item.key else f"title:{item.title}"
+        for stock in snapshot.stocks
+        for item in stock.news
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,6 +609,8 @@ class PaperReport:
     unfilled_count: int
     status_counts: dict[str, int]
     stale_codes: tuple[str, ...]
+    model_call_count: int = 0
+    reused_count: int = 0
 
 
 def build_paper_report(
@@ -530,6 +700,8 @@ def build_paper_report(
         unfilled_count=len(history.fills) - len(filled),
         status_counts=history.status_counts,
         stale_codes=tuple(code for code in portfolio.holdings if code not in prices),
+        model_call_count=history.model_call_count,
+        reused_count=history.reused_count,
     )
 
 

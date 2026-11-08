@@ -15,6 +15,7 @@ from trading_agent.application.prompt_builder import build_decision_prompt
 from trading_agent.application.records import (
     CycleStatus,
     DecisionCycleResult,
+    DecisionReuse,
 )
 from trading_agent.application.snapshot_builder import (
     SnapshotBuilder,
@@ -42,6 +43,9 @@ class RunDecisionCycle:
             build_decision_prompt
         ),
         force: bool = False,
+        reuse_decision_provider: (
+            Callable[[MarketSnapshot], DecisionReuse] | None
+        ) = None,
     ) -> None:
         self.snapshot_builder = snapshot_builder
         self.consensus_service = consensus_service
@@ -51,6 +55,14 @@ class RunDecisionCycle:
         self.clock = clock
         self.force = force
         self.prompt_builder = prompt_builder
+        self.reuse_decision_provider = reuse_decision_provider
+
+    def set_reuse_decision_provider(
+        self, provider: Callable[[MarketSnapshot], DecisionReuse] | None
+    ) -> None:
+        """paper 전용 재사용 판단 hook을 설정한다."""
+
+        self.reuse_decision_provider = provider
 
     def run(self) -> DecisionCycleResult:
         """사이클 결과를 반환하고 완료 또는 실패 기록을 남긴다."""
@@ -59,6 +71,8 @@ class RunDecisionCycle:
         snapshot = None
         prompt = None
         decision = None
+        reuse_check = None
+        model_called = False
         verdicts = []
         try:
             skip_reason = None if self.force else _skip_reason(None, self.clock())
@@ -75,43 +89,76 @@ class RunDecisionCycle:
                 )
             else:
                 assert snapshot is not None
+                if self.reuse_decision_provider is not None:
+                    try:
+                        reuse_check = self.reuse_decision_provider(snapshot)
+                    except Exception as error:
+                        reuse_check = DecisionReuse(
+                            False,
+                            f"재사용 판정 실패: {type(error).__name__}",
+                        )
                 allowed_codes = self.watchlist | frozenset(
                     position.code for position in snapshot.account.positions
                 )
                 policy = replace(self.risk_policy, allowed_codes=allowed_codes)
                 rule_proposals = generate_rule_proposals(snapshot.account, policy)
-                prompt = self.prompt_builder(snapshot, policy)
-                decision = self.consensus_service.decide(prompt)
-                if decision.failed:
+                if reuse_check is not None and reuse_check.should_reuse:
                     verdicts = RiskGuard.review(
-                        rule_proposals,
+                        [*rule_proposals, *reuse_check.proposals],
                         snapshot.account,
                         policy,
                     )
                     result = DecisionCycleResult(
                         run_id=run_id,
-                        status=CycleStatus.MODEL_FAILED,
-                        error=_model_failure_detail(decision),
-                        prompt=prompt,
+                        status=CycleStatus.REUSED,
                         snapshot=snapshot,
-                        decision=decision,
                         verdicts=verdicts,
+                        reused_proposals=list(reuse_check.proposals),
+                        reuse_source_run_id=reuse_check.source_run_id,
+                        reuse_reason=reuse_check.reason,
                     )
                 else:
-                    assert decision.consensus is not None
-                    verdicts = RiskGuard.review(
-                        [*rule_proposals, *decision.consensus.proposals],
-                        snapshot.account,
-                        policy,
-                    )
-                    result = DecisionCycleResult(
-                        run_id=run_id,
-                        status=CycleStatus.COMPLETED,
-                        prompt=prompt,
-                        snapshot=snapshot,
-                        decision=decision,
-                        verdicts=verdicts,
-                    )
+                    prompt = self.prompt_builder(snapshot, policy)
+                    model_called = True
+                    decision = self.consensus_service.decide(prompt)
+                    if decision.failed:
+                        verdicts = RiskGuard.review(
+                            rule_proposals,
+                            snapshot.account,
+                            policy,
+                        )
+                        result = DecisionCycleResult(
+                            run_id=run_id,
+                            status=CycleStatus.MODEL_FAILED,
+                            error=_model_failure_detail(decision),
+                            prompt=prompt,
+                            snapshot=snapshot,
+                            decision=decision,
+                            verdicts=verdicts,
+                            reuse_reason=(
+                                reuse_check.reason if reuse_check is not None else None
+                            ),
+                            model_called=model_called,
+                        )
+                    else:
+                        assert decision.consensus is not None
+                        verdicts = RiskGuard.review(
+                            [*rule_proposals, *decision.consensus.proposals],
+                            snapshot.account,
+                            policy,
+                        )
+                        result = DecisionCycleResult(
+                            run_id=run_id,
+                            status=CycleStatus.COMPLETED,
+                            prompt=prompt,
+                            snapshot=snapshot,
+                            decision=decision,
+                            verdicts=verdicts,
+                            reuse_reason=(
+                                reuse_check.reason if reuse_check is not None else None
+                            ),
+                            model_called=model_called,
+                        )
         except MarketDataUnavailable as error:
             result = DecisionCycleResult(
                 run_id=run_id,
@@ -121,6 +168,8 @@ class RunDecisionCycle:
                 snapshot=snapshot,
                 decision=decision,
                 verdicts=verdicts,
+                reuse_reason=(reuse_check.reason if reuse_check is not None else None),
+                model_called=model_called,
             )
         except Exception as error:
             result = DecisionCycleResult(
@@ -131,6 +180,8 @@ class RunDecisionCycle:
                 snapshot=snapshot,
                 decision=decision,
                 verdicts=verdicts,
+                reuse_reason=(reuse_check.reason if reuse_check is not None else None),
+                model_called=model_called,
             )
         except BaseException as error:
             interrupted = DecisionCycleResult(
@@ -146,7 +197,11 @@ class RunDecisionCycle:
 
         finished_at = self.clock()
         try:
-            if result.status in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
+            if result.status in (
+                CycleStatus.COMPLETED,
+                CycleStatus.REUSED,
+                CycleStatus.SKIPPED,
+            ):
                 self.ledger.complete_cycle(result, finished_at)
             else:
                 self.ledger.fail_cycle(result, finished_at)
@@ -155,6 +210,7 @@ class RunDecisionCycle:
                 run_id=run_id,
                 status=CycleStatus.ERROR,
                 error=f"{type(error).__name__}: {error}",
+                model_called=result.model_called,
             )
             try:
                 self.ledger.fail_cycle(fallback, self.clock())
@@ -176,7 +232,10 @@ def _model_failure_detail(decision: ConsensusDecisionResult) -> str:
     return "; ".join(details) or "두 모델 합의 판단에 실패했습니다."
 
 
-def _skip_reason(snapshot: MarketSnapshot | None, now: datetime) -> str | None:
+def _skip_reason(
+    snapshot: MarketSnapshot | None,
+    now: datetime,
+) -> str | None:
     """주말 또는 장 시작 후 오늘 일봉이 없으면 skip 사유를 반환한다."""
 
     if now.tzinfo is None or now.utcoffset() is None:

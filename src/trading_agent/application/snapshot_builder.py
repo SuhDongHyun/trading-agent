@@ -554,15 +554,17 @@ class SnapshotBuilder:
                 [end_date, *reversed(trading_dates[-self.news_lookback_trading_days :])]
             )
         )
-        news_items = []
+        news_items: list[NewsItem] = []
         for search_date in news_dates:
             if search_date is None:
                 continue
+
+            def read_news(date: str = search_date) -> list[NewsItem]:
+                return self.gateway.get_stock_news(code, date)
+
             items = self._read_optional(
                 f"{code}:news",
-                lambda search_date=search_date: self.gateway.get_stock_news(
-                    code, search_date
-                ),
+                read_news,
                 missing,
                 failure_detail=search_date,
             )
@@ -632,6 +634,7 @@ class SnapshotBuilder:
                 after_close=(
                     item.published_at.timetz().replace(tzinfo=None) > MARKET_CLOSE_TIME
                 ),
+                key=item.key,
             )
             for item in unique_news[: self.news_limit]
         ]

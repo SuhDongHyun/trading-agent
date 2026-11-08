@@ -219,6 +219,11 @@ def create_paper_runtime(
         watchlist=settings.watchlist,
         initial_cash=Decimal(str(settings.paper.initial_cash)),
         clock=korea_now,
+        reuse_enabled=settings.paper.reuse_decision.enabled,
+        price_move_atr_multiple=Decimal(
+            str(settings.paper.reuse_decision.price_move_atr_multiple)
+        ),
+        force_no_reuse=bool(getattr(args, "no_reuse", False)),
     )
     return PaperRuntime(use_case=use_case, gateway=gateway)
 

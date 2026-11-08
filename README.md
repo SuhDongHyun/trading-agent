@@ -423,6 +423,7 @@ CRON_TZ=Asia/Seoul
 
 ```sh
 uv run trading-agent paper run      # 판단 + 승인 제안 모의 체결 + 평가 기록
+uv run trading-agent paper run --no-reuse  # 직전 판단을 재사용하지 않고 모델 호출
 uv run trading-agent paper mark     # 매매 없이 현재가로 평가 기록 (장 마감 후 권장)
 uv run trading-agent paper report   # 누적 수익률, 벤치마크, 보유·주문 이력
 ```
@@ -435,7 +436,21 @@ paper:
   slippage_rate: 0.0         # 매수는 현재가×(1+값) 올림, 매도는 ×(1−값) 내림
   db_path: data/paper/portfolio.db
   ledger_db_path: data/paper/decisions.db  # 운영 ledger와 같은 경로는 거부
+  reuse_decision:
+    enabled: true
+    price_move_atr_multiple: 1.0  # 직전 판단 후 ATR 배수 이상 가격 변동 시 모델 호출
 ```
+
+`paper run`은 기존 skip 게이트를 유지합니다. 주말과 09:00 KST 이후 최신 일봉 날짜가
+오늘보다 이전이고 관련 조회 실패가 없는 회차는 `skipped` 처리하며, 재사용 판정·근거와
+모델 호출 집계에 반영하지 않습니다. 게이트를 통과한 뒤 매번 새 스냅샷을 만들며, 같은
+KST 날짜의 완료 판단이 있고 이후 모의 체결·ATR 기준 가격 변동·새 뉴스·관심종목/
+보유 종목 변경이 없으면 직전 합의 제안을 재사용합니다. 재사용 제안도 현재 가상
+계좌를 기준으로 규칙 제안과 함께 Risk Guard에 다시 전달합니다. 오늘 첫 판단, 직전
+판단 실패, 정보 부족, 재사용 판정 실패, 또는 `--no-reuse` 사용 시 모델을 호출합니다.
+설정은 `TRADING_AGENT__PAPER__REUSE_DECISION__ENABLED` 및
+`TRADING_AGENT__PAPER__REUSE_DECISION__PRICE_MOVE_ATR_MULTIPLE` 환경변수로
+재정의할 수 있습니다. `paper report`는 모델 호출과 재사용 회차를 따로 집계합니다.
 
 체결 규칙은 다음과 같습니다.
 

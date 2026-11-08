@@ -8,11 +8,19 @@ from decimal import Decimal
 from pathlib import Path
 
 from trading_agent.application.paper_trading import (
+    PaperDecisionEvidence,
     PaperFillRow,
     PaperHistory,
     PaperPortfolioStore,
     PaperRecord,
     PaperValuationRow,
+)
+from trading_agent.domain.models import (
+    Action,
+    ConsensusBasis,
+    ProposalSource,
+    RuleType,
+    TradeProposal,
 )
 from trading_agent.domain.paper import PaperHolding, PaperPortfolio
 
@@ -37,7 +45,10 @@ CREATE TABLE IF NOT EXISTS paper_runs (
     finished_at TEXT NOT NULL,
     status TEXT NOT NULL,
     decision_run_id INTEGER,
-    error TEXT
+    error TEXT,
+    model_called INTEGER NOT NULL DEFAULT 0,
+    reuse_source_run_id INTEGER,
+    reuse_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS paper_valuations (
     paper_run_id INTEGER PRIMARY KEY REFERENCES paper_runs(id),
@@ -72,6 +83,16 @@ CREATE TABLE IF NOT EXISTS paper_fills (
     reason TEXT NOT NULL,
     note TEXT
 );
+CREATE TABLE IF NOT EXISTS paper_decision_evidence (
+    paper_run_id INTEGER PRIMARY KEY REFERENCES paper_runs(id),
+    decision_run_id INTEGER NOT NULL,
+    judged_at TEXT NOT NULL,
+    prices_json TEXT NOT NULL,
+    atr14_json TEXT NOT NULL,
+    news_ids_json TEXT NOT NULL,
+    universe_codes_json TEXT NOT NULL,
+    proposals_json TEXT NOT NULL
+);
 """
 
 
@@ -91,6 +112,31 @@ class SQLitePaperPortfolioStore(PaperPortfolioStore):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection, connection:
             connection.executescript(_SCHEMA)
+            self._migrate_paper_runs(connection)
+
+    @staticmethod
+    def _migrate_paper_runs(connection: sqlite3.Connection) -> None:
+        """기존 paper DB에 선택적 재사용 기록 열을 추가한다."""
+
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(paper_runs)")
+        }
+        if "model_called" not in columns:
+            connection.execute(
+                "ALTER TABLE paper_runs ADD COLUMN model_called INTEGER NOT NULL "
+                "DEFAULT 0"
+            )
+            connection.execute(
+                "UPDATE paper_runs SET model_called = CASE "
+                "WHEN kind = 'cycle' AND status IN ('completed', 'model_failed') "
+                "THEN 1 ELSE 0 END"
+            )
+        if "reuse_source_run_id" not in columns:
+            connection.execute(
+                "ALTER TABLE paper_runs ADD COLUMN reuse_source_run_id INTEGER"
+            )
+        if "reuse_reason" not in columns:
+            connection.execute("ALTER TABLE paper_runs ADD COLUMN reuse_reason TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
@@ -136,7 +182,8 @@ class SQLitePaperPortfolioStore(PaperPortfolioStore):
             self._write_holdings(connection, portfolio)
             cursor = connection.execute(
                 "INSERT INTO paper_runs (kind, started_at, finished_at, status, "
-                "decision_run_id, error) VALUES (?, ?, ?, ?, ?, ?)",
+                "decision_run_id, error, model_called, reuse_source_run_id, "
+                "reuse_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.kind,
                     record.started_at.isoformat(),
@@ -144,9 +191,46 @@ class SQLitePaperPortfolioStore(PaperPortfolioStore):
                     record.status,
                     record.run_id,
                     record.error,
+                    int(record.model_called),
+                    record.reuse_source_run_id,
+                    record.reuse_reason,
                 ),
             )
             paper_run_id = cursor.lastrowid
+            evidence = record.decision_evidence
+            if evidence is not None:
+                connection.execute(
+                    """INSERT OR REPLACE INTO paper_decision_evidence
+                       (decision_run_id, paper_run_id, judged_at, prices_json,
+                        atr14_json, news_ids_json, universe_codes_json, proposals_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        evidence.run_id,
+                        paper_run_id,
+                        evidence.judged_at.isoformat(),
+                        json.dumps(
+                            {
+                                code: _str(price)
+                                for code, price in evidence.prices.items()
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                code: _str(value)
+                                for code, value in evidence.atr14_percent.items()
+                            }
+                        ),
+                        json.dumps(sorted(evidence.news_ids), ensure_ascii=False),
+                        json.dumps(sorted(evidence.universe_codes)),
+                        json.dumps(
+                            [
+                                _proposal_to_json(proposal)
+                                for proposal in evidence.proposals
+                            ],
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
             valuation = record.valuation
             if valuation is not None:
                 connection.execute(
@@ -260,12 +344,85 @@ class SQLitePaperPortfolioStore(PaperPortfolioStore):
                     "GROUP BY status"
                 ).fetchall()
             )
+            model_call_count = connection.execute(
+                "SELECT COUNT(*) FROM paper_runs "
+                "WHERE kind = 'cycle' AND model_called = 1"
+            ).fetchone()[0]
+            reused_count = connection.execute(
+                "SELECT COUNT(*) FROM paper_runs "
+                "WHERE kind = 'cycle' AND status = 'reused'"
+            ).fetchone()[0]
         return PaperHistory(
             started_at=datetime.fromisoformat(account[0]),
             valuations=valuations,
             fills=fills,
             status_counts=status_counts,
+            model_call_count=model_call_count,
+            reused_count=reused_count,
         )
+
+    def latest_decision_evidence(self) -> PaperDecisionEvidence | None:
+        """가장 최근 완료 판단의 비교 데이터와 합의 제안을 읽는다."""
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT paper_run_id, decision_run_id, judged_at, prices_json,
+                          atr14_json, news_ids_json, universe_codes_json,
+                          proposals_json
+                   FROM paper_decision_evidence ORDER BY paper_run_id DESC LIMIT 1"""
+            ).fetchone()
+        if row is None:
+            return None
+        (
+            paper_run_id,
+            run_id,
+            judged_at,
+            prices_json,
+            atr_json,
+            news_json,
+            codes_json,
+            proposals_json,
+        ) = row
+        return PaperDecisionEvidence(
+            paper_run_id=paper_run_id,
+            run_id=run_id,
+            judged_at=datetime.fromisoformat(judged_at),
+            prices={
+                code: _dec(value) for code, value in json.loads(prices_json).items()
+            },
+            atr14_percent={
+                code: _dec(value) for code, value in json.loads(atr_json).items()
+            },
+            news_ids=frozenset(json.loads(news_json)),
+            universe_codes=frozenset(json.loads(codes_json)),
+            proposals=tuple(
+                _proposal_from_json(item) for item in json.loads(proposals_json)
+            ),
+        )
+
+    def latest_model_attempt(self) -> tuple[str, int] | None:
+        """재사용·일봉 skip을 제외한 마지막 판단 시도를 반환한다."""
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT status, decision_run_id FROM paper_runs
+                   WHERE kind = 'cycle' AND status NOT IN ('reused', 'skipped')
+                   ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+        if row is None:
+            return None
+        return row[0], -1 if row[1] is None else row[1]
+
+    def has_filled_since(self, paper_run_id: int) -> bool:
+        """모델 판단 실행에서 발생했거나 그 뒤에 발생한 체결이 있는지 본다."""
+
+        with closing(self._connect()) as connection:
+            count = connection.execute(
+                """SELECT COUNT(*) FROM paper_fills
+                   WHERE paper_run_id >= ? AND status = 'filled'""",
+                (paper_run_id,),
+            ).fetchone()[0]
+        return count > 0
 
     @staticmethod
     def _write_holdings(
@@ -284,3 +441,41 @@ class SQLitePaperPortfolioStore(PaperPortfolioStore):
 
 def _str_enum(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _proposal_to_json(proposal: TradeProposal) -> dict[str, object]:
+    """재사용 판단의 합의 제안을 JSON 원시값으로 바꾼다."""
+
+    return {
+        "code": proposal.code,
+        "action": proposal.action.value,
+        "quantity": proposal.quantity,
+        "limit_price": str(proposal.limit_price),
+        "confidence": proposal.confidence,
+        "reason": proposal.reason,
+        "source": proposal.source.value,
+        "rule_type": None if proposal.rule_type is None else proposal.rule_type.value,
+        "consensus_basis": (
+            None if proposal.consensus_basis is None else proposal.consensus_basis.value
+        ),
+    }
+
+
+def _proposal_from_json(value: dict[str, object]) -> TradeProposal:
+    """저장한 JSON에서 검증된 합의 제안을 복원한다."""
+
+    rule_type = value["rule_type"]
+    consensus_basis = value["consensus_basis"]
+    return TradeProposal(
+        code=str(value["code"]),
+        action=Action(str(value["action"])),
+        quantity=int(str(value["quantity"])),
+        limit_price=Decimal(str(value["limit_price"])),
+        confidence=float(str(value["confidence"])),
+        reason=str(value["reason"]),
+        source=ProposalSource(str(value["source"])),
+        rule_type=None if rule_type is None else RuleType(str(rule_type)),
+        consensus_basis=(
+            None if consensus_basis is None else ConsensusBasis(str(consensus_basis))
+        ),
+    )

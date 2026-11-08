@@ -35,6 +35,8 @@ def require_stock_code(code: object) -> str:
 def require_action(value: object) -> "Action":
     """buy, sell, hold 중 하나인 동작을 확인한다."""
 
+    if not isinstance(value, str):
+        raise DomainError("action은 buy, sell, hold 중 하나여야 합니다.")
     try:
         return Action(value)
     except (TypeError, ValueError) as error:
@@ -130,6 +132,7 @@ class NewsSnapshotItem:
     published_at: datetime
     age_hours: float
     after_close: bool
+    key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
