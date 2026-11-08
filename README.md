@@ -411,6 +411,56 @@ CRON_TZ=Asia/Seoul
 0 16 * * 1-5 cd /path/to/trading-agent && uv run trading-agent run >> /var/log/trading-agent.log 2>&1
 ```
 
+## 가상 계좌 모의투자
+
+`paper` 명령은 실제 계좌 대신 SQLite에 저장한 가상 계좌(기본 1,000만원)로 `run`과
+같은 판단 사이클을 실행하고, Risk Guard가 승인한 제안을 모의 체결해 수익률을
+추적합니다. 시장 데이터는 trading-api의 실제 값을 쓰며 주문은 보내지 않습니다.
+
+```sh
+uv run trading-agent paper run      # 판단 + 승인 제안 모의 체결 + 평가 기록
+uv run trading-agent paper mark     # 매매 없이 현재가로 평가 기록 (장 마감 후 권장)
+uv run trading-agent paper report   # 누적 수익률, 벤치마크, 보유·주문 이력
+```
+
+```yaml
+paper:
+  initial_cash: 10000000
+  commission_rate: 0.00015   # 매수·매도 수수료 (원 미만 버림)
+  sell_tax_rate: 0.002       # 매도 거래세 (원 미만 버림)
+  slippage_rate: 0.0         # 매수는 현재가×(1+값) 올림, 매도는 ×(1−값) 내림
+  db_path: data/paper/portfolio.db
+  ledger_db_path: data/paper/decisions.db  # 운영 ledger와 같은 경로는 거부
+```
+
+체결 규칙은 다음과 같습니다.
+
+- 사이클 상태가 `completed` 또는 `model_failed`(규칙 제안만 승인)이고 스냅샷
+  `market_session`이 `open`일 때만 체결합니다. 그 외에는 `미체결`로 기록합니다.
+- 모델 판단이 끝난 뒤 종목 현재가를 다시 조회해 체결 기준가로 씁니다.
+- 매수는 현재가가 지정가 이하일 때, 합의 매도는 현재가가 지정가 이상일 때
+  현재가로 체결합니다. 손절·익절·리밸런싱 규칙 매도는 시장가로 봅니다.
+  조건을 만족하지 않은 주문은 그 사이클에서 취소되며 다음 사이클로 넘기지 않습니다.
+- 매수 수량은 수수료를 포함한 현금 한도로, 매도 수량은 보유 수량으로 줄입니다.
+- 평균 매입가는 수수료를 제외한 체결가 가중평균이며, 실현손익은 매도 수수료와
+  세금을 뺀 값입니다. 매수 수수료는 총평가(현금 감소)에 반영됩니다.
+
+각 실행 후 보유·관심 종목 현재가와 KOSPI 최신 값으로 평가를 기록합니다. `report`는
+마지막 평가 가격 기준으로 누적 수익률, 실현·평가 손익, 누적 수수료·세금, 초기
+자금부터 계산한 최대 낙폭, 같은 기간 KOSPI 수익률, 첫 평가 시점에 관심 종목을
+균등 매수해 보유했을 때의 수익률(비용 제외)과 초과수익을 표시합니다. 휴장 skip
+사이클은 평가를 남기지 않습니다. 판단 상세는 `ledger_db_path`의 DB에 `run`과 같은
+스키마로 저장됩니다.
+
+평일 장중 매시 실행 예시는 다음과 같습니다. cron의 `PATH`에 `uv`, `claude`,
+`codex`(node 포함)가 있어야 합니다.
+
+```cron
+CRON_TZ=Asia/Seoul
+5 9-15 * * 1-5 cd /path/to/trading-agent && flock -n data/paper/.lock uv run trading-agent paper run >> data/paper/cron.log 2>&1
+40 15 * * 1-5 cd /path/to/trading-agent && flock -w 900 data/paper/.lock uv run trading-agent paper mark && uv run trading-agent paper report >> data/paper/report.log 2>&1
+```
+
 ## 기록 조회
 
 최근 사이클의 리스크 승인 제안:
