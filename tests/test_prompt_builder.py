@@ -11,6 +11,7 @@ from trading_agent.application.prompt_builder import (
     TRADE_DECISION_GUIDANCE,
     build_decision_prompt,
     format_horizon_period,
+    to_json_value,
 )
 from trading_agent.domain.models import (
     AccountSnapshot,
@@ -75,8 +76,49 @@ def test_prompt_serializes_snapshot_values_and_includes_policy_glossary() -> Non
     )
 
     prompt = build_decision_prompt(snapshot, policy)
-    snapshot_json = prompt.split("스냅샷 JSON:\n", maxsplit=1)[1]
+    snapshot_json = prompt.split("스냅샷 JSON:\n", maxsplit=1)[1].rstrip("\n")
     serialized = json.loads(snapshot_json)
+    assert "\n" not in snapshot_json
+    assert snapshot_json == json.dumps(
+        serialized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    assert serialized == json.loads(
+        json.dumps(
+            to_json_value(snapshot), ensure_ascii=False, indent=2, allow_nan=False
+        )
+    )
+
+    risk_policy_json = prompt.split("리스크 정책:\n", maxsplit=1)[1].split(
+        "\n\n필드 설명:", maxsplit=1
+    )[0]
+    serialized_policy = json.loads(risk_policy_json)
+    expected_policy = {
+        "max_position_weight": str(policy.max_position_weight),
+        "max_order_ratio": str(policy.max_order_ratio),
+        "max_order_amount": str(policy.max_order_amount),
+        "effective_max_order_amount": str(
+            policy.effective_order_limit(snapshot.account.total_asset_value)
+        ),
+        "stop_loss_percent": None,
+        "take_profit_percent": None,
+        "take_profit_sell_fraction": str(policy.take_profit_sell_fraction),
+        "min_confidence": policy.min_confidence,
+        "allowed_codes": sorted(policy.allowed_codes),
+        "max_proposals_per_cycle": policy.max_proposals_per_cycle,
+    }
+    assert "\n" not in risk_policy_json
+    assert risk_policy_json == json.dumps(
+        serialized_policy,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    assert serialized_policy == json.loads(
+        json.dumps(expected_policy, ensure_ascii=False, indent=2, allow_nan=False)
+    )
 
     assert serialized["account"]["cash"] == "1235"
     assert serialized["stocks"][0]["current_price"] == "70000"
