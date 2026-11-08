@@ -9,21 +9,33 @@ from decimal import Decimal
 from pathlib import Path
 from types import FrameType
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
+from trading_agent.application.paper_trading import (
+    PaperCycleOutcome,
+    PaperReport,
+    PaperValuation,
+)
 from trading_agent.application.records import (
     CycleStatus,
     DecisionCycleResult,
     RecommendationRunResult,
 )
 from trading_agent.domain.models import Action, ConsensusBasis, TradeProposal
+from trading_agent.domain.paper import FillStatus
 from trading_agent.domain.recommendation import StockRecommendation
 from trading_agent.infrastructure.config import AgentSettings, load_settings
 from trading_agent.interface.bootstrap import (
     create_backtest_runtime,
     create_backtest_score_runtime,
+    create_paper_mark_runtime,
+    create_paper_runtime,
     create_recommendation_runtime,
     create_runtime,
+    load_paper_report,
 )
+
+KOREA_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,6 +158,28 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_score.add_argument(
         "--output", type=Path, help="출력 JSON 파일 (기본: <out-dir>/score.json)"
     )
+    paper_parser = commands.add_parser(
+        "paper", help="가상 계좌 모의투자 (주문 전송 없음)"
+    )
+    paper_commands = paper_parser.add_subparsers(dest="paper_command")
+    paper_parser.set_defaults(_print_paper_help=paper_parser.print_help)
+    paper_run = paper_commands.add_parser(
+        "run", help="가상 계좌로 판단 사이클을 실행하고 승인 제안을 모의 체결"
+    )
+    paper_run.add_argument(
+        "--force", action="store_true", help="휴장일 skip 판정을 생략"
+    )
+    paper_run.add_argument("--ledger-db", type=Path, help="모의투자 판단 기록 DB")
+    paper_mark = paper_commands.add_parser(
+        "mark", help="매매 없이 현재가로 가상 계좌를 평가해 기록"
+    )
+    paper_report = paper_commands.add_parser("report", help="모의투자 수익률 요약")
+    paper_report.add_argument(
+        "--fills", type=_positive_int, default=10, help="표시할 최근 주문 수"
+    )
+    for sub in (paper_run, paper_mark, paper_report):
+        sub.add_argument("--config", type=Path, help="YAML 설정 파일 경로")
+        sub.add_argument("--paper-db", type=Path, help="가상 계좌 DB 경로")
     return parser
 
 
@@ -173,6 +207,13 @@ def main(
     backtest_score_runtime_factory: Callable[
         ..., _Runtime[None]
     ] = create_backtest_score_runtime,
+    paper_runtime_factory: Callable[
+        ..., _Runtime[PaperCycleOutcome]
+    ] = create_paper_runtime,
+    paper_mark_runtime_factory: Callable[
+        ..., _Runtime[PaperValuation]
+    ] = create_paper_mark_runtime,
+    paper_report_loader: Callable[..., PaperReport | None] = load_paper_report,
 ) -> int:
     """CLI를 실행하고 cron에서 확인할 종료 코드를 반환한다."""
 
@@ -197,7 +238,188 @@ def main(
         return _execute_backtest(args, backtest_runtime_factory)
     if args.command == "backtest" and args.backtest_command == "score":
         return _execute_backtest_score(args, backtest_score_runtime_factory)
+    if args.command == "paper":
+        return _execute_paper(
+            args,
+            paper_runtime_factory,
+            paper_mark_runtime_factory,
+            paper_report_loader,
+        )
     return 0
+
+
+def _execute_paper(
+    args: argparse.Namespace,
+    run_factory: Callable[..., _Runtime[PaperCycleOutcome]],
+    mark_factory: Callable[..., _Runtime[PaperValuation]],
+    report_loader: Callable[..., PaperReport | None],
+) -> int:
+    """모의투자 하위 명령을 실행한다."""
+
+    if args.paper_command is None:
+        args._print_paper_help()
+        return 2
+    try:
+        settings = load_settings(args.config)
+    except Exception as error:
+        print(f"실행 준비 실패: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    if args.paper_command == "report":
+        try:
+            report = report_loader(settings, args)
+        except Exception as error:
+            print(f"리포트 실패: {type(error).__name__}: {error}", file=sys.stderr)
+            return 1
+        if report is None:
+            print(
+                "가상 계좌가 아직 없습니다. paper run이나 paper mark를 먼저 실행하세요."
+            )
+            return 0
+        _print_paper_report(report)
+        return 0
+    factory = run_factory if args.paper_command == "run" else mark_factory
+    try:
+        runtime = factory(settings, args)
+    except Exception as error:
+        print(f"실행 준비 실패: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    try:
+        outcome = runtime.run()
+    except Exception as error:
+        print(f"실행 실패: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    finally:
+        runtime.close()
+    if isinstance(outcome, PaperCycleOutcome):
+        _print_result(outcome.result)
+        _print_paper_cycle(outcome)
+        return _exit_code(outcome.result.status)
+    _print_valuation(outcome, settings.paper.initial_cash)
+    return 0
+
+
+def _won(value: Decimal | float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{Decimal(str(value)):,.0f}원"
+
+
+def _pct(value: Decimal | None, points: bool = False) -> str:
+    if value is None:
+        return "-"
+    return f"{value:+.2f}{'%p' if points else '%'}"
+
+
+def _print_paper_cycle(outcome: PaperCycleOutcome) -> None:
+    """모의 체결과 사이클 직후 평가를 표시한다."""
+
+    for fill in outcome.fills:
+        proposal = fill.proposal
+        head = (
+            f"{_proposal_origin(proposal)} {proposal.code} {fill.name} "
+            f"{proposal.action.value.upper()}"
+        )
+        if fill.status == FillStatus.FILLED:
+            print(
+                f"모의 체결: {head} {fill.quantity}주 @ {_won(fill.fill_price)} "
+                f"(수수료 {_won(fill.commission)}, 세금 {_won(fill.tax)})"
+                + (f" - {fill.note}" if fill.note else "")
+            )
+        else:
+            print(
+                f"미체결: {head} {proposal.quantity}주 지정가 "
+                f"{_won(proposal.limit_price)}, 현재가 {_won(fill.quote_price)} - "
+                f"{fill.note}"
+            )
+    if outcome.valuation is not None:
+        _print_valuation(outcome.valuation, outcome.portfolio.initial_cash)
+
+
+def _print_valuation(valuation: PaperValuation, initial_cash: Decimal | float) -> None:
+    initial = Decimal(str(initial_cash))
+    total = valuation.total_value
+    print(
+        f"가상 계좌: 총평가 {_won(total)} "
+        f"(현금 {_won(valuation.cash)}, 주식 {_won(valuation.holdings_value)}), "
+        f"누적 수익률 {_pct((total / initial - 1) * 100)}"
+    )
+    if valuation.stale_codes:
+        print(f"현재가 조회 실패로 평균가 평가: {', '.join(valuation.stale_codes)}")
+
+
+def _print_paper_report(report: PaperReport) -> None:
+    """모의투자 성과 요약을 표시한다."""
+
+    def fmt(moment: datetime | None) -> str:
+        if moment is None:
+            return "-"
+        return moment.astimezone(KOREA_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+
+    print(f"모의투자 시작 {fmt(report.started_at)} / 기준 {fmt(report.as_of)} KST")
+    print(
+        f"초기 자금 {_won(report.initial_cash)} -> 총평가 {_won(report.total_value)} "
+        f"(현금 {_won(report.cash)}, 주식 {_won(report.holdings_value)})"
+    )
+    print(
+        f"누적 수익률 {_pct(report.total_return_percent)} | "
+        f"손익 {_won(report.total_value - report.initial_cash)} "
+        f"(실현 {_won(report.realized_pnl)}, 평가 {_won(report.unrealized_pnl)}) | "
+        f"수수료·세금 {_won(report.fees_and_taxes)} | "
+        f"최대 낙폭 {_pct(report.max_drawdown_percent)}"
+    )
+    benchmarks = []
+    for label, value in (
+        ("KOSPI", report.kospi_return_percent),
+        ("관심종목 균등 보유", report.watchlist_return_percent),
+    ):
+        if value is not None:
+            excess = _pct(report.total_return_percent - value, True)
+            benchmarks.append(f"{label} {_pct(value)} (초과 {excess})")
+    comparison = " | ".join(benchmarks) or "평가 기록 2회 이상부터 표시"
+    print(f"비교: {comparison}")
+    counts = ", ".join(f"{k} {v}" for k, v in sorted(report.status_counts.items()))
+    print(
+        f"사이클: {counts or '없음'} | 주문: 체결 {report.filled_count}건, "
+        f"미체결 {report.unfilled_count}건"
+    )
+    if report.stale_codes:
+        stale = ", ".join(report.stale_codes)
+        print(f"마지막 평가에 현재가가 없어 평균가로 평가: {stale}")
+    print("보유 종목:")
+    if not report.holdings:
+        print("  없음")
+    for item in report.holdings:
+        print(
+            f"  {item.code} {item.name} {item.quantity}주 "
+            f"평균 {_won(item.average_price)} 현재 {_won(item.price)} "
+            f"평가 {_won(item.market_value)} "
+            f"손익 {_won(item.unrealized_pnl)} ({_pct(item.return_percent)}) "
+            f"비중 {item.weight_percent:.1f}%"
+        )
+    print("일별 마지막 평가:")
+    if not report.daily:
+        print("  없음")
+    for day in report.daily:
+        print(
+            f"  {day.date} {_won(day.total_value)} "
+            f"일간 {_pct(day.daily_return_percent)} "
+            f"누적 {_pct(day.cumulative_return_percent)}"
+        )
+    print("최근 주문:")
+    if not report.recent_fills:
+        print("  없음")
+    for row in report.recent_fills:
+        if row.status == FillStatus.FILLED:
+            detail = f"체결 {row.quantity}주 @ {_won(row.fill_price)}"
+            if row.realized_pnl is not None:
+                detail += f" 실현 {_won(row.realized_pnl)}"
+        else:
+            detail = f"미체결 {row.requested_quantity}주 지정가 {_won(row.limit_price)}"
+        note = f" - {row.note}" if row.note else ""
+        print(
+            f"  {fmt(row.at)} {row.code} {row.name} {row.action.upper()} "
+            f"[{row.source}] {detail}{note}"
+        )
 
 
 def _execute_backtest_score(

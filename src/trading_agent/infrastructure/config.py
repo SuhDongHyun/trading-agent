@@ -188,6 +188,17 @@ class LedgerSettings(BaseModel):
     stale_run_after_seconds: int = Field(default=3600, gt=0)
 
 
+class PaperSettings(BaseModel):
+    """가상 계좌 모의투자 설정."""
+
+    initial_cash: float = Field(default=10_000_000, gt=0)
+    commission_rate: float = Field(default=0.00015, ge=0, lt=1)
+    sell_tax_rate: float = Field(default=0.002, ge=0, lt=1)
+    slippage_rate: float = Field(default=0.0, ge=0, lt=1)
+    db_path: Path = Path("data/paper/portfolio.db")
+    ledger_db_path: Path = Path("data/paper/decisions.db")
+
+
 class AgentSettings(BaseSettings):
     """환경변수가 YAML 설정을 덮어쓰는 애플리케이션 설정."""
 
@@ -204,6 +215,7 @@ class AgentSettings(BaseSettings):
     consensus: ConsensusSettings = Field(default_factory=ConsensusSettings)
     price_guard: PriceGuardSettings = Field(default_factory=PriceGuardSettings)
     ledger: LedgerSettings = Field(default_factory=LedgerSettings)
+    paper: PaperSettings = Field(default_factory=PaperSettings)
 
     model_config = SettingsConfigDict(
         env_prefix="TRADING_AGENT__",

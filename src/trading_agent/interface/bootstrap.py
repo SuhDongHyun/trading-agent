@@ -27,7 +27,15 @@ from trading_agent.application.consensus_service import (
     RecommendationConsensusService,
 )
 from trading_agent.application.model_tasks import DECISION_TASK, RECOMMENDATION_TASK
-from trading_agent.application.ports import MarketIndex
+from trading_agent.application.paper_trading import (
+    MarkPaperPortfolio,
+    PaperCycleOutcome,
+    PaperReport,
+    PaperValuation,
+    RunPaperCycle,
+    build_paper_report,
+)
+from trading_agent.application.ports import MarketDataGateway, MarketIndex
 from trading_agent.application.prompt_builder import build_decision_prompt
 from trading_agent.application.recommend_stocks import RecommendStocks
 from trading_agent.application.recommendation_prompt import (
@@ -40,6 +48,7 @@ from trading_agent.application.records import (
 from trading_agent.application.run_decision_cycle import RunDecisionCycle
 from trading_agent.application.snapshot_builder import SnapshotBuilder
 from trading_agent.domain.models import ConfidenceAggregation, ConsensusPolicyName
+from trading_agent.domain.paper import FeeSchedule
 from trading_agent.domain.price_guard import PriceGuardMode, PriceGuardPolicy
 from trading_agent.domain.risk import RiskPolicy
 from trading_agent.infrastructure.backtest_result_store import FileBacktestResultStore
@@ -55,6 +64,7 @@ from trading_agent.infrastructure.point_in_time_gateway import (
 )
 from trading_agent.infrastructure.response_cache import ResponseCache, atomic_write_text
 from trading_agent.infrastructure.sqlite_ledger import SQLiteDecisionLedger
+from trading_agent.infrastructure.sqlite_paper_store import SQLitePaperPortfolioStore
 from trading_agent.infrastructure.trading_api import TradingApiMarketDataGateway
 
 KOREA_TIMEZONE = ZoneInfo("Asia/Seoul")
@@ -91,17 +101,17 @@ def create_runtime(
 ) -> TradingAgentRuntime:
     """설정을 적용한 네트워크·LLM 어댑터와 사이클을 조립한다."""
 
-    clock = korea_now
     gateway = TradingApiMarketDataGateway(settings.trading_api)
-    runner = SubprocessCommandRunner()
-    consensus_service = ConsensusDecisionService(
-        ClaudeCliDecisionModel(settings.llm.claude, runner, DECISION_TASK),
-        CodexCliDecisionModel(settings.llm.codex, runner, DECISION_TASK),
-        policy=settings.consensus.policy,
-        confidence_aggregation=settings.consensus.confidence_aggregation,
-        process_supervisor=runner,
+    cycle = _build_decision_cycle(
+        settings, gateway, db_path or settings.ledger.db_path, force
     )
-    risk_policy = RiskPolicy(
+    return TradingAgentRuntime(cycle=cycle, gateway=gateway)
+
+
+def _risk_policy(settings: AgentSettings) -> RiskPolicy:
+    """설정의 리스크 한도를 도메인 정책으로 바꾼다."""
+
+    return RiskPolicy(
         max_position_weight=Decimal(str(settings.risk.max_position_weight)),
         max_order_amount=(
             Decimal(str(settings.risk.max_order_amount))
@@ -124,7 +134,26 @@ def create_runtime(
         ),
         take_profit_sell_fraction=Decimal(str(settings.risk.take_profit_sell_fraction)),
     )
-    cycle = RunDecisionCycle(
+
+
+def _build_decision_cycle(
+    settings: AgentSettings,
+    gateway: MarketDataGateway,
+    db_path: str | Path,
+    force: bool = False,
+) -> RunDecisionCycle:
+    """주어진 시장 데이터 포트로 판단 사이클을 조립한다."""
+
+    clock = korea_now
+    runner = SubprocessCommandRunner()
+    consensus_service = ConsensusDecisionService(
+        ClaudeCliDecisionModel(settings.llm.claude, runner, DECISION_TASK),
+        CodexCliDecisionModel(settings.llm.codex, runner, DECISION_TASK),
+        policy=settings.consensus.policy,
+        confidence_aggregation=settings.consensus.confidence_aggregation,
+        process_supervisor=runner,
+    )
+    return RunDecisionCycle(
         snapshot_builder=SnapshotBuilder(
             gateway,
             settings.watchlist,
@@ -133,10 +162,10 @@ def create_runtime(
             news_lookback_trading_days=settings.snapshot.news_lookback_trading_days,
         ),
         consensus_service=consensus_service,
-        risk_policy=risk_policy,
+        risk_policy=_risk_policy(settings),
         watchlist=settings.watchlist,
         ledger=SQLiteDecisionLedger(
-            db_path or settings.ledger.db_path,
+            db_path,
             stale_run_after=timedelta(seconds=settings.ledger.stale_run_after_seconds),
         ),
         clock=clock,
@@ -145,7 +174,88 @@ def create_runtime(
         ),
         force=force,
     )
-    return TradingAgentRuntime(cycle=cycle, gateway=gateway)
+
+
+def _fee_schedule(settings: AgentSettings) -> FeeSchedule:
+    paper = settings.paper
+    return FeeSchedule(
+        commission_rate=Decimal(str(paper.commission_rate)),
+        sell_tax_rate=Decimal(str(paper.sell_tax_rate)),
+        slippage_rate=Decimal(str(paper.slippage_rate)),
+    )
+
+
+@dataclass(slots=True)
+class PaperRuntime[R]:
+    """모의투자 유스케이스 실행과 HTTP 연결 정리를 제공한다."""
+
+    use_case: Any
+    gateway: TradingApiMarketDataGateway
+
+    def run(self) -> R:
+        return self.use_case.run()
+
+    def close(self) -> None:
+        self.gateway.close()
+
+
+def create_paper_runtime(
+    settings: AgentSettings, args: Any
+) -> PaperRuntime[PaperCycleOutcome]:
+    """가상 계좌로 판단 사이클을 돌리고 모의 체결하는 런타임을 만든다."""
+
+    gateway = TradingApiMarketDataGateway(settings.trading_api)
+    ledger_path = getattr(args, "ledger_db", None) or settings.paper.ledger_db_path
+    if Path(ledger_path).resolve() == Path(settings.ledger.db_path).resolve():
+        raise ValueError("모의투자 판단 기록은 운영 ledger와 다른 DB를 써야 합니다.")
+    force = bool(getattr(args, "force", False))
+    use_case = RunPaperCycle(
+        store=SQLitePaperPortfolioStore(_paper_db(settings, args)),
+        gateway=gateway,
+        cycle_factory=lambda paper_gateway: _build_decision_cycle(
+            settings, paper_gateway, ledger_path, force
+        ),
+        fees=_fee_schedule(settings),
+        watchlist=settings.watchlist,
+        initial_cash=Decimal(str(settings.paper.initial_cash)),
+        clock=korea_now,
+    )
+    return PaperRuntime(use_case=use_case, gateway=gateway)
+
+
+def create_paper_mark_runtime(
+    settings: AgentSettings, args: Any
+) -> PaperRuntime[PaperValuation]:
+    """매매 없이 가상 계좌를 평가하는 런타임을 만든다."""
+
+    gateway = TradingApiMarketDataGateway(settings.trading_api)
+    use_case = MarkPaperPortfolio(
+        store=SQLitePaperPortfolioStore(_paper_db(settings, args)),
+        gateway=gateway,
+        watchlist=settings.watchlist,
+        initial_cash=Decimal(str(settings.paper.initial_cash)),
+        clock=korea_now,
+    )
+    return PaperRuntime(use_case=use_case, gateway=gateway)
+
+
+def load_paper_report(settings: AgentSettings, args: Any) -> PaperReport | None:
+    """저장된 가상 계좌 이력으로 리포트를 계산한다. 계좌가 없으면 None."""
+
+    store = SQLitePaperPortfolioStore(_paper_db(settings, args))
+    portfolio = store.load()
+    if portfolio is None:
+        return None
+    return build_paper_report(
+        portfolio,
+        store.history(),
+        settings.watchlist,
+        recent_fills=getattr(args, "fills", 10),
+    )
+
+
+def _paper_db(settings: AgentSettings, args: Any) -> Path:
+    return Path(getattr(args, "paper_db", None) or settings.paper.db_path)
 
 
 @dataclass(slots=True)
