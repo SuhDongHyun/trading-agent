@@ -7,7 +7,7 @@ from trading_agent.application.consensus_service import (
     ConsensusDecisionResult,
     RecommendationConsensusOutcome,
 )
-from trading_agent.domain.models import MarketSnapshot, ResearchSnapshot
+from trading_agent.domain.models import MarketSnapshot, ResearchSnapshot, TradeProposal
 from trading_agent.domain.recommendation import (
     RecommendationCandidate,
     StockRecommendation,
@@ -19,10 +19,21 @@ class CycleStatus(StrEnum):
     """사이클을 종료한 상태."""
 
     COMPLETED = "completed"
+    REUSED = "reused"
     SKIPPED = "skipped"
     MODEL_FAILED = "model_failed"
     DATA_FAILED = "data_failed"
     ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionReuse:
+    """paper run에서 직전 합의 판단을 재사용할지 결정한 결과."""
+
+    should_reuse: bool
+    reason: str
+    source_run_id: int | None = None
+    proposals: tuple[TradeProposal, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,9 +47,14 @@ class DecisionCycleResult:
     snapshot: MarketSnapshot | None = None
     decision: ConsensusDecisionResult | None = None
     verdicts: list[RiskVerdict] | None = None
+    reused_proposals: list[TradeProposal] | None = None
+    reuse_source_run_id: int | None = None
+    reuse_reason: str | None = None
+    model_called: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "verdicts", list(self.verdicts or []))
+        object.__setattr__(self, "reused_proposals", list(self.reused_proposals or []))
 
 
 @dataclass(frozen=True, slots=True)

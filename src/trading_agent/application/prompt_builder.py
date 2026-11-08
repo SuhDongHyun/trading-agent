@@ -8,7 +8,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from typing import Any
 
-from trading_agent.domain.models import MarketSnapshot
+from trading_agent.domain.models import MarketSnapshot, NewsSnapshotItem
 from trading_agent.domain.risk import RiskPolicy
 
 DEFAULT_HORIZON_DAYS = (10, 20)
@@ -233,6 +233,7 @@ def to_json_value(value: Any, field_name: str | None = None) -> Any:
         return {
             field.name: to_json_value(getattr(value, field.name), field.name)
             for field in fields(value)
+            if not (isinstance(value, NewsSnapshotItem) and field.name == "key")
         }
     if isinstance(value, Decimal):
         if field_name in {

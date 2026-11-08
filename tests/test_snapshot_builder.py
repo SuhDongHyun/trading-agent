@@ -473,6 +473,13 @@ def test_research_fetches_today_and_recent_daily_dates_and_deduplicates() -> Non
         "이전 기사",
         "24일 기사",
     ]
+    assert [item.key for item in snapshot.stocks[0].news] == [
+        "same-key",
+        None,
+        None,
+        None,
+        None,
+    ]
 
 
 def test_research_queries_news_once_when_latest_bar_is_today() -> None:

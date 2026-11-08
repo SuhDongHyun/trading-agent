@@ -29,7 +29,7 @@ from trading_agent.domain.recommendation import (
     StockRecommendation,
 )
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 _RUN_KIND_DECISION = "decision"
 _RUN_KIND_RECOMMENDATION = "recommendation"
 
@@ -133,6 +133,14 @@ def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
                 )
 
 
+def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+    """재사용 판단의 원본 run id를 ledger에 기록한다."""
+
+    columns = _table_columns(connection, "runs")
+    if columns and "reuse_source_run_id" not in columns:
+        connection.execute("ALTER TABLE runs ADD COLUMN reuse_source_run_id INTEGER")
+
+
 _MIGRATIONS = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
@@ -140,6 +148,7 @@ _MIGRATIONS = {
     4: _migrate_v4_to_v5,
     5: _migrate_v5_to_v6,
     6: _migrate_v6_to_v7,
+    7: _migrate_v7_to_v8,
 }
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS runs (
@@ -150,7 +159,8 @@ _SCHEMA = (
         status TEXT NOT NULL,
         error TEXT,
         prompt TEXT,
-        snapshot_json TEXT
+        snapshot_json TEXT,
+        reuse_source_run_id INTEGER
     )""",
     """CREATE TABLE IF NOT EXISTS model_runs (
         run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -297,14 +307,24 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
     ) -> None:
         """정상 사이클을 한 트랜잭션으로 종료하고 상세 데이터를 저장한다."""
 
-        if result.status not in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
-            raise ValueError("완료 기록에는 completed 또는 skipped 결과가 필요합니다.")
+        if result.status not in (
+            CycleStatus.COMPLETED,
+            CycleStatus.REUSED,
+            CycleStatus.SKIPPED,
+        ):
+            raise ValueError(
+                "완료 기록에는 completed, reused 또는 skipped 결과가 필요합니다."
+            )
         self._finish_cycle(result, finished_at)
 
     def fail_cycle(self, result: DecisionCycleResult, finished_at: datetime) -> None:
         """실패 사이클을 한 트랜잭션으로 종료하고 확보한 데이터를 저장한다."""
 
-        if result.status in (CycleStatus.COMPLETED, CycleStatus.SKIPPED):
+        if result.status in (
+            CycleStatus.COMPLETED,
+            CycleStatus.REUSED,
+            CycleStatus.SKIPPED,
+        ):
             raise ValueError("실패 기록에는 실패 상태 결과가 필요합니다.")
         self._finish_cycle(result, finished_at)
 
@@ -399,13 +419,14 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
         error: str | None,
         prompt: str | None,
         snapshot: object,
+        reuse_source_run_id: int | None = None,
     ) -> None:
         """running 상태인 run만 종료 상태로 바꾼다."""
 
         cursor = connection.execute(
             """UPDATE runs
                SET finished_at = ?, status = ?, error = ?, prompt = ?,
-                   snapshot_json = ?
+                   snapshot_json = ?, reuse_source_run_id = ?
                WHERE id = ? AND status = 'running'""",
             (
                 _iso_datetime(finished_at),
@@ -413,6 +434,7 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                 error,
                 prompt,
                 _json(snapshot),
+                reuse_source_run_id,
                 run_id,
             ),
         )
@@ -468,6 +490,7 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                 result.error,
                 result.prompt,
                 result.snapshot,
+                result.reuse_source_run_id,
             )
 
             if result.decision is not None:
@@ -485,6 +508,32 @@ class SQLiteDecisionLedger(DecisionLedger, RecommendationLedger):
                         )
                 if result.decision.consensus is not None:
                     self._store_consensus(connection, result.run_id, result)
+            elif result.status is CycleStatus.REUSED:
+                if result.reuse_reason:
+                    connection.execute(
+                        "UPDATE runs SET error = ? WHERE id = ?",
+                        (result.reuse_reason, result.run_id),
+                    )
+                for index, proposal in enumerate(result.reused_proposals or []):
+                    connection.execute(
+                        """INSERT INTO consensus_proposals
+                           (run_id, proposal_index, code, action, quantity,
+                            limit_price, confidence, reason, consensus_basis)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            result.run_id,
+                            index,
+                            proposal.code,
+                            proposal.action.value,
+                            proposal.quantity,
+                            str(proposal.limit_price),
+                            str(proposal.confidence),
+                            proposal.reason,
+                            proposal.consensus_basis.value
+                            if proposal.consensus_basis is not None
+                            else "agreed",
+                        ),
+                    )
             self._store_risk_verdicts(connection, result.run_id, result)
 
     @staticmethod

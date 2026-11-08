@@ -450,7 +450,7 @@ def test_version_1_ledger_is_migrated_in_place(tmp_path: Path) -> None:
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
         assert connection.execute(
             "SELECT kind, started_at, status FROM runs"
         ).fetchone() == (
@@ -542,7 +542,7 @@ def test_version_2_ledger_preserves_verdicts_and_defaults_source_to_consensus(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
         assert connection.execute(
             "SELECT kind, started_at, status FROM runs WHERE id = 7"
         ).fetchone() == ("decision", "2026-11-01", "completed")
@@ -651,7 +651,7 @@ def test_version_3_recommendation_prices_are_renamed_and_reopen_is_idempotent(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
         model_columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(model_recommendations)")
@@ -752,7 +752,7 @@ def test_version_4_migrates_policy_defaults_and_preserves_rows(
     SQLiteDecisionLedger(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
         result = connection.execute(
             "SELECT summary, policy, confidence_aggregation "
             "FROM consensus_results WHERE run_id = 11"
@@ -854,7 +854,7 @@ def test_version_5_migrates_price_guard_columns_and_preserves_rows(
             "price_adjusted, price_warnings_json "
             "FROM consensus_recommendations WHERE run_id = 5"
         ).fetchone()
-    assert version == (7,)
+    assert version == (8,)
     assert migrated == ("90", None, 0, "[]")
 
 
@@ -907,6 +907,6 @@ def test_version_6_migrates_relative_fields_as_null_and_is_idempotent(
             "SELECT code, reason, score, expected_excess_return_10d, drivers_json, "
             "key_risk_type, key_risk_note FROM consensus_recommendations"
         ).fetchone()
-    assert version == (7,)
+    assert version == (8,)
     assert model_row == ("005930", "기존 모델", None, None, None, None, None)
     assert consensus_row == ("005930", "기존 합의", None, None, None, None, None)
