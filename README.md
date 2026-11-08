@@ -26,7 +26,11 @@ uv sync
 두 CLI는 사용자 전역 설정과 격리해 실행합니다. 매매 판단 역할의 system prompt를
 따로 지정하고 도구는 쓰지 않습니다.
 
-- Claude: `--safe-mode --strict-mcp-config --disable-slash-commands`.
+- Claude: `--output-format stream-json --verbose`와
+  `--safe-mode --strict-mcp-config --disable-slash-commands`.
+  stdout에는 assistant·도구 이벤트와 최종 result를 보존하고, result의
+  `structured_output`을 검증합니다.
+  Claude stdout에는 계정 사용률을 담은 `rate_limit_event`를 포함해 stream 이벤트 전체가 저장됩니다.
   hooks, MCP, skills, plugins, CLAUDE.md를 로드하지 않습니다. `--bare`는 OAuth
   인증을 막으므로 쓰지 않습니다.
 - Codex: `--json --ignore-user-config --ignore-rules`와 hooks·plugins·apps·

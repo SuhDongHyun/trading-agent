@@ -308,6 +308,17 @@ def test_parser_keeps_decimal_prices() -> None:
     assert parsed.recommendations[0].expected_excess_return_10d == Decimal("4.5")
 
 
+def test_parser_accepts_optional_stock_name_and_ignores_it() -> None:
+    parsed = parse_model_recommendation(response(name="삼성전자"), "claude")
+
+    assert parsed.recommendations[0].code == "005930"
+
+
+def test_parser_rejects_non_string_optional_stock_name() -> None:
+    with pytest.raises(ValueError, match="name는 문자열"):
+        parse_model_recommendation(response(name=123), "claude")
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -339,16 +350,17 @@ def test_parser_rejects_wrong_types(overrides: dict[str, object]) -> None:
 
 
 def test_schema_requires_every_property_and_forbids_extra() -> None:
+    item_schema = RECOMMENDATION_RESPONSE_SCHEMA["properties"]["recommendations"][
+        "items"
+    ]
+    assert item_schema["properties"]["name"] == {"type": "string"}
     for schema in (
         RECOMMENDATION_RESPONSE_SCHEMA,
-        RECOMMENDATION_RESPONSE_SCHEMA["properties"]["recommendations"]["items"],
+        item_schema,
     ):
         assert schema["additionalProperties"] is False
         assert set(schema["required"]) == set(schema["properties"])
 
-    item_schema = RECOMMENDATION_RESPONSE_SCHEMA["properties"]["recommendations"][
-        "items"
-    ]
     drivers_schema = item_schema["properties"]["drivers"]
     assert "uniqueItems" not in drivers_schema
     assert "maxItems" not in drivers_schema
