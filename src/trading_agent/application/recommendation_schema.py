@@ -30,6 +30,7 @@ _ITEM_FIELDS = {
     "drivers",
     "key_risk",
 }
+_OPTIONAL_ITEM_FIELDS = {"name"}
 
 RECOMMENDATION_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -41,6 +42,7 @@ RECOMMENDATION_RESPONSE_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "code": {"type": "string"},
+                    "name": {"type": "string"},
                     "rating": {"type": "string", "enum": ["buy", "sell", "hold"]},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                     "target_price": _NULLABLE_NUMBER,
@@ -72,7 +74,7 @@ RECOMMENDATION_RESPONSE_SCHEMA: dict[str, Any] = {
                         "additionalProperties": False,
                     },
                 },
-                "required": sorted(_ITEM_FIELDS),
+                "required": sorted(_ITEM_FIELDS | _OPTIONAL_ITEM_FIELDS),
                 "additionalProperties": False,
             },
         },
@@ -106,6 +108,11 @@ def _parse_item(value: object, index: int) -> StockRecommendation:
     """추천 항목의 스키마와 도메인 불변식을 확인한다."""
 
     label = f"recommendations[{index}]"
+    if isinstance(value, dict):
+        optional_fields = _OPTIONAL_ITEM_FIELDS & value.keys()
+        if "name" in optional_fields:
+            require_string(value["name"], f"{label}.name")
+        value = {key: item for key, item in value.items() if key not in optional_fields}
     item = require_object(value, _ITEM_FIELDS, label)
     return StockRecommendation(
         code=require_string(item["code"], f"{label}.code"),

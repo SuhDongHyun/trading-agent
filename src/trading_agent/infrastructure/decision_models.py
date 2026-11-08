@@ -61,7 +61,7 @@ class ClaudeCliDecisionModel[T](DecisionModel[T]):
         self.task = task
 
     def decide(self, prompt: str) -> ModelRun[T]:
-        """Claude structured output envelope를 도메인 판단으로 검증한다."""
+        """Claude stream의 structured output result를 도메인 판단으로 검증한다."""
 
         schema_text = json.dumps(self.task.response_schema, separators=(",", ":"))
         argv = [
@@ -72,7 +72,8 @@ class ClaudeCliDecisionModel[T](DecisionModel[T]):
             "--effort",
             self.settings.effort,
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--json-schema",
             schema_text,
             "--tools",
@@ -92,14 +93,12 @@ class ClaudeCliDecisionModel[T](DecisionModel[T]):
                 "claude",
             )
         try:
-            envelope = json.loads(result.stdout)
-            if not isinstance(envelope, dict):
-                raise ValueError("Claude 응답 envelope가 JSON object가 아닙니다.")
-            if envelope.get("is_error") is True:
+            result_event = _parse_claude_stream(result.stdout)
+            if result_event.get("is_error") is True:
                 raise ValueError("Claude CLI가 is_error=true를 반환했습니다.")
-            if "structured_output" not in envelope:
-                raise ValueError("Claude 응답에 structured_output이 없습니다.")
-            structured_output = envelope["structured_output"]
+            if "structured_output" not in result_event:
+                raise ValueError("Claude result 이벤트에 structured_output이 없습니다.")
+            structured_output = result_event["structured_output"]
             response_text = (
                 structured_output
                 if isinstance(structured_output, str)
@@ -117,6 +116,23 @@ class ClaudeCliDecisionModel[T](DecisionModel[T]):
             response_text=response_text,
             decision=decision,
         )
+
+
+def _parse_claude_stream(stdout: str) -> dict[str, object]:
+    """Claude stream-json stdout에서 마지막 result 이벤트를 찾는다."""
+
+    result_event: dict[str, object] | None = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if not isinstance(event, dict):
+            raise ValueError("Claude stream-json 이벤트가 JSON object가 아닙니다.")
+        if event.get("type") == "result":
+            result_event = event
+    if result_event is None:
+        raise ValueError("Claude 응답에 result 이벤트가 없습니다.")
+    return result_event
 
 
 class CodexCliDecisionModel[T](DecisionModel[T]):

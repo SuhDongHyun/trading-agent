@@ -73,13 +73,14 @@ def completed(
     return CommandResult(stdout, stderr, exit_code, 1.25)
 
 
-def claude_envelope(
+def claude_result_event(
     response: object = VALID_RESPONSE,
     *,
     is_error: bool = False,
     result_text: str | None = None,
+    num_turns: int = 2,
 ) -> str:
-    # 실제 CLI result envelope 형태이며 session과 비용 값은 테스트용 더미다.
+    # 실제 CLI result 이벤트 형태이며 session과 비용 값은 테스트용 더미다.
     return json.dumps(
         {
             "type": "result",
@@ -88,29 +89,80 @@ def claude_envelope(
             "result": result_text if result_text is not None else json.dumps(response),
             "structured_output": response,
             "stop_reason": "tool_use",
-            "num_turns": 2,
+            "num_turns": num_turns,
             "session_id": "fixture-session-id",
             "total_cost_usd": 0.0123,
         }
     )
 
 
+def claude_stream(*events: dict[str, object]) -> str:
+    return "\n".join(json.dumps(event) for event in events)
+
+
+def assert_strict_object_schemas(schema: object) -> None:
+    """Ensure every object schema passed to Codex requires all its properties."""
+
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            assert set(schema.get("required", [])) == set(properties)
+        for value in schema.values():
+            assert_strict_object_schemas(value)
+    elif isinstance(schema, list):
+        for value in schema:
+            assert_strict_object_schemas(value)
+
+
 def test_claude_adapter_uses_structured_output_and_expected_argv(
     tmp_path: Path,
 ) -> None:
-    def claude_response(_argv: Sequence[str], _prompt: str, cwd: str) -> CommandResult:
-        assert Path(cwd).is_dir()
-        return completed(
-            claude_envelope(
+    stream = claude_stream(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "StructuredOutput",
+                        "input": {"summary": "incomplete"},
+                    }
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "is_error": True,
+                        "content": "Input failed schema validation",
+                    }
+                ]
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "retry"}]},
+        },
+        json.loads(
+            claude_result_event(
                 result_text=json.dumps(
                     {
                         "summary": "result string must be ignored",
                         "proposals": [],
                         "missing_info": [],
                     }
-                )
+                ),
+                num_turns=3,
             )
-        )
+        ),
+    )
+
+    def claude_response(_argv: Sequence[str], _prompt: str, cwd: str) -> CommandResult:
+        assert Path(cwd).is_dir()
+        return completed(stream)
 
     runner = FakeCommandRunner(claude_response)
     model = ClaudeCliDecisionModel(
@@ -128,8 +180,9 @@ def test_claude_adapter_uses_structured_output_and_expected_argv(
         "--effort",
         "high",
         "--output-format",
-        "json",
+        "stream-json",
     ]
+    assert "--verbose" in argv
     schema = json.loads(argv[argv.index("--json-schema") + 1])
     assert schema == DECISION_RESPONSE_SCHEMA
     assert argv[argv.index("--tools") + 1] == ""
@@ -138,7 +191,15 @@ def test_claude_adapter_uses_structured_output_and_expected_argv(
     assert Path(cwd) != tmp_path
     assert timeout == 45
     assert result.succeeded
-    assert result.stdout.startswith('{"type": "result"')
+    stream_events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert result.stdout == stream
+    assert [event["type"] for event in stream_events] == [
+        "assistant",
+        "user",
+        "assistant",
+        "result",
+    ]
+    assert stream_events[-1]["num_turns"] == 3
     assert result.stderr == "diagnostic"
     assert result.response_text is not None
     assert result.decision is not None
@@ -149,9 +210,9 @@ def test_claude_adapter_uses_structured_output_and_expected_argv(
 @pytest.mark.parametrize(
     ("stdout", "exit_code", "error_fragment"),
     [
-        (claude_envelope(is_error=True), 0, "is_error"),
+        (claude_result_event(is_error=True), 0, "is_error"),
         ("not JSON", 0, "Expecting value"),
-        (claude_envelope({"summary": "missing keys"}), 0, "누락 필드"),
+        (claude_result_event({"summary": "missing keys"}), 0, "누락 필드"),
         ("ignored", 17, "exit code 17"),
     ],
 )
@@ -169,6 +230,30 @@ def test_claude_adapter_fails_closed_for_bad_responses(
     assert raised.value.run.stdout == stdout
     assert raised.value.run.stderr == "diagnostic"
     assert raised.value.run.exit_code == exit_code
+
+
+def test_claude_adapter_requires_result_event() -> None:
+    stdout = claude_stream({"type": "assistant", "message": {"content": []}})
+    model = ClaudeCliDecisionModel(
+        ClaudeSettings(), FakeCommandRunner(lambda _a, _p, _c: completed(stdout))
+    )
+
+    with pytest.raises(DecisionModelError, match="result 이벤트") as raised:
+        model.decide("prompt")
+
+    assert raised.value.run.stdout == stdout
+
+
+def test_claude_adapter_requires_structured_output_in_result_event() -> None:
+    stdout = claude_stream({"type": "result", "is_error": False})
+    model = ClaudeCliDecisionModel(
+        ClaudeSettings(), FakeCommandRunner(lambda _a, _p, _c: completed(stdout))
+    )
+
+    with pytest.raises(DecisionModelError, match="structured_output") as raised:
+        model.decide("prompt")
+
+    assert raised.value.run.stdout == stdout
 
 
 def test_claude_adapter_preserves_timeout_output() -> None:
@@ -191,9 +276,9 @@ def test_codex_adapter_uses_schema_output_file_and_isolated_working_directory() 
         schema_path = Path(argv[argv.index("--output-schema") + 1])
         output_path = Path(argv[argv.index("-o") + 1])
         assert schema_path.parent == Path(cwd)
-        assert json.loads(schema_path.read_text(encoding="utf-8")) == (
-            DECISION_RESPONSE_SCHEMA
-        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        assert schema == DECISION_RESPONSE_SCHEMA
+        assert_strict_object_schemas(schema)
         # Codex --json writes JSONL events to stdout and the final answer to -o.
         raw_response = json.dumps(VALID_RESPONSE)
         output_path.write_text(raw_response, encoding="utf-8")
@@ -450,7 +535,7 @@ def _is_process_running(process_id: int) -> bool:
 
 
 def test_claude_adapter_isolates_user_configuration_and_sets_role() -> None:
-    runner = FakeCommandRunner(lambda _a, _p, _c: completed(claude_envelope()))
+    runner = FakeCommandRunner(lambda _a, _p, _c: completed(claude_result_event()))
     model = ClaudeCliDecisionModel(ClaudeSettings(), runner)
 
     model.decide("prompt")
@@ -510,7 +595,7 @@ def test_adapters_use_the_given_task_schema_and_parser() -> None:
         "missing_info": [],
     }
     claude_runner = FakeCommandRunner(
-        lambda _a, _p, _c: completed(claude_envelope(response))
+        lambda _a, _p, _c: completed(claude_result_event(response))
     )
 
     def write_response(argv: Sequence[str], _prompt: str, _cwd: str) -> CommandResult:
@@ -518,6 +603,7 @@ def test_adapters_use_the_given_task_schema_and_parser() -> None:
             Path(argv[argv.index("--output-schema") + 1]).read_text(encoding="utf-8")
         )
         assert schema == RECOMMENDATION_TASK.response_schema
+        assert_strict_object_schemas(schema)
         Path(argv[argv.index("-o") + 1]).write_text(
             json.dumps(response), encoding="utf-8"
         )
